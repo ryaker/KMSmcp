@@ -21,7 +21,6 @@ dist/
 secrets/
 config/
 credentials/
-auth/
 keys/
 certs/
 .doppler/
