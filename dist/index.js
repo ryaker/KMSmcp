@@ -6,11 +6,11 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, } from '@modelcontextprotocol/sdk/types.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import Redis from 'ioredis';
-import { HttpTransport } from './transport/HttpTransport.js';
-import { FACTCache } from './cache/FACTCache.js';
-import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js';
-import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index.js';
-import { UnifiedStoreTool, UnifiedSearchTool } from './tools/index.js';
+import { HttpTransport } from './transport/HttpTransport';
+import { FACTCache } from './cache/FACTCache';
+import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter';
+import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index';
+import { UnifiedStoreTool, UnifiedSearchTool } from './tools/index';
 export class UnifiedKMSServer {
     config;
     server;

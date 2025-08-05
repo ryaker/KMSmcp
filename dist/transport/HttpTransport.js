@@ -10,7 +10,7 @@ import { createServer } from 'http';
 import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { OAuth2Authenticator } from '../auth/OAuth2Authenticator.js';
+import { OAuth2Authenticator } from '../auth/OAuth2Authenticator';
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js';
 export class HttpTransport {
     config;

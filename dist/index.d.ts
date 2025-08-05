@@ -2,7 +2,7 @@
  * Main Unified KMS MCP Server
  * Orchestrates all components into a single, powerful MCP server
  */
-import { KMSConfig } from './types/index.js';
+import { KMSConfig } from './types/index';
 export declare class UnifiedKMSServer {
     private config;
     private server;

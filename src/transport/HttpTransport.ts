@@ -12,13 +12,13 @@ import { randomUUID } from 'node:crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { OAuth2Authenticator } from '../auth/OAuth2Authenticator.js'
+import { OAuth2Authenticator } from '../auth/OAuth2Authenticator'
 import { 
   OAuthConfig, 
   AuthContext, 
   ProtectedResourceMetadata, 
   AuthorizationServerMetadata 
-} from '../auth/types.js'
+} from '../auth/types'
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
 
 export interface HttpTransportConfig {

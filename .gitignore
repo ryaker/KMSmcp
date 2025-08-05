@@ -45,3 +45,4 @@ temp/
 .cache/
 .vscode/settings.local.json
 .idea/
+.claude/

@@ -3,6 +3,9 @@
  * Analyzes knowledge content and determines optimal storage strategy
  */
 import { UnifiedKnowledge, StorageDecision, RoutingRule } from '../types/index.js';
+interface DualPrimaryRule extends RoutingRule {
+    dualPrimary?: ('mem0' | 'neo4j' | 'mongodb')[];
+}
 export declare class IntelligentStorageRouter {
     private rules;
     /**
@@ -32,10 +35,11 @@ export declare class IntelligentStorageRouter {
     /**
      * Add custom routing rule
      */
-    addRule(rule: RoutingRule): void;
+    addRule(rule: DualPrimaryRule): void;
     /**
      * Remove routing rule by pattern
      */
     removeRule(pattern: RegExp): void;
 }
+export {};
 //# sourceMappingURL=IntelligentStorageRouter.d.ts.map

@@ -4,40 +4,57 @@
  */
 export class IntelligentStorageRouter {
     rules = [
-        // Memory patterns - route to Mem0
+        // Personal experiences, preferences, and interests - route to Mem0
         {
-            pattern: /memory|remember|recall|client|user.*prefer|behavior|pattern|habit|tendency/i,
+            pattern: /I like|I prefer|I enjoy|I love|I hate|I dislike|my favorite|personal|preference|interest|hobby|learned about|discovered|remember|recall|experience|behavior|habit|tendency|song|music|movie|book|food|travel|family|friend/i,
             contentTypes: ['memory'],
             primary: 'mem0',
-            reasoning: 'Memory and client behavior patterns optimize for Mem0 semantic search and user context'
+            reasoning: 'Personal experiences, preferences, and interests are semantic memories best stored in Mem0 for contextual recall'
         },
-        // Relationships and insights - route to Neo4j
+        // Relationships between concepts, people, ideas - route to Neo4j
         {
-            pattern: /relationship|connect|technique|effective|insight|concept|framework|methodology|approach|strategy/i,
+            pattern: /relationship|connect|link|relate|associate|influence|cause|effect|network|similar to|different from|reminds me of|connection between|concept|framework|methodology|approach|strategy|technique|effective/i,
             contentTypes: ['insight', 'relationship'],
             primary: 'neo4j',
-            reasoning: 'Relationships and coaching insights leverage Neo4j graph capabilities for technique effectiveness'
+            reasoning: 'Conceptual relationships and connections leverage Neo4j graph capabilities for exploring knowledge networks'
         },
-        // Structured data - route to MongoDB
+        // System configuration, technical procedures, structured data - route to MongoDB
         {
-            pattern: /config|setting|schema|session|conversation|metadata|profile|authentication|billing/i,
+            pattern: /config|configuration|setting|schema|setup|installation|procedure|step.*by.*step|documentation|specification|authentication|API|database|server|deployment|build|compile/i,
             contentTypes: ['fact', 'procedure'],
             primary: 'mongodb',
-            reasoning: 'Structured configuration and session data suits MongoDB document storage and indexing'
+            reasoning: 'Technical procedures and system configurations need structured storage with precise querying capabilities'
         },
-        // Learning patterns - route to Mem0 + Neo4j
+        // Learning patterns and personal growth - route to Mem0 with Neo4j secondary
         {
-            pattern: /learn|breakthrough|discovery|pattern|evolution|improvement|adaptation/i,
+            pattern: /learn|learning|understand|breakthrough|discovery|pattern|evolution|improvement|adaptation|growth|insight|realization|figured out|makes sense|clicked|understanding/i,
             contentTypes: ['pattern'],
             primary: 'mem0',
-            reasoning: 'Learning patterns combine memory (Mem0) with relationship tracking (Neo4j)'
+            reasoning: 'Personal learning patterns and insights are semantic memories with relationship potential'
         },
-        // Technical knowledge - route to MongoDB + Mem0
+        // Personal projects and work - dual primary storage (Mem0 for experience, MongoDB for structure)
         {
-            pattern: /bug|fix|error|implementation|code|api|endpoint|database|integration/i,
+            pattern: /project|working on|building|creating|developing|my.*code|my.*app|my.*website|implementation|feature|bug.*fix|solution|achievement/i,
             contentTypes: ['fact', 'procedure'],
-            primary: 'mongodb',
-            reasoning: 'Technical knowledge needs structured storage (MongoDB) with searchable context (Mem0)'
+            primary: 'mem0',
+            dualPrimary: ['mem0', 'mongodb'],
+            reasoning: 'Personal projects combine meaningful experiences (Mem0) with structured technical details (MongoDB)'
+        },
+        // Cultural content with personal connection - dual primary storage (Mem0 for personal meaning, MongoDB for metadata)
+        {
+            pattern: /song|music|artist|album|movie|film|book|author|cultural|art|literature|poem|poetry|hebrew|jewish|tradition|festival|holiday/i,
+            contentTypes: ['memory', 'fact'],
+            primary: 'mem0',
+            dualPrimary: ['mem0', 'mongodb'],
+            reasoning: 'Cultural content has both personal emotional significance (Mem0) and structured metadata (MongoDB)'
+        },
+        // Learning discoveries - dual primary storage (Mem0 for breakthrough experience, MongoDB for factual content)
+        {
+            pattern: /learned that|discovered that|found out that|realized that|understood that|figured out that|breakthrough|discovery|makes sense now|clicked for me|understanding/i,
+            contentTypes: ['memory', 'fact'],
+            primary: 'mem0',
+            dualPrimary: ['mem0', 'mongodb'],
+            reasoning: 'Learning discoveries combine personal breakthrough experiences (Mem0) with factual knowledge (MongoDB)'
         }
     ];
     /**
@@ -53,18 +70,34 @@ export class IntelligentStorageRouter {
         // Find matching rule
         const matchingRule = this.findMatchingRule(content, contentType);
         if (matchingRule) {
-            const decision = {
-                primary: matchingRule.primary,
-                secondary: this.getSecondaryStorage(matchingRule.primary, knowledge),
-                reasoning: matchingRule.reasoning,
-                cacheStrategy: this.determineCacheStrategy(knowledge)
-            };
-            console.log(`✅ Storage Decision:`);
-            console.log(`   Primary: ${decision.primary}`);
-            console.log(`   Secondary: ${decision.secondary?.join(', ') || 'none'}`);
-            console.log(`   Cache: ${decision.cacheStrategy}`);
-            console.log(`   Reasoning: ${decision.reasoning}`);
-            return decision;
+            // Check if this rule specifies dual primary storage
+            if (matchingRule.dualPrimary && matchingRule.dualPrimary.length > 1) {
+                const decision = {
+                    primary: matchingRule.dualPrimary[0], // First one is primary for return value
+                    secondary: matchingRule.dualPrimary.slice(1), // Rest are also primary but listed as secondary
+                    reasoning: `${matchingRule.reasoning} (Dual Primary: ${matchingRule.dualPrimary.join(' + ')})`,
+                    cacheStrategy: this.determineCacheStrategy(knowledge)
+                };
+                console.log(`✅ Dual Primary Storage Decision:`);
+                console.log(`   Primary Systems: ${matchingRule.dualPrimary.join(' + ')}`);
+                console.log(`   Cache: ${decision.cacheStrategy}`);
+                console.log(`   Reasoning: ${decision.reasoning}`);
+                return decision;
+            }
+            else {
+                const decision = {
+                    primary: matchingRule.primary,
+                    secondary: this.getSecondaryStorage(matchingRule.primary, knowledge),
+                    reasoning: matchingRule.reasoning,
+                    cacheStrategy: this.determineCacheStrategy(knowledge)
+                };
+                console.log(`✅ Storage Decision:`);
+                console.log(`   Primary: ${decision.primary}`);
+                console.log(`   Secondary: ${decision.secondary?.join(', ') || 'none'}`);
+                console.log(`   Cache: ${decision.cacheStrategy}`);
+                console.log(`   Reasoning: ${decision.reasoning}`);
+                return decision;
+            }
         }
         // Default fallback strategy
         const decision = {
@@ -104,7 +137,7 @@ export class IntelligentStorageRouter {
         const secondary = [];
         switch (primary) {
             case 'mem0':
-                // Memory in Mem0 → Store metadata in MongoDB for structured queries
+                // Personal memories in Mem0 → Store metadata in MongoDB for structured queries
                 secondary.push('mongodb');
                 // If it has relationships, also store in Neo4j
                 if (knowledge.relationships && knowledge.relationships.length > 0) {
@@ -112,15 +145,15 @@ export class IntelligentStorageRouter {
                 }
                 break;
             case 'neo4j':
-                // Insights in Neo4j → Index in Mem0 for semantic search
+                // Concept relationships in Neo4j → Index in Mem0 for semantic search
                 secondary.push('mem0');
-                // If it's coaching related, store config in MongoDB
-                if (knowledge.source === 'coaching' || knowledge.coachId) {
+                // If it's technical/structured content, store details in MongoDB
+                if (knowledge.source === 'technical' || knowledge.contentType === 'procedure') {
                     secondary.push('mongodb');
                 }
                 break;
             case 'mongodb':
-                // Structured data in MongoDB → Index in Mem0 for search
+                // Structured data in MongoDB → Index in Mem0 for personal search
                 secondary.push('mem0');
                 // If it describes relationships, also store in Neo4j
                 const content = knowledge.content || '';
@@ -135,14 +168,14 @@ export class IntelligentStorageRouter {
      * Determine cache strategy based on knowledge characteristics
      */
     determineCacheStrategy(knowledge) {
-        // Richard's personal queries - cache aggressively
-        if (knowledge.userId === 'richard_yaker') {
-            console.log(`🚀 L1 cache for richard_yaker`);
+        // Personal user queries - cache aggressively
+        if (knowledge.userId === 'richard_yaker' || knowledge.source === 'personal') {
+            console.log(`🚀 L1 cache for personal user content`);
             return 'L1';
         }
-        // Coaching insights and client memories - cache moderately
-        if (knowledge.contentType === 'memory' || knowledge.source === 'coaching') {
-            console.log(`⚡ L2 cache for coaching/memory content`);
+        // Personal memories and insights - cache moderately
+        if (knowledge.contentType === 'memory' || knowledge.contentType === 'insight') {
+            console.log(`⚡ L2 cache for personal memory/insight content`);
             return 'L2';
         }
         // High confidence knowledge - cache moderately
@@ -151,8 +184,8 @@ export class IntelligentStorageRouter {
             return 'L2';
         }
         // Technical knowledge - cache conservatively
-        if (knowledge.source === 'technical') {
-            console.log(`💾 L3 cache for technical content`);
+        if (knowledge.source === 'technical' || knowledge.contentType === 'procedure') {
+            console.log(`💾 L3 cache for technical/procedural content`);
             return 'L3';
         }
         // Everything else - conservative caching
@@ -191,7 +224,8 @@ export class IntelligentStorageRouter {
      */
     addRule(rule) {
         this.rules.push(rule);
-        console.log(`➕ Added custom routing rule for ${rule.primary}: ${rule.pattern}`);
+        const storageType = rule.dualPrimary ? `dual(${rule.dualPrimary.join('+')})` : rule.primary;
+        console.log(`➕ Added custom routing rule for ${storageType}: ${rule.pattern}`);
     }
     /**
      * Remove routing rule by pattern
