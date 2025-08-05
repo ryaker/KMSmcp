@@ -4,4 +4,3 @@
  */
 export { OAuth2Authenticator } from './OAuth2Authenticator.js';
 export * from './types.js';
-//# sourceMappingURL=index.js.map

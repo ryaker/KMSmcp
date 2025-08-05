@@ -328,4 +328,3 @@ export class Neo4jStorage {
         }
     }
 }
-//# sourceMappingURL=Neo4jStorage.js.map

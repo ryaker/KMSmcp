@@ -3,7 +3,7 @@
  * Uses StreamableHTTPServerTransport for proper MCP protocol compliance
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { OAuthConfig } from '../auth/types';
+import { OAuthConfig } from '../auth/types.js';
 export interface HttpTransportConfig {
     port: number;
     host?: string;
