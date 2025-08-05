@@ -46,5 +46,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 # Expose port
 EXPOSE 3001
 
-# Start command
+# Start command - use environment variables directly
 CMD ["node", "dist/index.js"]
