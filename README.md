@@ -87,6 +87,29 @@ npm start
 
 ## 🔧 Configuration
 
+### Client Configuration
+
+#### Claude Code
+Add to your Claude Code configuration:
+```json
+{
+  "mcpServers": {
+    "personal-kms": {
+      "type": "http",
+      "url": "https://your-kms-server.com/mcp"
+    }
+  }
+}
+```
+
+#### Claude Desktop
+1. Go to Settings → MCP Connectors
+2. Click "Add custom connector"
+3. Enter:
+   - **Name**: `personal-kms`
+   - **Remote MCP server URL**: `https://your-kms-server.com/mcp`
+4. Click "Add"
+
 ### Transport Modes
 
 The server supports three transport modes:

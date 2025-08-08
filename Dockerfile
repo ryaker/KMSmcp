@@ -1,5 +1,5 @@
 # Unified KMS MCP Server - Production Docker Image
-FROM node:18-alpine AS base
+FROM node:24-alpine AS base
 
 # Install dependencies for native modules
 RUN apk add --no-cache python3 make g++
@@ -20,7 +20,12 @@ COPY . .
 RUN npm run build
 
 # Production stage
-FROM node:18-alpine AS production
+FROM node:24-alpine AS production
+
+# Install Doppler CLI
+RUN apk add --no-cache curl bash gnupg && \
+    curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh | sh && \
+    doppler --version
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs && \
@@ -46,5 +51,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 # Expose port
 EXPOSE 3001
 
-# Start command - use environment variables directly
-CMD ["node", "dist/index.js"]
+# Start with Doppler if available, otherwise direct
+CMD sh -c 'if command -v doppler >/dev/null 2>&1 && [ -n "$DOPPLER_TOKEN" ]; then echo "✅ Using Doppler"; exec doppler run --project ry-local --config "${DOPPLER_CONFIG:-dev}" -- node dist/index.js; else echo "❌ No Doppler"; exec node dist/index.js; fi'
