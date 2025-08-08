@@ -64,6 +64,32 @@ The `unified_store` tool is the **brain** of the system that automatically decid
                     └─────────────────────┘
 ```
 
+## 📋 Prerequisites
+
+This unified KMS requires four cloud services for optimal performance. We recommend using managed services (PAAS) for reliability and scalability:
+
+### 🧠 Mem0 - AI Memory Layer
+**What it does**: Semantic memory storage with natural language understanding  
+**Get it**: [Sign up at Mem0](https://mem0.ai) - Free tier available  
+**Need**: API key from your dashboard
+
+### 🕸️ Neo4j - Knowledge Graph  
+**What it does**: Stores relationships between concepts and insights  
+**Get it**: [Neo4j Aura (Cloud)](https://neo4j.com/cloud/aura/) - Free tier with 50k nodes  
+**Need**: Connection URI, username, password
+
+### 🗄️ MongoDB - Structured Data
+**What it does**: Document storage for structured data and configurations  
+**Get it**: [MongoDB Atlas](https://mongodb.com/atlas) - Free 512MB cluster  
+**Need**: Connection string (mongodb+srv://...)
+
+### ⚡ Redis - L2 Cache (Optional)
+**What it does**: Fast caching layer for sub-100ms responses  
+**Get it**: [Redis Cloud](https://redis.com/redis-cloud/) or [Upstash](https://upstash.com/) - Free tiers available  
+**Need**: Connection URI (redis://... or rediss://...)
+
+> **💡 Pro Tip**: All these services offer generous free tiers perfect for getting started. You can upgrade as your knowledge base grows!
+
 ## 🛠️ Installation
 
 ```bash
@@ -73,7 +99,7 @@ npm install
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your credentials
+# Edit .env with your service credentials (see Prerequisites above)
 
 # Build
 npm run build
