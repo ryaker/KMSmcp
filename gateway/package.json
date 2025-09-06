@@ -1,0 +1,23 @@
+{
+  "name": "mcp-gateway",
+  "version": "1.0.0",
+  "description": "Unified MCP Gateway for mcp.yaker.org",
+  "main": "mcp-gateway.js",
+  "type": "module",
+  "scripts": {
+    "start": "node mcp-gateway.js",
+    "dev": "nodemon mcp-gateway.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "http-proxy-middleware": "^2.0.6",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

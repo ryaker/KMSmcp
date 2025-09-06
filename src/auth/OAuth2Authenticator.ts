@@ -61,15 +61,24 @@ export class OAuth2Authenticator {
     try {
       // Try JWT validation first (faster)
       context = await this.validateJWT(token)
+      console.log('✅ JWT validation successful')
     } catch (jwtError) {
-      console.log('JWT validation failed, trying token introspection:', jwtError instanceof Error ? jwtError.message : String(jwtError))
+      const errorMsg = jwtError instanceof Error ? jwtError.message : String(jwtError)
+      
+      // Check if this is an opaque token (not a JWT)
+      if (errorMsg.includes('not a valid JWT format') || errorMsg.includes('opaque token')) {
+        console.log('📝 Token appears to be an opaque access token, using introspection')
+      } else {
+        console.log('⚠️ JWT validation failed:', errorMsg)
+      }
       
       try {
-        // Fallback to token introspection
+        // Fallback to token introspection (for opaque tokens)
         context = await this.introspectToken(token)
       } catch (introspectionError) {
-        console.error('Token introspection failed:', introspectionError instanceof Error ? introspectionError.message : String(introspectionError))
-        throw this.createAuthError('invalid_token', 'Token validation failed')
+        console.error('❌ Token introspection failed:', introspectionError instanceof Error ? introspectionError.message : String(introspectionError))
+        console.error('   Token preview:', token.substring(0, 20) + '...')
+        throw this.createAuthError('invalid_token', 'Token validation failed - neither JWT nor valid opaque token')
       }
     }
 
@@ -88,6 +97,22 @@ export class OAuth2Authenticator {
   private async validateJWT(token: string): Promise<AuthContext> {
     if (!this.jwksClient) {
       throw new Error('JWKS client not configured')
+    }
+
+    // First, check if this looks like a JWT (has 3 parts separated by dots)
+    const parts = token.split('.')
+    if (parts.length !== 3) {
+      throw new Error('Token is not a valid JWT format - might be an opaque token')
+    }
+
+    // Try to decode the header to check if it's a valid JWT structure
+    try {
+      const header = JSON.parse(Buffer.from(parts[0], 'base64').toString())
+      if (!header.alg || !header.typ) {
+        throw new Error('Invalid JWT header structure')
+      }
+    } catch (e) {
+      throw new Error('Token appears malformed - not a valid JWT')
     }
 
     return new Promise((resolve, reject) => {

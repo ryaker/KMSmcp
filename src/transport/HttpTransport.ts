@@ -12,13 +12,13 @@ import { randomUUID } from 'node:crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { OAuth2Authenticator } from '../auth/OAuth2Authenticator'
+import { OAuth2Authenticator } from '../auth/OAuth2Authenticator.js'
 import { 
   OAuthConfig, 
   AuthContext, 
   ProtectedResourceMetadata, 
   AuthorizationServerMetadata 
-} from '../auth/types'
+} from '../auth/types.js'
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
 
 export interface HttpTransportConfig {
@@ -126,30 +126,37 @@ export class HttpTransport {
     // OAuth metadata endpoints (if OAuth is enabled)
     if (this.config.oauth?.enabled) {
       // OAuth 2.0 Authorization Server Metadata (RFC 8414)
+      // This points to Auth0 as our authorization server
       this.app.get('/.well-known/oauth-authorization-server', (req: Request, res: Response) => {
+        const issuer = this.config.oauth!.issuer!.replace(/\/$/, '') // Remove trailing slash
         res.json({
-          issuer: this.config.oauth!.issuer,
-          authorization_endpoint: `${req.protocol}://${req.get('host')}/authorize`,
-          token_endpoint: `${req.protocol}://${req.get('host')}/oauth/token`,
+          issuer: issuer,
+          authorization_endpoint: `${issuer}/authorize`,
+          token_endpoint: `${issuer}/oauth/token`,
           jwks_uri: this.config.oauth!.jwksUri,
-          registration_endpoint: `${req.protocol}://${req.get('host')}/register`,
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin'],
-          response_types_supported: ['code'],
-          grant_types_supported: ['authorization_code']
+          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin', 'openid', 'profile', 'email'],
+          response_types_supported: ['code', 'token', 'id_token', 'code id_token', 'code token', 'token id_token', 'code token id_token'],
+          grant_types_supported: ['authorization_code', 'implicit', 'refresh_token', 'client_credentials'],
+          code_challenge_methods_supported: ['S256', 'plain'],
+          userinfo_endpoint: `${issuer}/userinfo`,
+          token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic']
         })
       })
 
-      // OAuth 2.0 Authorization Server Metadata for MCP (v2 to force cache refresh)
-      this.app.get('/.well-known/oauth-authorization-server/mcp-v2', (req: Request, res: Response) => {
+      // OAuth 2.0 Authorization Server Metadata for MCP
+      this.app.get('/.well-known/oauth-authorization-server/mcp', (req: Request, res: Response) => {
+        const issuer = this.config.oauth!.issuer!.replace(/\/$/, '') // Remove trailing slash
         res.json({
-          issuer: this.config.oauth!.issuer,
-          authorization_endpoint: `${req.protocol}://${req.get('host')}/authorize`,
-          token_endpoint: `${req.protocol}://${req.get('host')}/oauth/token`,
+          issuer: issuer,
+          authorization_endpoint: `${issuer}/authorize`,
+          token_endpoint: `${issuer}/oauth/token`,
           jwks_uri: this.config.oauth!.jwksUri,
-          registration_endpoint: `${req.protocol}://${req.get('host')}/register`,
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin'],
-          response_types_supported: ['code'],
-          grant_types_supported: ['authorization_code']
+          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin', 'openid', 'profile', 'email'],
+          response_types_supported: ['code', 'token', 'id_token', 'code id_token', 'code token', 'token id_token', 'code token id_token'],
+          grant_types_supported: ['authorization_code', 'implicit', 'refresh_token', 'client_credentials'],
+          code_challenge_methods_supported: ['S256', 'plain'],
+          userinfo_endpoint: `${issuer}/userinfo`,
+          token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic']
         })
       })
 
@@ -176,15 +183,6 @@ export class HttpTransport {
         }
         res.json(metadata)
       })
-
-      // Dynamic client registration endpoint
-      this.app.post('/register', this.handleDynamicClientRegistration.bind(this))
-
-      // OAuth authorization endpoint with client mapping
-      this.app.get('/authorize', this.handleOAuthAuthorize.bind(this))
-
-      // OAuth token proxy endpoint
-      this.app.post('/oauth/token', this.handleTokenProxy.bind(this))
     }
 
     // MCP endpoints using proper SDK StreamableHTTPServerTransport
@@ -215,9 +213,20 @@ export class HttpTransport {
       return next()
     }
 
+    // Log request source information
+    const clientInfo = {
+      ip: req.ip || req.socket.remoteAddress,
+      userAgent: req.headers['user-agent'],
+      origin: req.headers.origin,
+      referer: req.headers.referer,
+      xForwardedFor: req.headers['x-forwarded-for'],
+      xRealIp: req.headers['x-real-ip']
+    }
+
     try {
       const authHeader = req.headers.authorization
       if (!authHeader) {
+        console.log('🚫 Missing Authorization header from:', clientInfo)
         res.status(401).json({ error: 'Missing Authorization header' })
         return
       }
@@ -226,7 +235,8 @@ export class HttpTransport {
       req.auth = authContext
       next()
     } catch (error) {
-      console.error('Authentication failed:', error)
+      console.error('❌ Authentication failed from:', clientInfo)
+      console.error('   Error details:', error)
       res.status(401).json({ error: 'Authentication failed' })
     }
   }
@@ -244,10 +254,23 @@ export class HttpTransport {
   private async handleMcpPostRequest(req: Request, res: Response): Promise<void> {
     try {
       const sessionId = req.headers['mcp-session-id'] as string
-      console.log(sessionId ? `Received MCP POST request for session: ${sessionId}` : 'Received MCP POST request:', req.body)
+      
+      // Extract client info from request body if it's an initialize request
+      if (req.body?.method === 'initialize') {
+        const clientInfo = req.body?.params?.clientInfo
+        console.log(`📱 MCP Client connecting:`, {
+          name: clientInfo?.name || 'unknown',
+          version: clientInfo?.version || 'unknown',
+          ip: req.ip || req.socket.remoteAddress,
+          userAgent: req.headers['user-agent'],
+          sessionId: sessionId
+        })
+      }
+      
+      console.log(sessionId ? `Received MCP POST request for session: ${sessionId}` : 'Received MCP POST request')
 
       if (this.config.oauth?.enabled && req.auth) {
-        console.log('Authenticated user:', req.auth)
+        console.log('✅ Authenticated user:', req.auth?.sub || req.auth)
       }
 
       let transport: StreamableHTTPServerTransport
@@ -257,6 +280,9 @@ export class HttpTransport {
         transport = this.transports.get(sessionId)!
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // New initialization request
+        console.log('[Transport] Creating new transport for initialize request')
+        console.log('[Transport] Initialize request body:', JSON.stringify(req.body, null, 2))
+        
         const eventStore = new InMemoryEventStore()
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
@@ -284,6 +310,28 @@ export class HttpTransport {
           throw new Error('MCP server factory not initialized')
         }
 
+        // Wrap the response to log what's being sent
+        const originalJson = res.json.bind(res)
+        const originalWrite = res.write.bind(res)
+        const originalEnd = res.end.bind(res)
+        
+        res.json = (data: any) => {
+          console.log('[Transport] Response via json():', JSON.stringify(data, null, 2))
+          return originalJson(data)
+        }
+        
+        res.write = (chunk: any, ...args: any[]) => {
+          console.log('[Transport] Response via write():', chunk.toString())
+          return originalWrite(chunk, ...args)
+        }
+        
+        res.end = (chunk: any, ...args: any[]) => {
+          if (chunk) {
+            console.log('[Transport] Response via end():', chunk.toString())
+          }
+          return originalEnd(chunk, ...args)
+        }
+        
         await transport.handleRequest(req, res, req.body)
         return // Already handled
       } else {
@@ -300,6 +348,8 @@ export class HttpTransport {
       }
 
       // Handle the request with existing transport
+      console.log('[Transport] Handling request with existing transport for session:', sessionId)
+      console.log('[Transport] Request body:', JSON.stringify(req.body, null, 2))
       await transport.handleRequest(req, res, req.body)
     } catch (error) {
       console.error('Error handling MCP POST request:', error)
@@ -428,228 +478,4 @@ export class HttpTransport {
       activeSessions: this.transports.size,
       authEnabled: this.config.oauth?.enabled || false,
     }
-  }
-
-  /**
-   * Handle OAuth 2.0 Dynamic Client Registration (RFC 7591)
-   */
-  private async handleDynamicClientRegistration(req: Request, res: Response): Promise<void> {
-    try {
-      console.log('🔐 Dynamic Client Registration request received')
-      
-      const { 
-        client_name = 'Claude MCP Client',
-        redirect_uris = ['https://claude.ai/api/mcp/auth_callback'],
-        grant_types = ['authorization_code'],
-        response_types = ['code'],
-        scope = 'mcp:read mcp:write mcp:admin'
-      } = req.body
-
-      // Create the client in Auth0 via Management API
-      const clientData = await this.createAuth0Client({
-        name: client_name,
-        app_type: 'spa', // Single Page Application for public clients
-        callbacks: Array.isArray(redirect_uris) ? redirect_uris : [redirect_uris],
-        grant_types: Array.isArray(grant_types) ? grant_types : [grant_types],
-        token_endpoint_auth_method: 'none'
-      })
-
-      console.log(`✅ Client ${clientData.client_id} successfully created in Auth0`)
-
-      const clientRegistration = {
-        client_id: clientData.client_id,
-        client_name,
-        redirect_uris: Array.isArray(redirect_uris) ? redirect_uris : [redirect_uris],
-        grant_types: Array.isArray(grant_types) ? grant_types : [grant_types],
-        response_types: Array.isArray(response_types) ? response_types : [response_types],
-        scope,
-        client_id_issued_at: Math.floor(Date.now() / 1000),
-        token_endpoint_auth_method: 'none'
-      }
-
-      res.status(201).json(clientRegistration)
-    } catch (error) {
-      console.error('❌ DCR registration failed:', error)
-      res.status(400).json({
-        error: 'invalid_request',
-        error_description: `Dynamic client registration failed: ${error instanceof Error ? error.message : String(error)}`
-      })
-    }
-  }
-
-  /**
-   * Handle OAuth authorization with client mapping
-   */
-  private async handleOAuthAuthorize(req: Request, res: Response): Promise<void> {
-    try {
-      const { client_id, redirect_uri, state, scope, response_type, code_challenge, code_challenge_method } = req.query
-
-      console.log(`🔐 OAuth authorize request for client: ${client_id}`)
-      
-      if (!client_id || typeof client_id !== 'string') {
-        res.status(400).json({ error: 'invalid_request', error_description: 'Invalid client_id' })
-        return
-      }
-
-      // Try to find mapped client or create new one
-      let mappedClientId = client_id
-      const existingMapping = await this.findMappedClient(client_id)
-      
-      if (existingMapping) {
-        mappedClientId = existingMapping
-      } else {
-        // Create new client and store mapping
-        const clientData = await this.createAuth0Client({
-          name: `Claude MCP Client (${client_id.substring(0, 8)}...)`,
-          app_type: 'spa', // Single Page Application for public clients
-          callbacks: [redirect_uri as string || 'https://claude.ai/api/mcp/auth_callback'],
-          grant_types: ['authorization_code'],
-          token_endpoint_auth_method: 'none'
-        })
-        
-        await this.storeClientMapping(client_id, clientData.client_id)
-        mappedClientId = clientData.client_id
-      }
-
-      // Redirect to Auth0 with mapped client ID
-      const params = new URLSearchParams({
-        response_type: response_type as string || 'code',
-        client_id: mappedClientId,
-        redirect_uri: redirect_uri as string,
-        scope: scope as string || 'mcp:read mcp:write mcp:admin',
-        state: state as string,
-        ...(code_challenge && { code_challenge: code_challenge as string }),
-        ...(code_challenge_method && { code_challenge_method: code_challenge_method as string }),
-        ...(this.config.oauth?.audience && { resource: this.config.oauth.audience })
-      })
-
-      const auth0Url = `${this.config.oauth?.authorizationEndpoint}?${params.toString()}`
-      res.redirect(auth0Url)
-    } catch (error) {
-      console.error('❌ OAuth authorize error:', error)
-      res.status(500).json({ error: 'server_error', error_description: 'Internal server error' })
-    }
-  }
-
-  /**
-   * Handle OAuth token exchange with client ID mapping
-   */
-  private async handleTokenProxy(req: Request, res: Response): Promise<void> {
-    try {
-      const { client_id, code, redirect_uri, grant_type, code_verifier } = req.body
-
-      if (!client_id) {
-        res.status(400).json({ error: 'invalid_request', error_description: 'Missing client_id' })
-        return
-      }
-
-      // Find mapped client ID
-      const mappedClientId = await this.findMappedClient(client_id)
-      if (!mappedClientId) {
-        res.status(400).json({ error: 'invalid_client', error_description: 'Client not found' })
-        return
-      }
-
-      // Proxy token request to Auth0
-      const tokenRequest = {
-        grant_type,
-        client_id: mappedClientId,
-        code,
-        redirect_uri,
-        code_verifier,
-        ...(this.config.oauth?.audience && { audience: this.config.oauth.audience })
-      }
-
-      const tokenResponse = await fetch(this.config.oauth!.tokenEndpoint!, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Accept': 'application/json'
-        },
-        body: new URLSearchParams(tokenRequest).toString()
-      })
-
-      const tokenData = await tokenResponse.json()
-      
-      if (tokenResponse.ok) {
-        res.json(tokenData)
-      } else {
-        res.status(tokenResponse.status).json(tokenData)
-      }
-    } catch (error) {
-      console.error('❌ Token proxy error:', error)
-      res.status(500).json({ error: 'server_error', error_description: 'Internal server error' })
-    }
-  }
-
-  // Helper methods for Auth0 client management
-  private async createAuth0Client(clientData: any): Promise<{ client_id: string; [key: string]: any }> {
-    console.log('🔧 Creating Auth0 client with data:', JSON.stringify(clientData, null, 2))
-    
-    const tokenEndpoint = this.config.oauth!.issuer.endsWith('/') 
-      ? `${this.config.oauth!.issuer}oauth/token`
-      : `${this.config.oauth!.issuer}/oauth/token`
-    
-    const tokenResponse = await fetch(tokenEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: this.config.oauth!.clientId,
-        client_secret: this.config.oauth!.clientSecret,
-        audience: this.config.oauth!.issuer.endsWith('/') 
-          ? `${this.config.oauth!.issuer}api/v2/`
-          : `${this.config.oauth!.issuer}/api/v2/`,
-        grant_type: 'client_credentials'
-      })
-    })
-
-    const tokenData = await tokenResponse.json() as { access_token: string }
-    console.log('✅ Got management API token')
-
-    const clientsEndpoint = this.config.oauth!.issuer.endsWith('/') 
-      ? `${this.config.oauth!.issuer}api/v2/clients`
-      : `${this.config.oauth!.issuer}/api/v2/clients`
-    
-    const createResponse = await fetch(clientsEndpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${tokenData.access_token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(clientData)
-    })
-
-    if (!createResponse.ok) {
-      const errorBody = await createResponse.text()
-      console.error('❌ Auth0 client creation failed:', {
-        status: createResponse.status,
-        statusText: createResponse.statusText,
-        body: errorBody
-      })
-      throw new Error(`Failed to create Auth0 client: ${createResponse.status} - ${errorBody}`)
-    }
-
-    const result = await createResponse.json() as { client_id: string; [key: string]: any }
-    console.log('✅ Auth0 client created:', result.client_id)
-    return result
-  }
-
-  private async findMappedClient(claudeClientId: string): Promise<string | null> {
-    // Simple in-memory mapping for demo - in production use Redis/database
-    return (global as any).clientMappings?.[claudeClientId] || null
-  }
-
-  private async storeClientMapping(claudeClientId: string, auth0ClientId: string): Promise<void> {
-    // Simple in-memory mapping for demo - in production use Redis/database
-    if (!(global as any).clientMappings) {
-      (global as any).clientMappings = {}
-    }
-    (global as any).clientMappings[claudeClientId] = auth0ClientId
-  }
-
-  private async verifyClientExists(clientId: string): Promise<void> {
-    // This would check if client exists in Auth0
-    // For now, we'll assume it doesn't exist to trigger mapping logic
-    throw new Error('Client not found')
-  }
-}
+  }}

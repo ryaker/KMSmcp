@@ -1,0 +1,50 @@
+// Debug version - add this code temporarily to HttpTransport.ts around line 290
+
+// Capture initialize response
+if (req.body?.method === 'initialize') {
+  console.log('==== INITIALIZE DEBUG START ====');
+  
+  // Create a response interceptor
+  const originalSend = res.send;
+  const originalJson = res.json;
+  const originalWrite = res.write;
+  const originalEnd = res.end;
+  
+  let responseData = '';
+  
+  res.send = function(data: any) {
+    console.log('[INIT] Response via send():', typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+    return originalSend.call(this, data);
+  };
+  
+  res.json = function(data: any) {
+    console.log('[INIT] Response via json():', JSON.stringify(data, null, 2));
+    return originalJson.call(this, data);
+  };
+  
+  res.write = function(chunk: any, ...args: any[]) {
+    const str = chunk?.toString ? chunk.toString() : String(chunk);
+    responseData += str;
+    return originalWrite.call(this, chunk, ...args);
+  };
+  
+  res.end = function(chunk?: any, ...args: any[]) {
+    if (chunk) {
+      const str = chunk?.toString ? chunk.toString() : String(chunk);
+      responseData += str;
+    }
+    if (responseData) {
+      console.log('[INIT] Complete response:', responseData);
+      try {
+        const parsed = JSON.parse(responseData);
+        console.log('[INIT] Parsed response:', JSON.stringify(parsed, null, 2));
+        console.log('[INIT] Capabilities:', parsed?.result?.capabilities);
+        console.log('[INIT] Tools:', parsed?.result?.capabilities?.tools);
+      } catch (e) {
+        // Not JSON
+      }
+    }
+    console.log('==== INITIALIZE DEBUG END ====');
+    return originalEnd.call(this, chunk, ...args);
+  };
+}

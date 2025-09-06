@@ -12,20 +12,22 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import Redis from 'ioredis'
-import { HttpTransport } from './transport/HttpTransport'
-import { AuthContext } from './auth/types'
+import { HttpTransport } from './transport/HttpTransport.js'
+import { AuthContext } from './auth/types.js'
 
 // Import our components
-import { KMSConfig } from './types/index'
-import { FACTCache } from './cache/FACTCache'
-import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter'
-import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index'
-import { UnifiedStoreTool, UnifiedSearchTool } from './tools/index'
+import { KMSConfig } from './types/index.js'
+import { FACTCache } from './cache/FACTCache.js'
+import { RedisKeepAlive } from './cache/RedisKeepAlive.js'
+import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js'
+import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index.js'
+import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool } from './tools/index.js'
 
 export class UnifiedKMSServer {
   private server: Server
   private httpTransport?: HttpTransport
   private redis!: Redis
+  private redisKeepAlive?: RedisKeepAlive
   private factCache!: FACTCache
   private router!: IntelligentStorageRouter
   private storage!: {
@@ -36,6 +38,7 @@ export class UnifiedKMSServer {
   private tools!: {
     store: UnifiedStoreTool
     search: UnifiedSearchTool
+    instructions: KMSInstructionsTool
   }
 
   constructor(private config: KMSConfig) {
@@ -67,7 +70,9 @@ export class UnifiedKMSServer {
     this.redis = new Redis(this.config.redis.uri, {
       maxRetriesPerRequest: 1,
       enableOfflineQueue: false,
-      lazyConnect: true
+      lazyConnect: true,
+      connectTimeout: 3000, // 3 second timeout
+      commandTimeout: 2000  // 2 second command timeout
     })
     
     // Handle Redis connection errors gracefully
@@ -77,6 +82,12 @@ export class UnifiedKMSServer {
     
     this.redis.on('connect', () => {
       console.log('✅ Redis cache connected')
+      
+      // Start Redis keep-alive only when connected
+      if (!this.redisKeepAlive) {
+        this.redisKeepAlive = new RedisKeepAlive(this.redis, 60 * 24) // 24 hours
+        this.redisKeepAlive.start()
+      }
     })
     
     this.redis.on('close', () => {
@@ -84,6 +95,11 @@ export class UnifiedKMSServer {
     })
     
     this.factCache = new FACTCache(this.config.fact, this.redis)
+    
+    // Connect to Redis asynchronously (don't block startup)
+    this.redis.connect().catch(err => {
+      console.warn('⚠️  Redis connection failed (cache will use L1 only):', err.message)
+    })
     
     // Step 2: Initialize storage systems
     console.log('📊 Initializing Storage Systems...')
@@ -108,7 +124,8 @@ export class UnifiedKMSServer {
     console.log('🛠️  Initializing Tools...')
     this.tools = {
       store: new UnifiedStoreTool(this.router, this.storage, this.factCache),
-      search: new UnifiedSearchTool(this.storage, this.factCache)
+      search: new UnifiedSearchTool(this.storage, this.factCache),
+      instructions: new KMSInstructionsTool()
     }
     
     // Step 5: Initialize HTTP transport if needed
@@ -196,6 +213,9 @@ export class UnifiedKMSServer {
    */
   private async handleInitialize(request: any, authContext: AuthContext): Promise<any> {
     console.log(`🚀 Handling initialize request for client: ${request.params?.clientInfo?.name}`)
+    console.log(`📥 Full initialize request:`, JSON.stringify(request, null, 2))
+    console.log(`📥 Request params:`, JSON.stringify(request.params, null, 2))
+    console.log(`📥 Protocol version from client:`, request.params?.protocolVersion)
     
     const response = {
       jsonrpc: '2.0',
@@ -218,6 +238,19 @@ export class UnifiedKMSServer {
     }
     
     console.log(`📤 Sending initialize response:`, JSON.stringify(response, null, 2))
+    console.log(`📤 Response capabilities:`, JSON.stringify(response.result.capabilities, null, 2))
+    console.log(`📤 Response tools capability:`, JSON.stringify(response.result.capabilities.tools, null, 2))
+    
+    // CRITICAL DEBUG - What exactly are we returning?
+    console.log('=== EXACT INITIALIZE RESPONSE ===');
+    console.log('Full response object:', response);
+    console.log('Response type:', typeof response);
+    console.log('Response keys:', Object.keys(response));
+    console.log('Result keys:', Object.keys(response.result));
+    console.log('Capabilities value:', response.result.capabilities);
+    console.log('Tools value:', response.result.capabilities.tools);
+    console.log('=== END INITIALIZE RESPONSE ===');
+    
     return response
   }
 
@@ -235,18 +268,24 @@ export class UnifiedKMSServer {
    */
   private async handleListTools(request: any, authContext: AuthContext): Promise<any> {
     console.log(`🔧 Handling tools/list request - this means Claude is proceeding after initialize!`)
+    console.log(`📥 Full tools/list request:`, JSON.stringify(request, null, 2))
     
     // For now, all authenticated users get access to all tools  
     // In production, you might want to filter tools based on user roles/scopes
     const tools = this.getToolDefinitions()
     
     console.log(`📤 Returning ${tools.length} tools to client`)
+    console.log(`📤 First tool being returned:`, JSON.stringify(tools[0], null, 2))
     
-    return {
+    const response = {
       jsonrpc: '2.0',
       result: { tools },
       id: request.id
     }
+    
+    console.log(`📤 Full tools/list response:`, JSON.stringify(response, null, 2).substring(0, 1000) + '...')
+    
+    return response
   }
 
   /**
@@ -295,6 +334,10 @@ export class UnifiedKMSServer {
 
       case 'test_mem0_direct_search':
         result = await this.testMem0DirectSearch(args)
+        break
+
+      case 'kms_instructions':
+        result = await this.tools.instructions.execute(args)
         break
 
       default:
@@ -553,6 +596,20 @@ export class UnifiedKMSServer {
           },
           required: ['query']
         }
+      },
+      {
+        name: 'kms_instructions',
+        description: 'Get instructions on how to autonomously use the Knowledge Management System effectively',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            topic: {
+              type: 'string',
+              description: 'Specific KMS usage topic (workflow, best_practices, search_patterns, storage_guidelines)',
+              enum: ['workflow', 'best_practices', 'search_patterns', 'storage_guidelines', 'overview']
+            }
+          }
+        }
       }
     ]
   }
@@ -604,6 +661,10 @@ export class UnifiedKMSServer {
 
           case 'test_mem0_direct_search':
             result = await this.testMem0DirectSearch(args)
+            break
+
+          case 'kms_instructions':
+            result = await this.tools.instructions.execute(args)
             break
 
           default:
@@ -790,6 +851,11 @@ export class UnifiedKMSServer {
   async close(): Promise<void> {
     console.log('🔌 Closing Unified KMS Server...')
     
+    // Stop Redis keep-alive
+    if (this.redisKeepAlive) {
+      this.redisKeepAlive.stop()
+    }
+    
     const promises = [
       this.storage.mongodb.close(),
       this.storage.neo4j.close(),
@@ -839,7 +905,7 @@ async function main() {
     transport: {
       mode: (process.env.TRANSPORT_MODE as 'stdio' | 'http' | 'dual') || 'stdio',
       http: process.env.TRANSPORT_MODE !== 'stdio' ? {
-        port: parseInt(process.env.HTTP_PORT || '3001'),
+        port: parseInt(process.env.PORT || process.env.HTTP_PORT || '3001'), // Railway provides PORT
         host: process.env.HTTP_HOST || '0.0.0.0',
         cors: {
           origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
@@ -872,6 +938,7 @@ async function main() {
   // Validate required config
   if (!config.mem0.apiKey) {
     console.error('❌ MEM0_API_KEY environment variable is required')
+    console.error('   Ensure Doppler integration is syncing secrets to Railway')
     process.exit(1)
   }
 

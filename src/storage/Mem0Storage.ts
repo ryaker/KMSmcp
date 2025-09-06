@@ -65,7 +65,7 @@ export class Mem0Storage implements StorageSystem {
           role: 'user', 
           content: knowledge.content 
         }],
-        userId,
+        user_id: userId,
         metadata: {
           kms_id: knowledge.id,
           content_type: knowledge.contentType,

@@ -2,7 +2,7 @@
  * Core Types for Unified KMS MCP Server
  */
 
-import { OAuthConfig } from '../auth/types'
+import { OAuthConfig } from '../auth/types.js'
 
 export interface KMSConfig {
   mongodb: {

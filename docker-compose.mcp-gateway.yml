@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # Main gateway/router
+  mcp-gateway:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx-mcp-gateway.conf:/etc/nginx/nginx.conf:ro
+    environment:
+      - RAILWAY_STATIC_URL=${RAILWAY_STATIC_URL}
+    depends_on:
+      - kms-mcp
+      - coaching-mcp
+      - mongodb-mcp
+      - neo4j-mcp
+
+  # Unified KMS MCP (existing)
+  kms-mcp:
+    build: .
+    environment:
+      - TRANSPORT_MODE=http
+      - HTTP_PORT=3001
+      - HTTP_HOST=0.0.0.0
+    expose:
+      - "3001"
+
+  # Coaching Clone Admin MCP
+  coaching-mcp:
+    image: ryaker/coaching-admin-mcp:latest
+    environment:
+      - TRANSPORT_MODE=http
+      - HTTP_PORT=3002
+      - HTTP_HOST=0.0.0.0
+    expose:
+      - "3002"
+
+  # MongoDB Personal MCP
+  mongodb-mcp:
+    image: ryaker/mongodb-personal-mcp:latest
+    environment:
+      - TRANSPORT_MODE=http
+      - HTTP_PORT=3003
+      - HTTP_HOST=0.0.0.0
+    expose:
+      - "3003"
+
+  # Neo4j Knowledge MCP
+  neo4j-mcp:
+    image: ryaker/neo4j-knowledge-mcp:latest
+    environment:
+      - TRANSPORT_MODE=http
+      - HTTP_PORT=3004
+      - HTTP_HOST=0.0.0.0
+    expose:
+      - "3004"
