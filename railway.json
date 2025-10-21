@@ -6,34 +6,8 @@
   "deploy": {
     "numReplicas": 1,
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
-  },
-  "services": [
-    {
-      "name": "kms-mcp",
-      "source": ".",
-      "domains": ["mcp.yaker.org"],
-      "healthcheckPath": "/health",
-      "port": 8080,
-      "internalPort": 8080
-    },
-    {
-      "name": "coaching-mcp", 
-      "source": "github:ryaker/coaching-clone-admin",
-      "port": 3002,
-      "internalPort": 3002
-    },
-    {
-      "name": "mongodb-mcp",
-      "source": "github:ryaker/mongodb-personal-mcp",
-      "port": 3003,
-      "internalPort": 3003
-    },
-    {
-      "name": "neo4j-mcp",
-      "source": "github:ryaker/neo4j-knowledge-mcp",
-      "port": 3004,
-      "internalPort": 3004
-    }
-  ]
+    "restartPolicyMaxRetries": 10,
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 300
+  }
 }
