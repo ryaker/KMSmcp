@@ -304,41 +304,41 @@ export class UnifiedKMSServer {
         return [
             {
                 name: 'unified_store',
-                description: 'Store knowledge with intelligent routing to optimal storage system',
+                description: 'Store knowledge with AI-powered inference. Just provide content - the system intelligently detects type, project, tags, and relationships. Examples: "Fixed OAuth bug with JWKS endpoint", "Realized morning sessions work best", "Always use TypeScript strict mode"',
                 inputSchema: {
                     type: 'object',
                     properties: {
                         content: {
                             type: 'string',
-                            description: 'Knowledge content to store'
+                            description: 'The knowledge to store. Can be a solution, insight, preference, pattern, fact, or procedure. The system will intelligently categorize it.'
                         },
                         contentType: {
                             type: 'string',
                             enum: ['memory', 'insight', 'pattern', 'relationship', 'fact', 'procedure'],
-                            description: 'Type of knowledge being stored'
+                            description: 'OPTIONAL - Auto-detected if not provided. memory=preferences/experiences, insight=realizations, pattern=recurring behaviors, procedure=solutions/fixes, fact=configuration/data'
                         },
                         source: {
                             type: 'string',
                             enum: ['coaching', 'personal', 'technical', 'cross_domain'],
-                            description: 'Source domain of the knowledge'
+                            description: 'OPTIONAL - Auto-detected based on content. technical=code/bugs, personal=preferences/insights, cross_domain=general knowledge'
                         },
                         userId: {
                             type: 'string',
-                            description: 'User ID (optional)'
+                            description: 'OPTIONAL - Defaults to "personal" for your knowledge base'
                         },
                         coachId: {
                             type: 'string',
-                            description: 'Coach ID (optional)'
+                            description: 'OPTIONAL - Only needed for coaching-specific content'
                         },
                         metadata: {
                             type: 'object',
-                            description: 'Additional metadata'
+                            description: 'OPTIONAL - Additional context. Auto-enhanced with detected project, language, frameworks, and temporal context'
                         },
                         confidence: {
                             type: 'number',
                             minimum: 0,
                             maximum: 1,
-                            description: 'Confidence score (0-1)'
+                            description: 'OPTIONAL - How certain you are (0-1). Auto-calculated based on content clarity if not provided'
                         },
                         relationships: {
                             type: 'array',
@@ -351,10 +351,10 @@ export class UnifiedKMSServer {
                                 },
                                 required: ['targetId', 'type', 'strength']
                             },
-                            description: 'Relationships to other knowledge nodes'
+                            description: 'OPTIONAL - Links to related knowledge. System suggests relationships like SOLVES, REQUIRES, CAUSES, SIMILAR_TO'
                         }
                     },
-                    required: ['content', 'contentType', 'source']
+                    required: ['content']
                 }
             },
             {

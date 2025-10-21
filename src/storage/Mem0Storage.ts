@@ -234,8 +234,12 @@ export class Mem0Storage implements StorageSystem {
       return `coach_${query.filters.coachId}`
     }
     
-    // Use configured default user ID or fall back to system_global
-    return this.config.defaultUserId || 'system_global'
+    // MUST use configured default user ID - this should be set in environment
+    if (!this.config.defaultUserId) {
+      throw new Error('MEM0_DEFAULT_USER_ID must be configured in environment')
+    }
+    
+    return this.config.defaultUserId
   }
 
   private buildMem0Filters(filters?: KnowledgeQuery['filters']): any {
