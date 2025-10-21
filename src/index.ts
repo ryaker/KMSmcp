@@ -935,10 +935,79 @@ async function main() {
     } : undefined
   }
 
+  // Debug: Log environment variable availability
+  console.log('\n🔍 Environment Variables Debug:')
+  console.log('━'.repeat(60))
+
+  // Core required variables
+  console.log('📌 CRITICAL VARIABLES:')
+  console.log(`   MEM0_API_KEY: ${process.env.MEM0_API_KEY ? '✅ SET (length: ' + process.env.MEM0_API_KEY.length + ')' : '❌ MISSING'}`)
+  console.log(`   MEM0_DEFAULT_USER_ID: ${process.env.MEM0_DEFAULT_USER_ID ? '✅ ' + process.env.MEM0_DEFAULT_USER_ID : '❌ MISSING'}`)
+
+  // Database variables
+  console.log('\n📌 DATABASE VARIABLES:')
+  console.log(`   MONGODB_ATLAS_URI: ${process.env.MONGODB_ATLAS_URI ? '✅ SET' : '❌ MISSING'}`)
+  console.log(`   NEO4J_AURA_URI: ${process.env.NEO4J_AURA_URI ? '✅ SET' : '❌ MISSING'}`)
+  console.log(`   NEO4J_AURA_USERNAME: ${process.env.NEO4J_AURA_USERNAME ? '✅ SET' : '❌ MISSING'}`)
+  console.log(`   NEO4J_AURA_PASSWORD: ${process.env.NEO4J_AURA_PASSWORD ? '✅ SET (length: ' + (process.env.NEO4J_AURA_PASSWORD?.length || 0) + ')' : '❌ MISSING'}`)
+  console.log(`   REDIS_CLOUD_URI: ${process.env.REDIS_CLOUD_URI ? '✅ SET' : '❌ MISSING'}`)
+
+  // OAuth variables
+  console.log('\n📌 OAUTH VARIABLES:')
+  console.log(`   OAUTH_ENABLED: ${process.env.OAUTH_ENABLED || 'false'}`)
+  if (process.env.OAUTH_ENABLED === 'true') {
+    console.log(`   OAUTH_ISSUER: ${process.env.OAUTH_ISSUER ? '✅ ' + process.env.OAUTH_ISSUER : '❌ MISSING'}`)
+    console.log(`   OAUTH_AUDIENCE: ${process.env.OAUTH_AUDIENCE ? '✅ ' + process.env.OAUTH_AUDIENCE : '❌ MISSING'}`)
+    console.log(`   OAUTH_CLIENT_ID: ${process.env.OAUTH_CLIENT_ID ? '✅ SET' : '❌ MISSING'}`)
+    console.log(`   OAUTH_JWKS_URI: ${process.env.OAUTH_JWKS_URI ? '✅ SET' : '❌ MISSING'}`)
+  }
+
+  // Transport variables
+  console.log('\n📌 TRANSPORT VARIABLES:')
+  console.log(`   TRANSPORT_MODE: ${process.env.TRANSPORT_MODE || 'stdio (default)'}`)
+  console.log(`   PORT: ${process.env.PORT || 'not set'}`)
+  console.log(`   HTTP_PORT: ${process.env.HTTP_PORT || 'not set'}`)
+  console.log(`   NODE_ENV: ${process.env.NODE_ENV || 'not set'}`)
+
+  // Doppler debug info
+  console.log('\n📌 DOPPLER INTEGRATION DEBUG:')
+  console.log(`   DOPPLER_PROJECT: ${process.env.DOPPLER_PROJECT || 'not set'}`)
+  console.log(`   DOPPLER_CONFIG: ${process.env.DOPPLER_CONFIG || 'not set'}`)
+  console.log(`   DOPPLER_ENVIRONMENT: ${process.env.DOPPLER_ENVIRONMENT || 'not set'}`)
+
+  // List ALL environment variables that start with known prefixes
+  console.log('\n📌 ALL RELEVANT ENV VARS:')
+  const relevantPrefixes = ['MEM0', 'MONGO', 'NEO4J', 'REDIS', 'OAUTH', 'TRANSPORT', 'HTTP', 'CORS', 'DOPPLER', 'RAILWAY', 'PORT', 'NODE_ENV']
+  const allEnvVars = Object.keys(process.env)
+    .filter(key => relevantPrefixes.some(prefix => key.startsWith(prefix)))
+    .sort()
+
+  if (allEnvVars.length > 0) {
+    allEnvVars.forEach(key => {
+      const value = process.env[key]
+      const displayValue = key.includes('KEY') || key.includes('PASSWORD') || key.includes('SECRET') || key.includes('URI')
+        ? `SET (length: ${value?.length || 0})`
+        : value
+      console.log(`   ${key}: ${displayValue}`)
+    })
+  } else {
+    console.log('   ⚠️  NO environment variables with expected prefixes found!')
+    console.log('   This suggests Doppler integration is NOT syncing to Railway')
+  }
+
+  console.log('━'.repeat(60))
+  console.log('')
+
   // Validate required config
   if (!config.mem0.apiKey) {
     console.error('❌ MEM0_API_KEY environment variable is required')
     console.error('   Ensure Doppler integration is syncing secrets to Railway')
+    console.error('\n💡 TROUBLESHOOTING:')
+    console.error('   1. Check Railway dashboard → Settings → Integrations → Doppler')
+    console.error('   2. Verify Doppler project is set to: ry-local')
+    console.error('   3. Verify Doppler config is set to: dev')
+    console.error('   4. Check Doppler dashboard has MEM0_API_KEY in ry-local/dev')
+    console.error('   5. Try re-syncing the Doppler integration in Railway')
     process.exit(1)
   }
 

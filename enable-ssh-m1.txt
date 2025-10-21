@@ -1,0 +1,20 @@
+# Run these commands on your M1 Mini:
+
+# 1. Enable SSH
+sudo systemsetup -setremotelogin on
+
+# 2. Check if it's enabled
+sudo systemsetup -getremotelogin
+
+# 3. Check firewall isn't blocking
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+
+# 4. If firewall is on, add SSH
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/libexec/sshd-keygen-wrapper
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /usr/libexec/sshd-keygen-wrapper
+
+# 5. Verify SSH is listening
+sudo lsof -i :22
+
+# Should show your IP and username like:
+# ssh ryaker@192.168.4.164

@@ -147,3 +147,90 @@ The more you search and find useful previous knowledge, the more natural it beco
 ## Implementation Goals
 
 Make memory integration so smooth and natural that it becomes automatic - like how you naturally break down complex problems or connect related concepts. The unified MCP handles the technical complexity while you focus on the conceptual richness of multi-dimensional memory.
+## 🔍 SemTools - Semantic Filesystem for Document Intelligence
+
+### Overview
+SemTools provides semantic search and document parsing capabilities, transforming Claude Code into a general document intelligence agent beyond just code.
+
+### Components
+- **`parse`** - Converts non-searchable documents (PDFs, DOCX, PPTX, etc.) to markdown using LlamaParse API
+- **`search`** - Local semantic keyword search using multilingual embeddings (no cloud dependency)
+- **`workspace`** - Persistent caching for blazing-fast repeated searches
+
+### Installation & Configuration
+```bash
+# Already installed globally via npm
+# API key configured in ~/.zshrc
+export LLAMA_CLOUD_API_KEY="REDACTED_API_KEY"
+```
+
+### Common Usage Patterns
+
+#### Basic Parse and Search
+```bash
+# Parse PDFs and search for specific content
+parse document.pdf | xargs cat | search "error handling" --n-lines 30
+
+# Search across multiple parsed documents
+parse my_docs/*.pdf | xargs search "API endpoints" --n-lines 30 --max-distance 0.3
+
+# Direct search on text files
+search "machine learning" *.txt --n-lines 30 --top-k 10
+```
+
+#### Using Workspaces for Large Collections
+```bash
+# Create/use a workspace for persistent indexing
+workspace use my-workspace
+export SEMTOOLS_WORKSPACE=my-workspace
+
+# Initial search (creates index)
+search "financial analysis" docs/*.pdf --n-lines 30 --top-k 10
+
+# Subsequent searches use cached embeddings (MUCH faster)
+search "quarterly earnings" docs/*.pdf --n-lines 30 --max-distance 0.3
+
+# Check workspace status
+workspace status
+
+# Clean up stale files
+workspace prune
+```
+
+#### Advanced Pipelines
+```bash
+# Combine with grep for precise filtering
+parse *.pdf | xargs cat | grep -i "revenue" | search "Q3 2024" --max-distance 0.2
+
+# Multi-stage pipeline
+find . -name "*.pdf" -mtime -30 | xargs parse | xargs search "compliance" --n-lines 50
+
+# Parse and create searchable knowledge base
+parse reports/*.pdf contracts/*.docx | tee parsed_files.txt | xargs search "liability clause" --n-lines 40
+```
+
+### Best Practices for Claude Code
+
+1. **Always use workspaces** for repeated searches over the same files
+2. **Set --n-lines to 30-50** for adequate context (default 3 is too small)
+3. **Use --ignore-case** flag for case-insensitive search
+4. **Parse first** when dealing with PDFs, Word docs, or other non-text formats
+5. **Combine --max-distance and --top-k** for optimal results
+6. **Cache parsed files** - they're stored in ~/.parse/ automatically
+
+### Use Cases
+
+- **Financial Analysis**: Parse quarterly reports, search for specific metrics
+- **Legal Review**: Search contracts for specific clauses semantically
+- **Research Synthesis**: Analyze academic papers, extract methodologies
+- **Technical Documentation**: Find info across mixed format docs
+- **Knowledge Mining**: Create searchable indexes of company documents
+
+### Tips
+
+- Parsed files are cached in `~/.parse/` - reuse them!
+- Workspaces are stored in `~/.semtools/workspaces/`
+- Use `--max-distance 0.3` for semantic similarity (lower = more similar)
+- Use `--top-k` when you want a fixed number of results
+- Combine with standard Unix tools (grep, awk, sed) for powerful pipelines
+

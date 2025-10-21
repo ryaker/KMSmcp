@@ -7,6 +7,7 @@ import { UnifiedKnowledge, StorageDecision, SystemName } from '../types/index.js
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Neo4jStorage, Mem0Storage } from '../storage/index.js'
+import { ContentInference } from '../inference/ContentInference.js'
 
 export class UnifiedStoreTool {
   private router: IntelligentStorageRouter
@@ -33,8 +34,8 @@ export class UnifiedStoreTool {
    */
   async store(args: {
     content: string
-    contentType: 'memory' | 'insight' | 'pattern' | 'relationship' | 'fact' | 'procedure'
-    source: 'coaching' | 'personal' | 'technical' | 'cross_domain'
+    contentType?: 'memory' | 'insight' | 'pattern' | 'relationship' | 'fact' | 'procedure'
+    source?: 'coaching' | 'personal' | 'technical' | 'cross_domain'
     userId?: string
     coachId?: string
     metadata?: Record<string, any>
@@ -56,24 +57,65 @@ export class UnifiedStoreTool {
     }
   }> {
     const startTime = Date.now()
-    
+
     console.log(`\n🚀 UNIFIED STORE Starting...`)
     console.log(`📝 Content: "${args.content.slice(0, 100)}${args.content.length > 100 ? '...' : ''}"`)
-    console.log(`🏷️  Type: ${args.contentType}, Source: ${args.source}`)
-    console.log(`👤 User: ${args.userId || 'none'}, Coach: ${args.coachId || 'none'}`)
+
+    // Apply smart inference if needed
+    let enrichedArgs = { ...args }
+    const inference = ContentInference.analyze(args.content)
+
+    // Use inference to fill in missing parameters
+    if (!args.contentType) {
+      enrichedArgs.contentType = inference.contentType
+      console.log(`🧠 Inferred content type: ${inference.contentType} (confidence: ${inference.confidence})`)
+    }
+
+    if (!args.source) {
+      // Infer source based on content and project
+      if (inference.detectedProject) {
+        enrichedArgs.source = 'technical'
+      } else if (inference.contentType === 'memory' || inference.contentType === 'insight') {
+        enrichedArgs.source = 'personal'
+      } else {
+        enrichedArgs.source = 'cross_domain'
+      }
+      console.log(`🧠 Inferred source: ${enrichedArgs.source}`)
+    }
+
+    // Enhance metadata with inference
+    const enhancedMetadata = ContentInference.generateMetadata(args.content, args.metadata)
+    enrichedArgs.metadata = enhancedMetadata
+
+    // Use inferred confidence if not provided
+    if (!args.confidence) {
+      enrichedArgs.confidence = inference.confidence
+    }
+
+    // Suggest relationships if none provided
+    if (!args.relationships || args.relationships.length === 0) {
+      const suggestedRelationships = ContentInference.suggestRelationships(args.content)
+      if (suggestedRelationships.length > 0) {
+        console.log(`💡 Suggested relationships: ${suggestedRelationships.map(r => r.type).join(', ')}`)
+      }
+    }
+
+    console.log(`🏷️  Type: ${enrichedArgs.contentType}, Source: ${enrichedArgs.source}`)
+    console.log(`👤 User: ${enrichedArgs.userId || 'auto'}, Context: ${inference.detectedProject || 'general'}`)
+    console.log(`🏷️  Tags: ${enhancedMetadata.tags?.join(', ') || 'none'}`)
 
     // Create unified knowledge object
     const knowledge: UnifiedKnowledge = {
       id: crypto.randomUUID(),
       content: args.content,
-      contentType: args.contentType,
-      source: args.source,
-      userId: args.userId,
-      coachId: args.coachId,
-      metadata: args.metadata || {},
+      contentType: enrichedArgs.contentType!,
+      source: enrichedArgs.source!,
+      userId: enrichedArgs.userId || 'personal',
+      coachId: enrichedArgs.coachId,
+      metadata: enrichedArgs.metadata || {},
       timestamp: new Date(),
-      confidence: args.confidence || 0.8,
-      relationships: args.relationships || []
+      confidence: enrichedArgs.confidence || 0.8,
+      relationships: enrichedArgs.relationships || []
     }
 
     // Step 1: Get intelligent storage decision
