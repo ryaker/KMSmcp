@@ -160,8 +160,8 @@ SemTools provides semantic search and document parsing capabilities, transformin
 ### Installation & Configuration
 ```bash
 # Already installed globally via npm
-# API key configured in ~/.zshrc
-export LLAMA_CLOUD_API_KEY="REDACTED_API_KEY"
+# API key configured in ~/.zshrc (NEVER commit actual keys to git!)
+export LLAMA_CLOUD_API_KEY="<your-llama-cloud-api-key>"
 ```
 
 ### Common Usage Patterns
