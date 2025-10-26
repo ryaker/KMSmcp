@@ -9,5 +9,12 @@
     "restartPolicyMaxRetries": 10,
     "healthcheckPath": "/health",
     "healthcheckTimeout": 300
-  }
+  },
+  "services": [
+    {
+      "name": "kms-mcp",
+      "source": ".",
+      "domains": ["mcp.yaker.org"]
+    }
+  ]
 }
