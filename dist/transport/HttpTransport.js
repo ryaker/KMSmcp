@@ -185,8 +185,18 @@ export class HttpTransport {
         };
         try {
             const authHeader = req.headers.authorization;
+            // Allow MCP protocol methods (initialize, ping, etc.) without authentication
+            // Only require authentication for tool calls
+            const method = req.body?.method;
+            const isProtocolMethod = method && ['initialize', 'ping', 'notifications/initialized'].includes(method);
             if (!authHeader) {
+                if (isProtocolMethod) {
+                    console.log(`✅ Allowing unauthenticated protocol method: ${method}`);
+                    next();
+                    return;
+                }
                 console.log('🚫 Missing Authorization header from:', clientInfo);
+                console.log(`   Method: ${method || 'unknown'}`);
                 res.status(401).json({ error: 'Missing Authorization header' });
                 return;
             }
