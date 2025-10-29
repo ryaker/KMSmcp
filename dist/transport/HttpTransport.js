@@ -125,7 +125,18 @@ export class HttpTransport {
                 };
                 res.json(metadata);
             });
-            // OAuth 2.0 Protected Resource Metadata for MCP  
+            // OAuth 2.0 Protected Resource Metadata for MCP (legacy path for Claude.ai/Desktop compatibility)
+            this.app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
+                const metadata = {
+                    resource: this.config.oauth.audience,
+                    authorization_servers: [this.config.oauth.issuer],
+                    scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin'],
+                    bearer_methods_supported: ['header'],
+                    resource_documentation: 'https://modelcontextprotocol.io'
+                };
+                res.json(metadata);
+            });
+            // OAuth 2.0 Protected Resource Metadata for MCP V2
             this.app.get('/.well-known/oauth-protected-resource/mcp-v2', (req, res) => {
                 const metadata = {
                     resource: this.config.oauth.audience,
