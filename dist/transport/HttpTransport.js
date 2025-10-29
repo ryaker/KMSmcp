@@ -185,10 +185,17 @@ export class HttpTransport {
         };
         try {
             const authHeader = req.headers.authorization;
-            // Allow MCP protocol methods (initialize, ping, etc.) without authentication
-            // Only require authentication for tool calls
+            // Allow MCP protocol methods (initialize, ping, tools/list, etc.) without authentication
+            // Only require authentication for tool calls (tools/call)
             const method = req.body?.method;
-            const isProtocolMethod = method && ['initialize', 'ping', 'notifications/initialized'].includes(method);
+            const isProtocolMethod = method && [
+                'initialize',
+                'ping',
+                'notifications/initialized',
+                'tools/list',
+                'resources/list',
+                'prompts/list'
+            ].includes(method);
             if (!authHeader) {
                 if (isProtocolMethod) {
                     console.log(`✅ Allowing unauthenticated protocol method: ${method}`);
