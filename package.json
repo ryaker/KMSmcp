@@ -6,7 +6,6 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "postinstall": "npm run build",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "jest",
