@@ -100,19 +100,19 @@ export class Neo4jStorage implements StorageSystem {
       const filterClauses: string[] = []
       if (query.filters?.userId) {
         params.userId = query.filters.userId
-        filterClauses.push('(k.userId IS NULL OR k.userId = $userId)')
+        filterClauses.push('k.userId = $userId')
       }
       if (query.filters?.source && query.filters.source.length > 0) {
         params.sources = query.filters.source
-        filterClauses.push('(k.source IS NULL OR k.source IN $sources)')
+        filterClauses.push('k.source IN $sources')
       }
       if (query.filters?.contentType && query.filters.contentType.length > 0) {
         params.contentTypes = query.filters.contentType
-        filterClauses.push('(k.contentType IS NULL OR k.contentType IN $contentTypes)')
+        filterClauses.push('k.contentType IN $contentTypes')
       }
       if (query.filters?.minConfidence !== undefined) {
         params.minConfidence = query.filters.minConfidence
-        filterClauses.push('(k.confidence IS NULL OR k.confidence >= $minConfidence)')
+        filterClauses.push('k.confidence >= $minConfidence')
       }
       const whereClause = filterClauses.length > 0 ? `WHERE ${filterClauses.join(' AND ')}` : ''
 
@@ -379,7 +379,24 @@ export class Neo4jStorage implements StorageSystem {
         CREATE INDEX knowledge_confidence_index IF NOT EXISTS
         FOR (k:Knowledge) ON (k.confidence)
       `)
-      
+
+      // Full-text index used by search() for broad keyword search across all node types.
+      // knowledge_search covers the main content/name fields on Knowledge and entity nodes.
+      try {
+        await session.run(`
+          CALL db.index.fulltext.createNodeIndex(
+            'knowledge_search',
+            ['Knowledge','Person','Organization','Project','Technology','Concept','Service','Event'],
+            ['name','content','description','notes','headline','profession','career','purpose','industry']
+          )
+        `)
+      } catch (ftErr: any) {
+        // Index already exists — this is not an error; Neo4j throws if the name is taken
+        if (!String(ftErr?.message || '').includes('already exists')) {
+          throw ftErr
+        }
+      }
+
       console.log('🔗 Neo4j constraints and indexes created')
     } catch (error) {
       console.warn('⚠️ Neo4j constraint creation warning:', error)

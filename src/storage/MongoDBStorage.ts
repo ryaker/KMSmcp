@@ -50,7 +50,7 @@ export class MongoDBStorage implements StorageSystem {
         const keywords = query.query
           .split(/\s+/)
           .map(k => k.trim())
-          .filter(k => k.length > 0) // keep all non-empty tokens, including short ones like "AI", "C#"
+          .filter(k => k.length >= 2) // keep short technical terms like "AI", "C#" but skip noisy 1-char tokens
 
         if (keywords.length > 0) {
           filter.$or = keywords.flatMap(k => [

@@ -254,7 +254,7 @@ export class Mem0Storage implements StorageSystem {
     return [defaultUserId, 'system_technical', 'system_global']
   }
 
-  async testDirectSearch(query: string, userId: string = process.env.KMS_DEFAULT_USER_ID || 'personal'): Promise<any> {
+  async testDirectSearch(query: string, userId: string = this.config.defaultUserId || 'personal'): Promise<any> {
     try {
       console.log(`🧪 [Mem0Storage.testDirectSearch] Testing direct search for: "${query}" with user: ${userId}`)
       

@@ -219,8 +219,11 @@ export class FACTCache implements FACTCacheLayer {
   /**
    * Generate cache key for search queries
    */
-  static generateSearchKey(query: string, filters?: any): string {
-    const payload = filters ? `${query}\0${JSON.stringify(filters)}` : query
+  static generateSearchKey(query: string, filters?: any, options?: any): string {
+    const parts: string[] = [query]
+    if (filters) parts.push(JSON.stringify(filters))
+    if (options) parts.push(JSON.stringify(options))
+    const payload = parts.join('\0')
     const hash = createHash('sha256').update(payload).digest('hex').slice(0, 32)
     return `kms:search:${hash}`
   }

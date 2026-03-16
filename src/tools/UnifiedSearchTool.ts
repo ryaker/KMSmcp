@@ -92,7 +92,7 @@ export class UnifiedSearchTool {
 
     // Step 1: Check cache first
     const cacheCheckStart = Date.now()
-    const cacheKey = this.cache ? FACTCache.generateSearchKey(args.query, args.filters) : ''
+    const cacheKey = this.cache ? FACTCache.generateSearchKey(args.query, args.filters, args.options) : ''
     const cached = this.cache ? await this.cache.get<{
       results: any[]
       totalFound: number

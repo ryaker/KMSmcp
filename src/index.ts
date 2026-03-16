@@ -372,6 +372,10 @@ export class UnifiedKMSServer {
         result = await this.tools.instructions.execute(args)
         break
 
+      case 'kms_ping':
+        result = await this.handleKmsPing()
+        break
+
       default:
         throw new Error(`Tool ${name} not found`)
     }
