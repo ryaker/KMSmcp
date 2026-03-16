@@ -18,6 +18,15 @@ export class IntelligentStorageRouter {
       primary: 'mem0',
       reasoning: 'Personal experiences, preferences, and interests are semantic memories best stored in Mem0 for contextual recall'
     },
+
+    // Career and professional life facts - Mem0 for recall, Neo4j for entity graph (person → company → outcome)
+    {
+      pattern: /interview|job|position|role|career|hired|rejected|offer|salary|company|worked at|applied|joined|left|promoted|fired|laid off|startup|founded|internship|contract|freelance|consulting|employment|resignation|promotion/i,
+      contentTypes: ['fact', 'memory'],
+      primary: 'mem0',
+      dualPrimary: ['mem0', 'neo4j'],
+      reasoning: 'Career facts belong in Mem0 for recall and Neo4j for relationship graph (person → company → outcome)'
+    },
     
     // Relationships between concepts, people, ideas - route to Neo4j
     {
@@ -84,7 +93,7 @@ export class IntelligentStorageRouter {
     console.log(`   Content Type: ${contentType}, Source: ${source}, User: ${userId}`)
     
     // Find matching rule
-    const matchingRule = this.findMatchingRule(content, contentType)
+    const matchingRule = this.findMatchingRule(content, contentType, source)
     
     if (matchingRule) {
       // Check if this rule specifies dual primary storage
@@ -135,23 +144,33 @@ export class IntelligentStorageRouter {
   /**
    * Find the best matching rule for given content
    */
-  private findMatchingRule(content: string, contentType?: string): DualPrimaryRule | null {
-    // First try to match by content type
+  private findMatchingRule(content: string, contentType?: string, source?: string): DualPrimaryRule | null {
+    // Pattern match first — most specific signal
+    const patternMatch = this.rules.find(rule => rule.pattern.test(content))
+    if (patternMatch) {
+      // Skip MongoDB-primary technical rules when source is explicitly personal
+      if (source === 'personal' && patternMatch.primary === 'mongodb' && !patternMatch.dualPrimary) {
+        console.log(`🔍 Pattern matched ${patternMatch.primary} but source=personal — continuing to content type check`)
+      } else {
+        console.log(`🔍 Matched by pattern: ${patternMatch.pattern}`)
+        return patternMatch
+      }
+    }
+
+    // Fall back to content type match, skipping MongoDB-only rules for personal source
     if (contentType) {
-      const typeMatch = this.rules.find(rule => rule.contentTypes.includes(contentType))
+      const typeMatch = this.rules.find(rule => {
+        if (!rule.contentTypes.includes(contentType)) return false
+        // Don't route personal content to MongoDB-only technical rules
+        if (source === 'personal' && rule.primary === 'mongodb' && !rule.dualPrimary) return false
+        return true
+      })
       if (typeMatch) {
         console.log(`📝 Matched by content type: ${contentType}`)
         return typeMatch
       }
     }
-    
-    // Then try to match by content pattern
-    const patternMatch = this.rules.find(rule => rule.pattern.test(content))
-    if (patternMatch) {
-      console.log(`🔍 Matched by pattern: ${patternMatch.pattern}`)
-      return patternMatch
-    }
-    
+
     console.log(`❌ No rule matched for content type "${contentType}" or content pattern`)
     return null
   }
@@ -189,10 +208,13 @@ export class IntelligentStorageRouter {
       case 'mongodb':
         // Structured data in MongoDB → Index in Mem0 for personal search
         secondary.push('mem0')
-        
-        // If it describes relationships, also store in Neo4j
+
+        // Personal source or content describing people/orgs/events → also extract to Neo4j
         const content = knowledge.content || ''
-        if (/relationship|connect|link|associate|relate/i.test(content)) {
+        if (
+          knowledge.source === 'personal' ||
+          /relationship|connect|link|associate|relate|person|company|organization|event/i.test(content)
+        ) {
           secondary.push('neo4j')
         }
         break
