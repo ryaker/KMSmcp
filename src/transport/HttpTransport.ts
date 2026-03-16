@@ -1,6 +1,7 @@
 /**
  * HTTP Transport for Remote MCP Server using official MCP SDK
  * Uses StreamableHTTPServerTransport for proper MCP protocol compliance
+ * Authentication is delegated to the Cloudflare Tunnel/Gateway
  */
 
 import express, { Request, Response, NextFunction } from 'express'
@@ -8,18 +9,17 @@ import cors from 'cors'
 import helmet from 'helmet'
 import rateLimit from 'express-rate-limit'
 import { createServer, Server as HttpServer } from 'http'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { OAuth2Authenticator } from '../auth/OAuth2Authenticator.js'
-import { 
-  OAuthConfig, 
-  AuthContext, 
-  ProtectedResourceMetadata, 
-  AuthorizationServerMetadata 
-} from '../auth/types.js'
+import { AuthContext } from '../auth/types.js'
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
+import {
+  getSessionStats,
+  registerSessionDirect,
+  isKnownSession
+} from './session-middleware.js'
 
 export interface HttpTransportConfig {
   port: number
@@ -32,14 +32,14 @@ export interface HttpTransportConfig {
     windowMs?: number
     max?: number
   }
-  oauth?: OAuthConfig
+  oauth?: any // Kept for type compatibility but ignored
 }
 
 export interface McpServerFactory {
   (): Server
 }
 
-// Extend Request interface to include auth property
+// Extend Request interface
 declare global {
   namespace Express {
     interface Request {
@@ -51,7 +51,6 @@ declare global {
 export class HttpTransport {
   private app: express.Application
   private server?: HttpServer
-  private authenticator?: OAuth2Authenticator
   private mcpServerFactory?: McpServerFactory
   private transports = new Map<string, StreamableHTTPServerTransport>()
 
@@ -59,17 +58,13 @@ export class HttpTransport {
     this.app = express()
     this.setupMiddleware()
     this.setupRoutes()
-    
-    if (config.oauth?.enabled) {
-      this.authenticator = new OAuth2Authenticator(config.oauth)
-    }
   }
 
   /**
    * Setup Express middleware
    */
   private setupMiddleware(): void {
-    // Trust proxy for ngrok/reverse proxy support
+    // Trust proxy for Cloudflare Tunnel support
     this.app.set('trust proxy', 1)
     
     // Security headers
@@ -83,14 +78,14 @@ export class HttpTransport {
       origin: this.config.cors?.origin || true,
       credentials: this.config.cors?.credentials || true,
       methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'mcp-session-id', 'last-event-id']
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'mcp-session-id', 'last-event-id', 'cf-access-jwt-assertion']
     }))
 
     // Rate limiting
     this.app.use(rateLimit({
       windowMs: this.config.rateLimit?.windowMs || 15 * 60 * 1000,
       max: this.config.rateLimit?.max || 1000,
-      message: 'Too many requests from this IP, please try again later.',
+      message: 'Too many requests',
       standardHeaders: true,
       legacyHeaders: false
     }))
@@ -99,13 +94,32 @@ export class HttpTransport {
     this.app.use(express.json({ limit: '10mb' }))
     this.app.use(express.urlencoded({ extended: true }))
 
-    // Request logging
+    // Request logging & Identity Extraction
     this.app.use((req: Request, res: Response, next: NextFunction) => {
       const timestamp = new Date().toISOString()
+      const cfAssertion = req.headers['cf-access-jwt-assertion'] as string
+
       console.log(`${timestamp} ${req.method} ${req.path}`)
-      if (req.method === 'POST' && req.path.includes('/mcp')) {
-        console.log(`  ↳ MCP Request Body:`, JSON.stringify(req.body, null, 2))
+      
+      if (cfAssertion) {
+        try {
+          const payload = JSON.parse(Buffer.from(cfAssertion.split('.')[1], 'base64').toString())
+          // Log only a redacted prefix of the subject to avoid PII in logs
+          const subPreview = typeof payload.sub === 'string' ? payload.sub.slice(0, 8) + '…' : 'unknown'
+          console.log(`  ↳ Identity: sub=${subPreview}`)
+          req.auth = {
+            isAuthenticated: true,
+            user: {
+              id: payload.sub,
+              email: payload.email,
+              name: payload.name || payload.email
+            }
+          }
+        } catch (e) {
+          console.warn('  ↳ Failed to parse Cloudflare Identity header')
+        }
       }
+
       next()
     })
   }
@@ -116,160 +130,29 @@ export class HttpTransport {
   private setupRoutes(): void {
     // Health check
     this.app.get('/health', (req: Request, res: Response) => {
-      res.json({ 
-        status: 'healthy', 
+      const stats = getSessionStats()
+      res.json({
+        status: 'healthy',
+        service: 'kms-mcp',
         timestamp: new Date().toISOString(),
-        version: '2.0.0'
+        version: '2.0.0',
+        sessions: stats,
+        auth: 'tunnel-delegated'
       })
     })
 
-    // OAuth metadata endpoints (if OAuth is enabled)
-    if (this.config.oauth?.enabled) {
-      // OAuth 2.0 Authorization Server Metadata (RFC 8414)
-      // This points to Auth0 as our authorization server
-      this.app.get('/.well-known/oauth-authorization-server', (req: Request, res: Response) => {
-        const issuer = this.config.oauth!.issuer!.replace(/\/$/, '') // Remove trailing slash
-        res.json({
-          issuer: issuer,
-          authorization_endpoint: `${issuer}/authorize`,
-          token_endpoint: `${issuer}/oauth/token`,
-          jwks_uri: this.config.oauth!.jwksUri,
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin', 'openid', 'profile', 'email'],
-          response_types_supported: ['code', 'token', 'id_token', 'code id_token', 'code token', 'token id_token', 'code token id_token'],
-          grant_types_supported: ['authorization_code', 'implicit', 'refresh_token', 'client_credentials'],
-          code_challenge_methods_supported: ['S256', 'plain'],
-          userinfo_endpoint: `${issuer}/userinfo`,
-          token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic']
-        })
-      })
+    // MCP endpoints - No internal auth, trust the tunnel
+    this.app.post('/mcp', this.handleMcpPostRequest.bind(this))
+    this.app.get('/mcp', this.handleMcpGetRequest.bind(this))
+    this.app.delete('/mcp', this.handleMcpDeleteRequest.bind(this))
 
-      // OAuth 2.0 Authorization Server Metadata for MCP
-      this.app.get('/.well-known/oauth-authorization-server/mcp', (req: Request, res: Response) => {
-        const issuer = this.config.oauth!.issuer!.replace(/\/$/, '') // Remove trailing slash
-        res.json({
-          issuer: issuer,
-          authorization_endpoint: `${issuer}/authorize`,
-          token_endpoint: `${issuer}/oauth/token`,
-          jwks_uri: this.config.oauth!.jwksUri,
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin', 'openid', 'profile', 'email'],
-          response_types_supported: ['code', 'token', 'id_token', 'code id_token', 'code token', 'token id_token', 'code token id_token'],
-          grant_types_supported: ['authorization_code', 'implicit', 'refresh_token', 'client_credentials'],
-          code_challenge_methods_supported: ['S256', 'plain'],
-          userinfo_endpoint: `${issuer}/userinfo`,
-          token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic']
-        })
-      })
-
-      // OAuth 2.0 Protected Resource Metadata (RFC 9728)
-      this.app.get('/.well-known/oauth-protected-resource', (req: Request, res: Response) => {
-        const metadata: ProtectedResourceMetadata = {
-          resource: this.config.oauth!.audience!,
-          authorization_servers: [this.config.oauth!.issuer!],
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin'],
-          bearer_methods_supported: ['header'],
-          resource_documentation: 'https://modelcontextprotocol.io'
-        }
-        res.json(metadata)
-      })
-
-      // OAuth 2.0 Protected Resource Metadata for MCP (legacy path for Claude.ai/Desktop compatibility)
-      this.app.get('/.well-known/oauth-protected-resource/mcp', (req: Request, res: Response) => {
-        const metadata: ProtectedResourceMetadata = {
-          resource: this.config.oauth!.audience!,
-          authorization_servers: [this.config.oauth!.issuer!],
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin'],
-          bearer_methods_supported: ['header'],
-          resource_documentation: 'https://modelcontextprotocol.io'
-        }
-        res.json(metadata)
-      })
-
-      // OAuth 2.0 Protected Resource Metadata for MCP V2
-      this.app.get('/.well-known/oauth-protected-resource/mcp-v2', (req: Request, res: Response) => {
-        const metadata: ProtectedResourceMetadata = {
-          resource: this.config.oauth!.audience!,
-          authorization_servers: [this.config.oauth!.issuer!],
-          scopes_supported: ['mcp:read', 'mcp:write', 'mcp:admin'],
-          bearer_methods_supported: ['header'],
-          resource_documentation: 'https://modelcontextprotocol.io'
-        }
-        res.json(metadata)
-      })
-    }
-
-    // MCP endpoints using proper SDK StreamableHTTPServerTransport
-    if (this.config.oauth?.enabled) {
-      this.app.post('/mcp', this.authenticateRequest.bind(this), this.handleMcpPostRequest.bind(this))
-      this.app.get('/mcp', this.authenticateRequest.bind(this), this.handleMcpGetRequest.bind(this))
-      this.app.delete('/mcp', this.authenticateRequest.bind(this), this.handleMcpDeleteRequest.bind(this))
-    } else {
-      this.app.post('/mcp', this.handleMcpPostRequest.bind(this))
-      this.app.get('/mcp', this.handleMcpGetRequest.bind(this))
-      this.app.delete('/mcp', this.handleMcpDeleteRequest.bind(this))
-    }
-
-    // Error handler
+    // Generic error handler
     this.app.use((err: any, req: Request, res: Response, next: NextFunction) => {
       console.error('HTTP Transport Error:', err)
       if (!res.headersSent) {
         res.status(500).json({ error: 'Internal server error' })
       }
     })
-  }
-
-  /**
-   * Authenticate request using OAuth2
-   */
-  private async authenticateRequest(req: Request, res: Response, next: NextFunction): Promise<void> {
-    if (!this.authenticator) {
-      return next()
-    }
-
-    // Log request source information
-    const clientInfo = {
-      ip: req.ip || req.socket.remoteAddress,
-      userAgent: req.headers['user-agent'],
-      origin: req.headers.origin,
-      referer: req.headers.referer,
-      xForwardedFor: req.headers['x-forwarded-for'],
-      xRealIp: req.headers['x-real-ip']
-    }
-
-    try {
-      const authHeader = req.headers.authorization
-
-      // Allow MCP protocol methods (initialize, ping, tools/list, etc.) without authentication
-      // Only require authentication for tool calls (tools/call)
-      const method = req.body?.method
-      const isProtocolMethod = method && [
-        'initialize',
-        'ping',
-        'notifications/initialized',
-        'tools/list',
-        'resources/list',
-        'prompts/list'
-      ].includes(method)
-
-      if (!authHeader) {
-        if (isProtocolMethod) {
-          console.log(`✅ Allowing unauthenticated protocol method: ${method}`)
-          next()
-          return
-        }
-        console.log('🚫 Missing Authorization header from:', clientInfo)
-        console.log(`   Method: ${method || 'unknown'}`)
-        res.status(401).json({ error: 'Missing Authorization header' })
-        return
-      }
-
-      const authContext = await this.authenticator.authenticate(authHeader)
-      req.auth = authContext
-      next()
-    } catch (error) {
-      console.error('❌ Authentication failed from:', clientInfo)
-      console.error('   Error details:', error)
-      res.status(401).json({ error: 'Authentication failed' })
-    }
   }
 
   /**
@@ -280,60 +163,131 @@ export class HttpTransport {
   }
 
   /**
+   * Wrap a Response so SSE output is collected and returned as a single JSON object.
+   * Used for clients (e.g. Anthropic MCP proxy) that send Accept: application/json only.
+   */
+  private wrapResponseForJson(res: Response): Response {
+    let buffer = ''
+    let statusCode = 200
+    const capturedHeaders: Record<string, string> = {}
+
+    const proxy = Object.create(res) as Response
+
+    // Capture status
+    proxy.status = (code: number) => { statusCode = code; return proxy }
+    proxy.writeHead = (code: number, headers?: any) => {
+      statusCode = code
+      if (headers) {
+        Object.assign(capturedHeaders, headers)
+        // Forward non-SSE headers immediately to the real response
+        for (const [key, val] of Object.entries(headers)) {
+          const lower = key.toLowerCase()
+          if (lower !== 'content-type' && lower !== 'cache-control' && lower !== 'connection') {
+            res.setHeader(key, val as string)
+          }
+        }
+      }
+      return res
+    }
+
+    // Suppress SSE-specific headers; we will set our own Content-Type at the end
+    proxy.setHeader = (name: string, value: any) => {
+      const lower = name.toLowerCase()
+      if (lower !== 'content-type' && lower !== 'cache-control' && lower !== 'connection') {
+        capturedHeaders[name] = value
+        res.setHeader(name, value)
+      }
+      return proxy
+    }
+
+    // Buffer SSE chunks
+    proxy.write = (chunk: any) => {
+      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+      return true
+    }
+
+    // On end: parse SSE data lines, send as JSON
+    proxy.end = (chunk?: any) => {
+      if (chunk) buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+
+      const messages: any[] = []
+      for (const line of buffer.split('\n')) {
+        if (line.startsWith('data: ')) {
+          try { messages.push(JSON.parse(line.slice(6))) } catch { /* skip */ }
+        }
+      }
+
+      const body = messages.length === 1 ? messages[0] : messages.length > 1 ? messages : {}
+      console.log(`[json-bridge] SSE→JSON: ${messages.length} message(s), status ${statusCode}`)
+
+      if (!res.headersSent) {
+        res.status(statusCode)
+          .header('Content-Type', 'application/json')
+          .json(body)
+      }
+      return res
+    }
+
+    return proxy
+  }
+
+  /**
    * Handle MCP POST request using StreamableHTTPServerTransport
    */
   private async handleMcpPostRequest(req: Request, res: Response): Promise<void> {
     try {
+      // Detect JSON-only clients (Anthropic MCP proxy sends Accept: application/json only).
+      // The StreamableHTTP SDK requires both application/json AND text/event-stream in Accept.
+      // For JSON-only clients: patch the Accept header and wrap res to convert SSE→JSON.
+      const accept = (req.headers['accept'] || '') as string
+      const wantsSSE = accept.includes('text/event-stream')
+      if (!wantsSSE) {
+        req.headers['accept'] = 'application/json, text/event-stream'
+        res = this.wrapResponseForJson(res)
+        console.log('[json-bridge] JSON-only client detected — SSE→JSON bridge active')
+      }
+
       const sessionId = req.headers['mcp-session-id'] as string
       
-      // Extract client info from request body if it's an initialize request
       if (req.body?.method === 'initialize') {
         const clientInfo = req.body?.params?.clientInfo
         console.log(`📱 MCP Client connecting:`, {
           name: clientInfo?.name || 'unknown',
           version: clientInfo?.version || 'unknown',
-          ip: req.ip || req.socket.remoteAddress,
-          userAgent: req.headers['user-agent'],
           sessionId: sessionId
         })
-      }
-      
-      console.log(sessionId ? `Received MCP POST request for session: ${sessionId}` : 'Received MCP POST request')
-
-      if (this.config.oauth?.enabled && req.auth) {
-        console.log('✅ Authenticated user:', req.auth?.sub || req.auth)
       }
 
       let transport: StreamableHTTPServerTransport
       
       if (sessionId && this.transports.has(sessionId)) {
-        // Reuse existing transport
         transport = this.transports.get(sessionId)!
       } else if (!sessionId && isInitializeRequest(req.body)) {
-        // New initialization request
-        console.log('[Transport] Creating new transport for initialize request')
-        console.log('[Transport] Initialize request body:', JSON.stringify(req.body, null, 2))
-        
         const eventStore = new InMemoryEventStore()
+        const userAgent = req.headers['user-agent'] || 'unknown'
+        const rawIp = req.ip || req.socket.remoteAddress || 'unknown'
+        // Hash the IP so session records are linkable for debugging without storing PII
+        const clientIpHash = typeof rawIp === 'string'
+          ? `ip_${createHash('sha256').update(rawIp).digest('hex').slice(0, 12)}`
+          : 'unknown'
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
-          eventStore, // Enable resumability
+          eventStore,
           onsessioninitialized: (sessionId) => {
-            console.log(`Session initialized with ID: ${sessionId}`)
+            console.log(`Session initialized: ${sessionId}`)
             this.transports.set(sessionId, transport)
+            registerSessionDirect(sessionId, 'kms-mcp', userAgent, clientIpHash)
           }
         })
 
-        // Set up onclose handler to clean up transport when closed
         transport.onclose = () => {
           const sid = transport.sessionId
           if (sid && this.transports.has(sid)) {
-            console.log(`Transport closed for session ${sid}, removing from transports map`)
             this.transports.delete(sid)
           }
         }
 
-        // Connect the transport to the MCP server BEFORE handling the request
         if (this.mcpServerFactory) {
           const server = this.mcpServerFactory()
           await server.connect(transport)
@@ -341,132 +295,86 @@ export class HttpTransport {
           throw new Error('MCP server factory not initialized')
         }
 
-        // Wrap the response to log what's being sent
-        const originalJson = res.json.bind(res)
-        const originalWrite = res.write.bind(res)
-        const originalEnd = res.end.bind(res)
-        
-        res.json = (data: any) => {
-          console.log('[Transport] Response via json():', JSON.stringify(data, null, 2))
-          return originalJson(data)
-        }
-        
-        res.write = (chunk: any, ...args: any[]) => {
-          console.log('[Transport] Response via write():', chunk.toString())
-          return originalWrite(chunk, ...args)
-        }
-        
-        res.end = (chunk: any, ...args: any[]) => {
-          if (chunk) {
-            console.log('[Transport] Response via end():', chunk.toString())
-          }
-          return originalEnd(chunk, ...args)
-        }
-        
         await transport.handleRequest(req, res, req.body)
-        return // Already handled
+        return
+      } else if (sessionId && isKnownSession(sessionId)) {
+        // Session was valid before server restart but is no longer in memory.
+        // Return 404 per MCP spec — client should reinitialize.
+        // (Previous code tried to recover by creating a new transport but passed a non-initialize
+        // body, causing the transport to return 400, which the Anthropic proxy reported as
+        // "Invalid content from server".)
+        console.log(`[Transport] Session ${sessionId.substring(0, 8)}... expired after restart — returning 404 to trigger client reinit`)
+        res.status(404).json({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: 'Session expired: server restarted. Please reinitialize.' },
+          id: req.body?.id ?? null
+        })
+        return
       } else {
-        // Invalid request - no session ID or not initialization request
         res.status(400).json({
           jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'Bad Request: No valid session ID provided',
-          },
+          error: { code: -32000, message: 'Bad Request: No valid session ID' },
           id: null,
         })
         return
       }
 
-      // Handle the request with existing transport
-      console.log('[Transport] Handling request with existing transport for session:', sessionId)
-      console.log('[Transport] Request body:', JSON.stringify(req.body, null, 2))
       await transport.handleRequest(req, res, req.body)
     } catch (error) {
       console.error('Error handling MCP POST request:', error)
       if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32603,
-            message: 'Internal server error',
-          },
-          id: null,
-        })
+        res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null })
       }
     }
   }
 
-  /**
-   * Handle MCP GET request for SSE streams using StreamableHTTPServerTransport
-   */
   private async handleMcpGetRequest(req: Request, res: Response): Promise<void> {
     try {
       const sessionId = req.headers['mcp-session-id'] as string
-      if (!sessionId || !this.transports.has(sessionId)) {
-        res.status(400).send('Invalid or missing session ID')
+      if (!sessionId) {
+        res.status(400).send('Missing mcp-session-id header')
         return
       }
-
-      if (this.config.oauth?.enabled && req.auth) {
-        console.log('Authenticated SSE connection from user:', req.auth)
+      if (!this.transports.has(sessionId)) {
+        res.status(404).send('Session not found or expired')
+        return
       }
-
-      // Check for Last-Event-ID header for resumability
-      const lastEventId = req.headers['last-event-id']
-      if (lastEventId) {
-        console.log(`Client reconnecting with Last-Event-ID: ${lastEventId}`)
-      } else {
-        console.log(`Establishing new SSE stream for session ${sessionId}`)
-      }
-
       const transport = this.transports.get(sessionId)!
       await transport.handleRequest(req, res)
     } catch (error) {
       console.error('Error handling MCP GET request:', error)
-      if (!res.headersSent) {
-        res.status(500).send('Error processing SSE request')
-      }
+      if (!res.headersSent) res.status(500).send('Error processing SSE request')
     }
   }
 
-  /**
-   * Handle MCP DELETE request for session termination using StreamableHTTPServerTransport
-   */
   private async handleMcpDeleteRequest(req: Request, res: Response): Promise<void> {
     try {
       const sessionId = req.headers['mcp-session-id'] as string
-      if (!sessionId || !this.transports.has(sessionId)) {
-        res.status(400).send('Invalid or missing session ID')
+      if (!sessionId) {
+        res.status(400).send('Missing mcp-session-id header')
         return
       }
-
-      console.log(`Received session termination request for session ${sessionId}`)
-
+      if (!this.transports.has(sessionId)) {
+        res.status(404).send('Session not found or expired')
+        return
+      }
       const transport = this.transports.get(sessionId)!
       await transport.handleRequest(req, res)
     } catch (error) {
       console.error('Error handling session termination:', error)
-      if (!res.headersSent) {
-        res.status(500).send('Error processing session termination')
-      }
+      if (!res.headersSent) res.status(500).send('Error processing session termination')
     }
   }
 
-  /**
-   * Start HTTP server
-   */
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
         this.server = createServer(this.app)
-        
         this.server.listen(this.config.port, this.config.host || '0.0.0.0', () => {
           console.log(`🌐 HTTP Transport listening on ${this.config.host || '0.0.0.0'}:${this.config.port}`)
           console.log(`📡 MCP endpoint: http://${this.config.host || 'localhost'}:${this.config.port}/mcp`)
           resolve()
         })
-        
         this.server.on('error', reject)
       } catch (error) {
         reject(error)
@@ -474,39 +382,18 @@ export class HttpTransport {
     })
   }
 
-  /**
-   * Stop HTTP server
-   */
   async stop(): Promise<void> {
     return new Promise((resolve) => {
       if (this.server) {
-        // Close all active transports
         for (const [sessionId, transport] of this.transports) {
-          try {
-            console.log(`Closing transport for session ${sessionId}`)
-            transport.close()
-            this.transports.delete(sessionId)
-          } catch (error) {
-            console.error(`Error closing transport for session ${sessionId}:`, error)
-          }
+          try { transport.close(); this.transports.delete(sessionId) } catch (error) {}
         }
-
-        this.server.close(() => {
-          console.log('🔌 HTTP Transport stopped')
-          resolve()
-        })
-      } else {
-        resolve()
-      }
+        this.server.close(() => { console.log('🔌 HTTP Transport stopped'); resolve() })
+      } else resolve()
     })
   }
 
-  /**
-   * Get transport statistics
-   */
   getStats(): Record<string, any> {
-    return {
-      activeSessions: this.transports.size,
-      authEnabled: this.config.oauth?.enabled || false,
-    }
-  }}
+    return { activeSessions: this.transports.size, auth: 'tunnel-delegated' }
+  }
+}

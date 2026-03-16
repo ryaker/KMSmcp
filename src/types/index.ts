@@ -13,6 +13,7 @@ export interface KMSConfig {
     uri: string
     username: string
     password: string
+    database?: string
   }
   mem0: {
     apiKey: string
@@ -49,9 +50,8 @@ export interface UnifiedKnowledge {
   id: string
   content: string
   contentType: 'memory' | 'insight' | 'pattern' | 'relationship' | 'fact' | 'procedure'
-  source: 'coaching' | 'personal' | 'technical' | 'cross_domain'
+  source: 'personal' | 'technical' | 'cross_domain'
   userId?: string
-  coachId?: string
   metadata: Record<string, any>
   timestamp: Date
   confidence: number
@@ -75,7 +75,6 @@ export interface KnowledgeQuery {
     contentType?: string[]
     source?: string[]
     userId?: string
-    coachId?: string
     timeRange?: { start: Date, end: Date }
     minConfidence?: number
   }

@@ -54,8 +54,6 @@ export class ContentInference {
   // Project detection patterns
   private static readonly PROJECT_PATTERNS = [
     { pattern: /KMSmcp|KMS MCP|knowledge management/i, project: 'KMSmcp' },
-    { pattern: /coaching.?clone/i, project: 'CoachingClone' },
-    { pattern: /gondola|PEMLeads/i, project: 'Gondola' },
     { pattern: /OAuth|JWKS|authentication/i, project: 'auth-system' }
   ]
 

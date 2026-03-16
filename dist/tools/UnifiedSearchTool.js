@@ -20,9 +20,15 @@ export class UnifiedSearchTool {
         console.log(`📝 Query: "${args.query}"`);
         console.log(`🎯 Filters: ${JSON.stringify(args.filters || {})}`);
         console.log(`⚙️  Options: ${JSON.stringify(args.options || {})}`);
+        const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal';
+        const enforceUserId = (filters) => {
+            if (!filters)
+                return { userId: defaultUserId };
+            return { ...filters, userId: filters.userId || defaultUserId };
+        };
         const query = {
             query: args.query,
-            filters: args.filters,
+            filters: enforceUserId(args.filters),
             options: {
                 includeRelationships: true,
                 maxResults: 10,
@@ -84,6 +90,24 @@ export class UnifiedSearchTool {
         const sortedResults = this.rankResults(uniqueResults, args.query)
             .slice(0, query.options?.maxResults || 10);
         const mergingTime = Date.now() - mergingStart;
+        // Step 4: Context expansion — entity cards + triggered actions
+        // Runs AFTER merging so we know which entities surfaced before deciding what to expand.
+        const { entity_context, triggered_actions } = await this.expandWithEntityContext(processedResults, args.query);
+        // Annotate sortedResults (the actual returned set) with linkedEntityIds from entity_context.
+        // expandWithEntityContext annotates processedResults items which are separate spread copies,
+        // so we re-apply the annotation here on the objects that callers actually receive.
+        for (const r of sortedResults) {
+            const linkedIds = [];
+            if (r.id && entity_context[r.id])
+                linkedIds.push(r.id);
+            const refs = r.metadata?.entityRefs || [];
+            for (const ref of refs) {
+                if (entity_context[ref])
+                    linkedIds.push(ref);
+            }
+            if (linkedIds.length > 0)
+                r.linkedEntityIds = linkedIds;
+        }
         const result = {
             query: args.query,
             results: sortedResults,
@@ -100,9 +124,11 @@ export class UnifiedSearchTool {
                 searchTime,
                 mergingTime,
                 totalTime: Date.now() - startTime
-            }
+            },
+            entity_context,
+            triggered_actions
         };
-        // Step 4: Cache the results
+        // Step 5: Cache the results
         if (this.cache && query.options?.cacheStrategy !== 'realtime') {
             const ttl = this.getCacheTTL(query.options?.cacheStrategy || 'conservative');
             await this.cache.set(cacheKey, result, ttl);
@@ -110,9 +136,94 @@ export class UnifiedSearchTool {
         }
         console.log(`\n✅ UNIFIED SEARCH COMPLETE`);
         console.log(`   Found: ${sortedResults.length} unique results`);
+        console.log(`   Entities: ${Object.keys(entity_context).length}`);
+        console.log(`   Triggered: ${triggered_actions.length}`);
         console.log(`   Total Time: ${result.searchTime}ms`);
-        console.log(`   Cache: ${cached ? 'HIT' : 'MISS'}`);
         return result;
+    }
+    /**
+     * Context expansion pass — runs after initial search.
+     *
+     * 1. Collects entity IDs from Neo4j results (Person/Organization/Project nodes)
+     * 2. Collects entityRefs from MongoDB result metadata (explicit cross-links)
+     * 3. Fetches brief entity summaries for all collected IDs (parallel)
+     * 4. Matches ContextTrigger/ToolRoute nodes against query keywords
+     *
+     * Returns entity_context (brief cards keyed by ID) and triggered_actions.
+     */
+    async expandWithEntityContext(results, query) {
+        // Node types that warrant an entity card — operational/system nodes are returned as triggers instead
+        const ENTITY_LABELS = new Set(['Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event']);
+        const OPERATIONAL_LABELS = new Set(['ContextTrigger', 'ToolRoute', 'ResourceMap', 'QueryType', 'System', 'MemoryTier']);
+        // Collect entity IDs from Neo4j results
+        const entityIds = new Set();
+        for (const r of results.neo4j) {
+            const labels = r.nodeLabels || [];
+            const hasEntityLabel = labels.some(l => ENTITY_LABELS.has(l));
+            const hasOperationalLabel = labels.some(l => OPERATIONAL_LABELS.has(l));
+            if (hasEntityLabel && !hasOperationalLabel && r.id) {
+                entityIds.add(r.id);
+            }
+        }
+        // Collect entityRefs from MongoDB results — these are explicit cross-links stored with procedures/lessons
+        for (const r of results.mongodb) {
+            const refs = r.metadata?.entityRefs || [];
+            for (const ref of refs)
+                entityIds.add(ref);
+        }
+        // Collect entityRefs from Mem0 results too
+        for (const r of results.mem0) {
+            const refs = r.metadata?.entityRefs || [];
+            for (const ref of refs)
+                entityIds.add(ref);
+        }
+        // Fetch entity summaries in parallel (cap at 6 to avoid slowdown)
+        const idsToFetch = Array.from(entityIds).slice(0, 6);
+        const entity_context = {};
+        if (idsToFetch.length > 0) {
+            const summaries = await Promise.allSettled(idsToFetch.map(id => this.storage.neo4j.getEntitySummary(id)));
+            for (let i = 0; i < idsToFetch.length; i++) {
+                const s = summaries[i];
+                if (s.status === 'fulfilled' && s.value) {
+                    entity_context[idsToFetch[i]] = s.value;
+                }
+            }
+        }
+        // Annotate each result with which entity IDs it links to (for agent consumption)
+        for (const r of [...results.neo4j, ...results.mongodb, ...results.mem0]) {
+            const linkedIds = [];
+            if (r.id && entity_context[r.id])
+                linkedIds.push(r.id);
+            const refs = r.metadata?.entityRefs || [];
+            for (const ref of refs) {
+                if (entity_context[ref])
+                    linkedIds.push(ref);
+            }
+            if (linkedIds.length > 0)
+                r.linkedEntityIds = linkedIds;
+        }
+        // Match ContextTrigger/ToolRoute nodes against query keywords
+        const triggered_actions = [];
+        try {
+            const operationalNodes = await this.storage.neo4j.getOperationalNodes();
+            const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            for (const node of operationalNodes) {
+                const haystack = `${node.name} ${node.description} ${node.taskPattern || ''}`.toLowerCase();
+                const matches = queryWords.some(word => haystack.includes(word));
+                if (matches) {
+                    triggered_actions.push({
+                        id: node.id,
+                        type: node.type,
+                        name: node.name,
+                        actions: node.actions
+                    });
+                }
+            }
+        }
+        catch (error) {
+            console.warn('⚠️ Context trigger matching failed:', error);
+        }
+        return { entity_context, triggered_actions };
     }
     /**
      * Search specific system

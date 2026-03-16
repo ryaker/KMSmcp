@@ -43,12 +43,21 @@ export class MongoDBStorage implements StorageSystem {
       
       const filter: any = {}
       
-      // Text search
+      // Text search — split into keywords so "MCP session recovery" finds docs containing
+      // those words individually, not the exact phrase as a substring.
       if (query.query) {
-        filter.$or = [
-          { content: { $regex: query.query, $options: 'i' } },
-          { 'metadata.tags': { $regex: query.query, $options: 'i' } }
-        ]
+        const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const keywords = query.query
+          .split(/\s+/)
+          .map(k => k.trim())
+          .filter(k => k.length >= 2) // keep short technical terms like "AI", "C#" but skip noisy 1-char tokens
+
+        if (keywords.length > 0) {
+          filter.$or = keywords.flatMap(k => [
+            { content: { $regex: escapeRegex(k), $options: 'i' } },
+            { 'metadata.tags': { $regex: escapeRegex(k), $options: 'i' } }
+          ])
+        }
       }
       
       // Apply filters
@@ -60,9 +69,6 @@ export class MongoDBStorage implements StorageSystem {
       }
       if (query.filters?.userId) {
         filter.userId = query.filters.userId
-      }
-      if (query.filters?.coachId) {
-        filter.coachId = query.filters.coachId
       }
       if (query.filters?.minConfidence) {
         filter.confidence = { $gte: query.filters.minConfidence }
@@ -194,13 +200,11 @@ export class MongoDBStorage implements StorageSystem {
       await this.collection.createIndex({ contentType: 1 })
       await this.collection.createIndex({ source: 1 })
       await this.collection.createIndex({ userId: 1 })
-      await this.collection.createIndex({ coachId: 1 })
       await this.collection.createIndex({ confidence: -1 })
       await this.collection.createIndex({ timestamp: -1 })
-      
+
       // Compound indexes for common queries
       await this.collection.createIndex({ userId: 1, contentType: 1 })
-      await this.collection.createIndex({ coachId: 1, confidence: -1 })
       
       console.log('📄 MongoDB indexes created successfully')
     } catch (error) {

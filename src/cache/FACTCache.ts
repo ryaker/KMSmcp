@@ -6,6 +6,7 @@
  */
 
 import Redis from 'ioredis'
+import { createHash } from 'node:crypto'
 import { FACTCacheLayer, KMSConfig } from '../types/index.js'
 
 export class FACTCache implements FACTCacheLayer {
@@ -206,10 +207,9 @@ export class FACTCache implements FACTCacheLayer {
   /**
    * Generate cache key for knowledge
    */
-  static generateKnowledgeKey(userId?: string, coachId?: string, type?: string, context?: any): string {
-    const parts = ['knowledge']
+  static generateKnowledgeKey(userId?: string, type?: string, context?: any): string {
+    const parts = ['kms', 'knowledge']
     if (userId) parts.push(`user:${userId}`)
-    if (coachId) parts.push(`coach:${coachId}`)
     if (type) parts.push(`type:${type}`)
     if (context) parts.push(`ctx:${JSON.stringify(context).slice(0, 50)}`)
     
@@ -219,10 +219,12 @@ export class FACTCache implements FACTCacheLayer {
   /**
    * Generate cache key for search queries
    */
-  static generateSearchKey(query: string, filters?: any): string {
-    const queryHash = Buffer.from(query).toString('base64').slice(0, 20)
-    const filterHash = filters ? Buffer.from(JSON.stringify(filters)).toString('base64').slice(0, 10) : ''
-    
-    return `search:${queryHash}:${filterHash}`
+  static generateSearchKey(query: string, filters?: any, options?: any): string {
+    const parts: string[] = [query]
+    if (filters) parts.push(JSON.stringify(filters))
+    if (options) parts.push(JSON.stringify(options))
+    const payload = parts.join('\0')
+    const hash = createHash('sha256').update(payload).digest('hex').slice(0, 32)
+    return `kms:search:${hash}`
   }
 }
