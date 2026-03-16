@@ -80,10 +80,30 @@ export class Neo4jStorage {
             const maxResults = Math.floor(query.options?.maxResults || 10);
             let cypher;
             const params = { query: query.query };
+            // Build filter conditions based on KnowledgeQuery.filters
+            const filterClauses = [];
+            if (query.filters?.userId) {
+                params.userId = query.filters.userId;
+                filterClauses.push('(k.userId IS NULL OR k.userId = $userId)');
+            }
+            if (query.filters?.source && query.filters.source.length > 0) {
+                params.sources = query.filters.source;
+                filterClauses.push('(k.source IS NULL OR k.source IN $sources)');
+            }
+            if (query.filters?.contentType && query.filters.contentType.length > 0) {
+                params.contentTypes = query.filters.contentType;
+                filterClauses.push('(k.contentType IS NULL OR k.contentType IN $contentTypes)');
+            }
+            if (query.filters?.minConfidence !== undefined) {
+                params.minConfidence = query.filters.minConfidence;
+                filterClauses.push('(k.confidence IS NULL OR k.confidence >= $minConfidence)');
+            }
+            const whereClause = filterClauses.length > 0 ? `WHERE ${filterClauses.join(' AND ')}` : '';
             if (query.options?.includeRelationships) {
                 cypher = `
           CALL db.index.fulltext.queryNodes('knowledge_search', $query)
           YIELD node AS k, score
+          ${whereClause}
           OPTIONAL MATCH (k)-[r]-(related)
           WHERE related.name IS NOT NULL
           RETURN k, score,
@@ -101,6 +121,7 @@ export class Neo4jStorage {
                 cypher = `
           CALL db.index.fulltext.queryNodes('knowledge_search', $query)
           YIELD node AS k, score
+          ${whereClause}
           RETURN k, score, [] as relationships
           ORDER BY score DESC
           LIMIT ${maxResults}
@@ -127,7 +148,16 @@ export class Neo4jStorage {
                     id: node.id || node.name,
                     content,
                     confidence: Math.min(score / 5, 1), // normalize fulltext score to 0-1
-                    metadata: node.metadata ? JSON.parse(node.metadata) : node,
+                    metadata: (() => {
+                        if (!node.metadata)
+                            return node;
+                        try {
+                            return JSON.parse(node.metadata);
+                        }
+                        catch {
+                            return node;
+                        }
+                    })(),
                     sourceSystem: 'neo4j',
                     timestamp: node.timestamp ? new Date(node.timestamp) : new Date(),
                     contentType: node.type || node.contentType || 'graph_node',
@@ -418,7 +448,7 @@ export class Neo4jStorage {
         try {
             const result = await session.run(`
         MATCH (n)
-        WHERE labels(n)[0] IN ['Person','Organization','Project','Technology','Concept','Service']
+        WHERE ANY(label IN labels(n) WHERE label IN ['Person','Organization','Project','Technology','Concept','Service'])
           AND n.id IS NOT NULL
           AND n.name IS NOT NULL
         RETURN n.id AS id, n.name AS name,

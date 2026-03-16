@@ -221,11 +221,11 @@ export class Mem0Storage implements StorageSystem {
       return query.filters.userId
     }
 
-    // MUST use configured default user ID - this should be set in environment
     if (!this.config.defaultUserId) {
-      throw new Error('MEM0_DEFAULT_USER_ID must be configured in environment')
+      console.warn('⚠️ KMS_DEFAULT_USER_ID not configured, using fallback "personal"')
+      return 'personal'
     }
-    
+
     return this.config.defaultUserId
   }
 

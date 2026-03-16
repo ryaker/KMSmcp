@@ -33,10 +33,13 @@ export class OllamaStorageRouter {
       }
     }
 
+    // Resolve contentType from both locations: top-level and inferred
+    const resolvedContentType = metadata?.contentType ?? metadata?.inferred?.contentType ?? 'fact'
+
     // Fallback: build a minimal UnifiedKnowledge from content + metadata
     const knowledge: Partial<UnifiedKnowledge> = {
       content,
-      ...(metadata?.contentType ? { contentType: metadata.contentType } : {}),
+      contentType: resolvedContentType,
       ...(metadata?.source ? { source: metadata.source } : {}),
       ...(metadata?.userId ? { userId: metadata.userId } : {}),
     }
@@ -59,7 +62,7 @@ export class OllamaStorageRouter {
 
     return {
       targets,
-      contentType: metadata?.contentType ?? 'fact',
+      contentType: resolvedContentType,
       source: 'regex',
       confidence,
     }

@@ -4,6 +4,7 @@
  * L2: Redis (fast, shared across instances)
  * L3: Database queries (slowest, but always available)
  */
+import { createHash } from 'node:crypto';
 export class FACTCache {
     config;
     l1Cache = new Map();
@@ -198,8 +199,8 @@ export class FACTCache {
      * Generate cache key for search queries
      */
     static generateSearchKey(query, filters) {
-        const queryHash = Buffer.from(query).toString('base64').slice(0, 20);
-        const filterHash = filters ? Buffer.from(JSON.stringify(filters)).toString('base64').slice(0, 10) : '';
-        return `kms:search:${queryHash}:${filterHash}`;
+        const payload = filters ? `${query}\0${JSON.stringify(filters)}` : query;
+        const hash = createHash('sha256').update(payload).digest('hex').slice(0, 32);
+        return `kms:search:${hash}`;
     }
 }

@@ -71,9 +71,11 @@ Text: "${content.slice(0, 500)}"`
       }
 
       const validTargets: Array<'mem0' | 'mongodb' | 'neo4j'> = ['mem0', 'mongodb', 'neo4j']
-      const targets = parsed.targets.filter((t): t is 'mem0' | 'mongodb' | 'neo4j' =>
-        validTargets.includes(t as 'mem0' | 'mongodb' | 'neo4j')
-      )
+      const targets = Array.from(new Set(
+        parsed.targets.filter((t): t is 'mem0' | 'mongodb' | 'neo4j' =>
+          validTargets.includes(t as 'mem0' | 'mongodb' | 'neo4j')
+        )
+      ))
       if (targets.length === 0) {
         console.warn('[OllamaInference] classifyStorageTargets: no valid target values')
         return null
@@ -106,6 +108,11 @@ Text: "${content.slice(0, 500)}"`
       return []
     }
 
+    const available = await this.isAvailable()
+    if (!available) {
+      return []
+    }
+
     const prompt = `Return a JSON array of IDs only. No explanation. Return [] if nothing matches.
 
 From the Candidates list below, return only the IDs of entities that are mentioned or clearly implied in the Text.
@@ -127,8 +134,10 @@ Text: "${content.slice(0, 600)}"`
       }
 
       const candidateIds = new Set(candidates.map(c => c.id))
-      const filtered = (parsed as unknown[])
-        .filter((item): item is string => typeof item === 'string' && candidateIds.has(item))
+      const filtered = Array.from(new Set(
+        (parsed as unknown[])
+          .filter((item): item is string => typeof item === 'string' && candidateIds.has(item))
+      ))
 
       console.log(`[OllamaInference] extractEntityMentions: found ${filtered.length} of ${candidates.length} candidates`)
       return filtered

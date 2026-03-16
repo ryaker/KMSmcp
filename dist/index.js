@@ -712,6 +712,9 @@ export class UnifiedKMSServer {
             result.datastores.mongodb = { status: 'error', error: e instanceof Error ? e.message : String(e) };
         }
         result.latencyMs = Date.now() - start;
+        result.status = Object.values(result.datastores).some((store) => store?.status === 'error')
+            ? 'degraded'
+            : 'ok';
         return result;
     }
     async handleCacheInvalidate(args) {
@@ -848,7 +851,7 @@ async function main() {
         neo4j: {
             uri: process.env.NEO4J_AURA_URI || process.env.NEO4J_URI || 'bolt://localhost:7687',
             username: process.env.NEO4J_AURA_USERNAME || process.env.NEO4J_USERNAME || 'neo4j',
-            password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || 'password',
+            password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || '',
             database: process.env.NEO4J_AURA_DATABASE || process.env.NEO4J_DATABASE
         },
         mem0: {
@@ -902,7 +905,7 @@ async function main() {
     // Core required variables
     console.log('📌 CRITICAL VARIABLES:');
     console.log(`   MEM0_API_KEY: ${process.env.MEM0_API_KEY ? '✅ SET (length: ' + process.env.MEM0_API_KEY.length + ')' : '❌ MISSING'}`);
-    console.log(`   MEM0_DEFAULT_USER_ID: ${process.env.MEM0_DEFAULT_USER_ID ? '✅ ' + process.env.MEM0_DEFAULT_USER_ID : '❌ MISSING'}`);
+    console.log(`   KMS_DEFAULT_USER_ID: ${process.env.KMS_DEFAULT_USER_ID ? '✅ ' + process.env.KMS_DEFAULT_USER_ID : '❌ MISSING (will use "personal")'}`);
     // Database variables
     console.log('\n📌 DATABASE VARIABLES:');
     console.log(`   MONGODB_ATLAS_URI: ${process.env.MONGODB_ATLAS_URI ? '✅ SET' : '❌ MISSING'}`);
@@ -932,7 +935,7 @@ async function main() {
     console.log(`   DOPPLER_ENVIRONMENT: ${process.env.DOPPLER_ENVIRONMENT || 'not set'}`);
     // List ALL environment variables that start with known prefixes
     console.log('\n📌 ALL RELEVANT ENV VARS:');
-    const relevantPrefixes = ['MEM0', 'MONGO', 'NEO4J', 'REDIS', 'OAUTH', 'TRANSPORT', 'HTTP', 'CORS', 'DOPPLER', 'RAILWAY', 'PORT', 'NODE_ENV'];
+    const relevantPrefixes = ['KMS', 'MEM0', 'MONGO', 'NEO4J', 'REDIS', 'OAUTH', 'TRANSPORT', 'HTTP', 'CORS', 'DOPPLER', 'RAILWAY', 'PORT', 'NODE_ENV'];
     const allEnvVars = Object.keys(process.env)
         .filter(key => relevantPrefixes.some(prefix => key.startsWith(prefix)))
         .sort();

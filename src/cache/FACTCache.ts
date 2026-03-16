@@ -6,6 +6,7 @@
  */
 
 import Redis from 'ioredis'
+import { createHash } from 'node:crypto'
 import { FACTCacheLayer, KMSConfig } from '../types/index.js'
 
 export class FACTCache implements FACTCacheLayer {
@@ -219,9 +220,8 @@ export class FACTCache implements FACTCacheLayer {
    * Generate cache key for search queries
    */
   static generateSearchKey(query: string, filters?: any): string {
-    const queryHash = Buffer.from(query).toString('base64').slice(0, 20)
-    const filterHash = filters ? Buffer.from(JSON.stringify(filters)).toString('base64').slice(0, 10) : ''
-    
-    return `kms:search:${queryHash}:${filterHash}`
+    const payload = filters ? `${query}\0${JSON.stringify(filters)}` : query
+    const hash = createHash('sha256').update(payload).digest('hex').slice(0, 32)
+    return `kms:search:${hash}`
   }
 }

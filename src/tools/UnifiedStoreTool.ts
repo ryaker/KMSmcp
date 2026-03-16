@@ -135,17 +135,25 @@ export class UnifiedStoreTool {
     let decision: StorageDecision
 
     if (this.ollamaRouter) {
+      // Pass all resolved knowledge fields so the fallback router has full context
+      const routingMetadata = {
+        ...knowledge.metadata,
+        contentType: knowledge.contentType,
+        source: knowledge.source,
+        userId: knowledge.userId,
+      }
       const ollamaDecision = await this.ollamaRouter.getStorageTargets(
         knowledge.content,
-        knowledge.metadata
+        routingMetadata
       )
       primarySystem = ollamaDecision.targets[0] as SystemName
       secondarySystems = ollamaDecision.targets.slice(1) as SystemName[]
-      // Build a compatible StorageDecision for cache + stats downstream
+      // Derive cacheStrategy from the fallback router so it stays policy-consistent
+      const fallbackDecision = this.router.determineStorage(knowledge)
       decision = {
         primary: primarySystem,
         secondary: secondarySystems,
-        cacheStrategy: 'L2',
+        cacheStrategy: fallbackDecision.cacheStrategy,
         reasoning: `OllamaStorageRouter(${ollamaDecision.source}, confidence=${ollamaDecision.confidence.toFixed(2)})`
       }
     } else {

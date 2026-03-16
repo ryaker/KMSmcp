@@ -63,7 +63,9 @@ export class HttpTransport {
             if (cfAssertion) {
                 try {
                     const payload = JSON.parse(Buffer.from(cfAssertion.split('.')[1], 'base64').toString());
-                    console.log(`  ↳ Identity: ${payload.email || payload.sub}`);
+                    // Log only a redacted prefix of the subject to avoid PII in logs
+                    const subPreview = typeof payload.sub === 'string' ? payload.sub.slice(0, 8) + '…' : 'unknown';
+                    console.log(`  ↳ Identity: sub=${subPreview}`);
                     req.auth = {
                         isAuthenticated: true,
                         user: {
@@ -268,8 +270,12 @@ export class HttpTransport {
     async handleMcpGetRequest(req, res) {
         try {
             const sessionId = req.headers['mcp-session-id'];
-            if (!sessionId || !this.transports.has(sessionId)) {
-                res.status(400).send('Invalid or missing session ID');
+            if (!sessionId) {
+                res.status(400).send('Missing mcp-session-id header');
+                return;
+            }
+            if (!this.transports.has(sessionId)) {
+                res.status(404).send('Session not found or expired');
                 return;
             }
             const transport = this.transports.get(sessionId);
@@ -284,8 +290,12 @@ export class HttpTransport {
     async handleMcpDeleteRequest(req, res) {
         try {
             const sessionId = req.headers['mcp-session-id'];
-            if (!sessionId || !this.transports.has(sessionId)) {
-                res.status(400).send('Invalid or missing session ID');
+            if (!sessionId) {
+                res.status(400).send('Missing mcp-session-id header');
+                return;
+            }
+            if (!this.transports.has(sessionId)) {
+                res.status(404).send('Session not found or expired');
                 return;
             }
             const transport = this.transports.get(sessionId);

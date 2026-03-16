@@ -46,15 +46,16 @@ export class MongoDBStorage implements StorageSystem {
       // Text search — split into keywords so "MCP session recovery" finds docs containing
       // those words individually, not the exact phrase as a substring.
       if (query.query) {
+        const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
         const keywords = query.query
           .split(/\s+/)
           .map(k => k.trim())
-          .filter(k => k.length > 2) // skip trivial words
+          .filter(k => k.length > 0) // keep all non-empty tokens, including short ones like "AI", "C#"
 
         if (keywords.length > 0) {
           filter.$or = keywords.flatMap(k => [
-            { content: { $regex: k, $options: 'i' } },
-            { 'metadata.tags': { $regex: k, $options: 'i' } }
+            { content: { $regex: escapeRegex(k), $options: 'i' } },
+            { 'metadata.tags': { $regex: escapeRegex(k), $options: 'i' } }
           ])
         }
       }
