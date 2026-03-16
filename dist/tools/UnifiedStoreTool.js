@@ -118,10 +118,6 @@ export class UnifiedStoreTool {
         try {
             // Store in primary system
             await this.storeInSystem(knowledge, primarySystem);
-            // Fire-and-forget enrichment for primary store
-            if (this.enrichmentQueue) {
-                this.enrichmentQueue.add(knowledge.id, knowledge.content, primarySystem);
-            }
             // Store in secondary systems (for cross-linking)
             if (secondarySystems.length > 0) {
                 console.log(`\n🔗 Cross-linking to secondary systems...`);
@@ -129,15 +125,15 @@ export class UnifiedStoreTool {
                     try {
                         await this.storeInSystem(knowledge, system);
                         console.log(`✅ Cross-stored in ${system}`);
-                        // Fire-and-forget enrichment for each secondary store
-                        if (this.enrichmentQueue) {
-                            this.enrichmentQueue.add(knowledge.id, knowledge.content, system);
-                        }
                     }
                     catch (error) {
                         console.warn(`⚠️ Failed to cross-store in ${system}:`, error instanceof Error ? error.message : String(error));
                     }
                 }));
+            }
+            // Queue enrichment once for the primary system (same content — no need to repeat per secondary)
+            if (this.enrichmentQueue) {
+                this.enrichmentQueue.add(knowledge.id, knowledge.content, primarySystem);
             }
             const storageTime = Date.now() - storageStartTime;
             // Step 3: Cache based on strategy

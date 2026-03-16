@@ -966,7 +966,7 @@ async function main() {
     neo4j: {
       uri: process.env.NEO4J_AURA_URI || process.env.NEO4J_URI || 'bolt://localhost:7687',
       username: process.env.NEO4J_AURA_USERNAME || process.env.NEO4J_USERNAME || 'neo4j',
-      password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || '',
+      password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || (() => { throw new Error('NEO4J_AURA_PASSWORD or NEO4J_PASSWORD must be set') })(),
       database: process.env.NEO4J_AURA_DATABASE || process.env.NEO4J_DATABASE
     },
     mem0: {

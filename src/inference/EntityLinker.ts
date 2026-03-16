@@ -18,36 +18,35 @@ export class EntityLinker {
   ) {}
 
   async enrich(id: string, content: string, sourceSystem: 'mongodb' | 'mem0' | 'neo4j'): Promise<void> {
-    try {
-      const candidates = await this.getCandidates()
+    const candidates = await this.getCandidates()
 
-      if (candidates.length === 0) {
-        console.warn('[EntityLinker] no entity candidates available — skipping enrichment')
-        return
-      }
-
-      let foundIds = await this.ollama.extractEntityMentions(content, candidates)
-      let method = 'ollama'
-
-      if (foundIds.length === 0) {
-        foundIds = this.fuzzyMatch(content, candidates)
-        method = 'fuzzy'
-      }
-
-      if (foundIds.length === 0) {
-        return
-      }
-
-      if (sourceSystem === 'mongodb') {
-        await this.mongodb.update(id, { metadata: { entityRefs: foundIds } })
-      }
-
-      await this.neo4j.createAboutRelationships(id, foundIds)
-
-      console.log(`[EntityLinker] ${id}: linked ${foundIds.length} entities via ${method}: [${foundIds.join(', ')}]`)
-    } catch (err) {
-      console.warn('[EntityLinker] enrich error (swallowed):', err)
+    if (candidates.length === 0) {
+      console.warn('[EntityLinker] no entity candidates available — skipping enrichment')
+      return
     }
+
+    let foundIds = await this.ollama.extractEntityMentions(content, candidates)
+    let method = 'ollama'
+
+    if (foundIds.length === 0) {
+      foundIds = this.fuzzyMatch(content, candidates)
+      method = 'fuzzy'
+    }
+
+    if (foundIds.length === 0) {
+      return
+    }
+
+    // Persist entityRefs back to the source document when the backend supports updates.
+    // Mem0 does not expose a metadata-update API, so refs for mem0 records are only
+    // written as ABOUT relationships in Neo4j and not reflected in Mem0 metadata.
+    if (sourceSystem === 'mongodb') {
+      await this.mongodb.update(id, { metadata: { entityRefs: foundIds } })
+    }
+
+    await this.neo4j.createAboutRelationships(id, foundIds)
+
+    console.log(`[EntityLinker] ${id}: linked ${foundIds.length} entities via ${method}: [${foundIds.join(', ')}]`)
   }
 
   private async getCandidates(): Promise<EntityMention[]> {

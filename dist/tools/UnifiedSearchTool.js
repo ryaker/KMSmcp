@@ -93,6 +93,21 @@ export class UnifiedSearchTool {
         // Step 4: Context expansion — entity cards + triggered actions
         // Runs AFTER merging so we know which entities surfaced before deciding what to expand.
         const { entity_context, triggered_actions } = await this.expandWithEntityContext(processedResults, args.query);
+        // Annotate sortedResults (the actual returned set) with linkedEntityIds from entity_context.
+        // expandWithEntityContext annotates processedResults items which are separate spread copies,
+        // so we re-apply the annotation here on the objects that callers actually receive.
+        for (const r of sortedResults) {
+            const linkedIds = [];
+            if (r.id && entity_context[r.id])
+                linkedIds.push(r.id);
+            const refs = r.metadata?.entityRefs || [];
+            for (const ref of refs) {
+                if (entity_context[ref])
+                    linkedIds.push(ref);
+            }
+            if (linkedIds.length > 0)
+                r.linkedEntityIds = linkedIds;
+        }
         const result = {
             query: args.query,
             results: sortedResults,

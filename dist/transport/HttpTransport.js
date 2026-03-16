@@ -57,9 +57,8 @@ export class HttpTransport {
         // Request logging & Identity Extraction
         this.app.use((req, res, next) => {
             const timestamp = new Date().toISOString();
-            const clientIp = req.headers['cf-connecting-ip'] || req.ip || req.socket.remoteAddress;
             const cfAssertion = req.headers['cf-access-jwt-assertion'];
-            console.log(`${timestamp} ${req.method} ${req.path} from ${clientIp}`);
+            console.log(`${timestamp} ${req.method} ${req.path}`);
             if (cfAssertion) {
                 try {
                     const payload = JSON.parse(Buffer.from(cfAssertion.split('.')[1], 'base64').toString());

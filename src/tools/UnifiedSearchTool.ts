@@ -169,6 +169,19 @@ export class UnifiedSearchTool {
       args.query
     )
 
+    // Annotate sortedResults (the actual returned set) with linkedEntityIds from entity_context.
+    // expandWithEntityContext annotates processedResults items which are separate spread copies,
+    // so we re-apply the annotation here on the objects that callers actually receive.
+    for (const r of sortedResults) {
+      const linkedIds: string[] = []
+      if (r.id && entity_context[r.id]) linkedIds.push(r.id)
+      const refs: string[] = r.metadata?.entityRefs || []
+      for (const ref of refs) {
+        if (entity_context[ref]) linkedIds.push(ref)
+      }
+      if (linkedIds.length > 0) r.linkedEntityIds = linkedIds
+    }
+
     const result = {
       query: args.query,
       results: sortedResults,

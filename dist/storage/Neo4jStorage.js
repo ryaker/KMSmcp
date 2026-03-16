@@ -161,7 +161,7 @@ export class Neo4jStorage {
                     sourceSystem: 'neo4j',
                     timestamp: node.timestamp ? new Date(node.timestamp) : new Date(),
                     contentType: node.type || node.contentType || 'graph_node',
-                    source: 'neo4j',
+                    source: node.source || 'technical',
                     nodeLabels: record.get('k').labels,
                     relationships: relationships.filter((r) => r.relatedNode)
                 };
@@ -416,7 +416,10 @@ export class Neo4jStorage {
             const result = await session.run(`
         MATCH (n)
         WHERE n.type IN ['ContextTrigger', 'ToolRoute']
-        RETURN n.id AS id, n.type AS type, n.name AS name,
+           OR ANY(label IN labels(n) WHERE label IN ['ContextTrigger', 'ToolRoute'])
+        RETURN n.id AS id,
+               coalesce(n.type, [l IN labels(n) WHERE l IN ['ContextTrigger', 'ToolRoute'] | l][0]) AS type,
+               n.name AS name,
                coalesce(n.description, n.taskPattern, '') AS description,
                coalesce(n.actions, []) AS actions,
                n.taskPattern AS taskPattern
@@ -482,11 +485,11 @@ export class Neo4jStorage {
         const session = this.driver.session(this.sessionConfig);
         try {
             await session.run(`
+        MATCH (k:Knowledge {id: $sourceId})
         UNWIND $targetIds AS targetId
         MATCH (e {id: targetId})
-        MERGE (k:Knowledge {id: $sourceId})
         MERGE (k)-[r:ABOUT]->(e)
-        SET r.createdAt = datetime(), r.source = 'enrichment'
+        ON CREATE SET r.createdAt = datetime(), r.source = 'enrichment'
       `, {
                 sourceId,
                 targetIds: targetEntityIds
