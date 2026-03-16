@@ -783,10 +783,14 @@ export class UnifiedKMSServer {
     // Neo4j: get real node count to prove connectivity
     try {
       const stats = await this.storage.neo4j.getStats()
-      result.datastores.neo4j = {
-        status: 'connected',
-        nodes: stats.totalNodes,
-        relationships: stats.totalRelationships
+      if (stats.status === 'error') {
+        result.datastores.neo4j = stats
+      } else {
+        result.datastores.neo4j = {
+          status: 'connected',
+          nodes: stats.totalNodes,
+          relationships: stats.totalRelationships
+        }
       }
     } catch (e) {
       result.datastores.neo4j = { status: 'error', error: e instanceof Error ? e.message : String(e) }
@@ -795,7 +799,11 @@ export class UnifiedKMSServer {
     // Mem0: quick search to prove connectivity
     try {
       const mem0Stats = await this.storage.mem0.getStats()
-      result.datastores.mem0 = { status: 'connected', ...mem0Stats }
+      if (mem0Stats.status === 'error') {
+        result.datastores.mem0 = mem0Stats
+      } else {
+        result.datastores.mem0 = { status: 'connected', ...mem0Stats }
+      }
     } catch (e) {
       result.datastores.mem0 = { status: 'error', error: e instanceof Error ? e.message : String(e) }
     }
@@ -803,15 +811,22 @@ export class UnifiedKMSServer {
     // MongoDB: quick stats
     try {
       const mongoStats = await this.storage.mongodb.getStats()
-      result.datastores.mongodb = { status: 'connected', ...mongoStats }
+      if (mongoStats.status === 'error') {
+        result.datastores.mongodb = mongoStats
+      } else {
+        result.datastores.mongodb = { status: 'connected', ...mongoStats }
+      }
     } catch (e) {
       result.datastores.mongodb = { status: 'error', error: e instanceof Error ? e.message : String(e) }
     }
 
     result.latencyMs = Date.now() - start
-    result.status = Object.values(result.datastores).some((store: any) => store?.status === 'error')
-      ? 'degraded'
-      : 'ok'
+    const datastoreStatuses = Object.values(result.datastores).map((store: any) => store?.status)
+    result.status = datastoreStatuses.every(s => s === 'error')
+      ? 'error'
+      : datastoreStatuses.some(s => s === 'error')
+        ? 'degraded'
+        : 'ok'
     return result
   }
 
