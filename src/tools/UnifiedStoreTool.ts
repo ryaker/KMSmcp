@@ -5,6 +5,8 @@
 import crypto from 'crypto'
 import { UnifiedKnowledge, StorageDecision, SystemName } from '../types/index.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
+import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
+import { EnrichmentQueue } from '../inference/EnrichmentQueue.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Neo4jStorage, Mem0Storage } from '../storage/index.js'
 import { ContentInference } from '../inference/ContentInference.js'
@@ -17,15 +19,21 @@ export class UnifiedStoreTool {
     mem0: Mem0Storage
   }
   private cache: FACTCache
+  private ollamaRouter: OllamaStorageRouter | null
+  private enrichmentQueue: EnrichmentQueue | null
 
   constructor(
     router: IntelligentStorageRouter,
     storage: { mongodb: MongoDBStorage, neo4j: Neo4jStorage, mem0: Mem0Storage },
-    cache: FACTCache | null
+    cache: FACTCache | null,
+    ollamaRouter?: OllamaStorageRouter | null,
+    enrichmentQueue?: EnrichmentQueue | null
   ) {
     this.router = router
     this.storage = storage
     this.cache = cache as FACTCache // Now using real cache
+    this.ollamaRouter = ollamaRouter ?? null
+    this.enrichmentQueue = enrichmentQueue ?? null
   }
 
   /**
@@ -35,9 +43,8 @@ export class UnifiedStoreTool {
   async store(args: {
     content: string
     contentType?: 'memory' | 'insight' | 'pattern' | 'relationship' | 'fact' | 'procedure'
-    source?: 'coaching' | 'personal' | 'technical' | 'cross_domain'
+    source?: 'personal' | 'technical' | 'cross_domain'
     userId?: string
-    coachId?: string
     metadata?: Record<string, any>
     confidence?: number
     relationships?: Array<{
@@ -104,14 +111,16 @@ export class UnifiedStoreTool {
     console.log(`👤 User: ${enrichedArgs.userId || 'auto'}, Context: ${inference.detectedProject || 'general'}`)
     console.log(`🏷️  Tags: ${enhancedMetadata.tags?.join(', ') || 'none'}`)
 
+    const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal'
+    const resolvedUserId = enrichedArgs.userId || defaultUserId
+
     // Create unified knowledge object
     const knowledge: UnifiedKnowledge = {
       id: crypto.randomUUID(),
       content: args.content,
       contentType: enrichedArgs.contentType!,
       source: enrichedArgs.source!,
-      userId: enrichedArgs.userId || 'personal',
-      coachId: enrichedArgs.coachId,
+      userId: resolvedUserId,
       metadata: enrichedArgs.metadata || {},
       timestamp: new Date(),
       confidence: enrichedArgs.confidence || 0.8,
@@ -120,7 +129,31 @@ export class UnifiedStoreTool {
 
     // Step 1: Get intelligent storage decision
     const routingStartTime = Date.now()
-    const decision = this.router.determineStorage(knowledge)
+
+    let primarySystem: SystemName
+    let secondarySystems: SystemName[]
+    let decision: StorageDecision
+
+    if (this.ollamaRouter) {
+      const ollamaDecision = await this.ollamaRouter.getStorageTargets(
+        knowledge.content,
+        knowledge.metadata
+      )
+      primarySystem = ollamaDecision.targets[0] as SystemName
+      secondarySystems = ollamaDecision.targets.slice(1) as SystemName[]
+      // Build a compatible StorageDecision for cache + stats downstream
+      decision = {
+        primary: primarySystem,
+        secondary: secondarySystems,
+        cacheStrategy: 'L2',
+        reasoning: `OllamaStorageRouter(${ollamaDecision.source}, confidence=${ollamaDecision.confidence.toFixed(2)})`
+      }
+    } else {
+      decision = this.router.determineStorage(knowledge)
+      primarySystem = decision.primary
+      secondarySystems = decision.secondary ?? []
+    }
+
     const routingTime = Date.now() - routingStartTime
 
     console.log(`\n🧠 STORAGE DECISION:`)
@@ -131,19 +164,28 @@ export class UnifiedStoreTool {
 
     // Step 2: Store in systems
     const storageStartTime = Date.now()
-    
+
     try {
       // Store in primary system
-      await this.storeInSystem(knowledge, decision.primary)
-      
+      await this.storeInSystem(knowledge, primarySystem)
+
+      // Fire-and-forget enrichment for primary store
+      if (this.enrichmentQueue) {
+        this.enrichmentQueue.add(knowledge.id, knowledge.content, primarySystem as 'mongodb' | 'mem0' | 'neo4j')
+      }
+
       // Store in secondary systems (for cross-linking)
-      if (decision.secondary && decision.secondary.length > 0) {
+      if (secondarySystems.length > 0) {
         console.log(`\n🔗 Cross-linking to secondary systems...`)
         await Promise.all(
-          decision.secondary.map(async (system) => {
+          secondarySystems.map(async (system) => {
             try {
               await this.storeInSystem(knowledge, system)
               console.log(`✅ Cross-stored in ${system}`)
+              // Fire-and-forget enrichment for each secondary store
+              if (this.enrichmentQueue) {
+                this.enrichmentQueue.add(knowledge.id, knowledge.content, system as 'mongodb' | 'mem0' | 'neo4j')
+              }
             } catch (error) {
               console.warn(`⚠️ Failed to cross-store in ${system}:`, error instanceof Error ? error.message : String(error))
             }
@@ -157,8 +199,7 @@ export class UnifiedStoreTool {
       let cached = false
       if (decision.cacheStrategy !== 'skip') {
         const cacheKey = FACTCache.generateKnowledgeKey(
-          knowledge.userId, 
-          knowledge.coachId, 
+          knowledge.userId,
           knowledge.contentType,
           { id: knowledge.id }
         )

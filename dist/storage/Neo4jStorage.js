@@ -6,14 +6,16 @@ export class Neo4jStorage {
     config;
     name = 'neo4j';
     driver;
+    sessionConfig;
     constructor(config) {
         this.config = config;
+        this.sessionConfig = config.database ? { database: config.database } : {};
     }
     async initialize() {
         console.log('🔗 Connecting to Neo4j...');
         this.driver = neo4j.driver(this.config.uri, neo4j.auth.basic(this.config.username, this.config.password));
         // Test connection
-        const session = this.driver.session();
+        const session = this.driver.session(this.sessionConfig);
         try {
             await session.run('RETURN 1');
             console.log('✅ Neo4j connected successfully');
@@ -25,7 +27,7 @@ export class Neo4jStorage {
         await this.createConstraints();
     }
     async store(knowledge) {
-        const session = this.driver.session();
+        const session = this.driver.session(this.sessionConfig);
         try {
             console.log(`🔗 Storing in Neo4j: ${knowledge.id}`);
             // Create the knowledge node
@@ -36,7 +38,6 @@ export class Neo4jStorage {
           contentType: $contentType,
           source: $source,
           userId: $userId,
-          coachId: $coachId,
           confidence: $confidence,
           timestamp: datetime($timestamp),
           metadata: $metadata
@@ -47,7 +48,6 @@ export class Neo4jStorage {
                 contentType: knowledge.contentType,
                 source: knowledge.source,
                 userId: knowledge.userId,
-                coachId: knowledge.coachId,
                 confidence: knowledge.confidence,
                 timestamp: knowledge.timestamp.toISOString(),
                 metadata: JSON.stringify(knowledge.metadata)
@@ -71,68 +71,69 @@ export class Neo4jStorage {
         }
     }
     async search(query) {
-        const session = this.driver.session();
+        const session = this.driver.session(this.sessionConfig);
         try {
             console.log(`🔍 Searching Neo4j: "${query.query}"`);
-            let cypher = `
-        MATCH (k:Knowledge)
-        WHERE k.content CONTAINS $query
-      `;
+            // Use fulltext index for broad search across Person, Organization, Project, etc.
+            // The old MATCH (k:Knowledge) query returned 0 results because there are 0 Knowledge nodes —
+            // all data lives under Person/Organization/Project/Technology/Concept/Service/Event labels.
+            const maxResults = Math.floor(query.options?.maxResults || 10);
+            let cypher;
             const params = { query: query.query };
-            // Add filters
-            if (query.filters?.contentType) {
-                cypher += ` AND k.contentType IN $contentTypes`;
-                params.contentTypes = query.filters.contentType;
-            }
-            if (query.filters?.source) {
-                cypher += ` AND k.source IN $sources`;
-                params.sources = query.filters.source;
-            }
-            if (query.filters?.userId) {
-                cypher += ` AND k.userId = $userId`;
-                params.userId = query.filters.userId;
-            }
-            if (query.filters?.coachId) {
-                cypher += ` AND k.coachId = $coachId`;
-                params.coachId = query.filters.coachId;
-            }
-            if (query.filters?.minConfidence) {
-                cypher += ` AND k.confidence >= $minConfidence`;
-                params.minConfidence = query.filters.minConfidence;
-            }
-            // Include relationships if requested
             if (query.options?.includeRelationships) {
-                cypher += `
-          OPTIONAL MATCH (k)-[r]-(related:Knowledge)
-          RETURN k, collect({
-            relationship: type(r),
-            relatedNode: related.id,
-            relatedContent: related.content,
-            strength: r.strength
-          }) as relationships
+                cypher = `
+          CALL db.index.fulltext.queryNodes('knowledge_search', $query)
+          YIELD node AS k, score
+          OPTIONAL MATCH (k)-[r]-(related)
+          WHERE related.name IS NOT NULL
+          RETURN k, score,
+            collect({
+              relationship: type(r),
+              relatedNode: related.id,
+              relatedContent: coalesce(related.name, related.content, ''),
+              strength: r.strength
+            }) as relationships
+          ORDER BY score DESC
+          LIMIT ${maxResults}
         `;
             }
             else {
-                cypher += ` RETURN k, [] as relationships`;
+                cypher = `
+          CALL db.index.fulltext.queryNodes('knowledge_search', $query)
+          YIELD node AS k, score
+          RETURN k, score, [] as relationships
+          ORDER BY score DESC
+          LIMIT ${maxResults}
+        `;
             }
-            cypher += `
-        ORDER BY k.confidence DESC, k.timestamp DESC
-        LIMIT ${query.options?.maxResults || 10}
-      `;
             const result = await session.run(cypher, params);
             const results = result.records.map(record => {
                 const node = record.get('k').properties;
+                const score = record.get('score');
                 const relationships = record.get('relationships');
+                // Derive a unified content string from whatever text properties exist on the node
+                const content = [
+                    node.name,
+                    node.notes || node.note,
+                    node.description,
+                    node.content,
+                    node.headline,
+                    node.profession,
+                    node.career,
+                    node.purpose,
+                    node.industry
+                ].filter(Boolean).join(' | ');
                 return {
-                    id: node.id,
-                    content: node.content,
-                    confidence: node.confidence,
-                    metadata: JSON.parse(node.metadata || '{}'),
+                    id: node.id || node.name,
+                    content,
+                    confidence: Math.min(score / 5, 1), // normalize fulltext score to 0-1
+                    metadata: node.metadata ? JSON.parse(node.metadata) : node,
                     sourceSystem: 'neo4j',
-                    timestamp: new Date(node.timestamp),
-                    contentType: node.contentType,
-                    source: node.source,
-                    relationships: relationships.filter((r) => r.relatedNode) // Filter out empty relationships
+                    timestamp: node.timestamp ? new Date(node.timestamp) : new Date(),
+                    contentType: node.type || node.contentType || 'graph_node',
+                    source: 'neo4j',
+                    nodeLabels: record.get('k').labels,
+                    relationships: relationships.filter((r) => r.relatedNode)
                 };
             });
             console.log(`🔗 Neo4j found ${results.length} results`);
@@ -147,11 +148,11 @@ export class Neo4jStorage {
         }
     }
     async getStats() {
-        const session = this.driver.session();
+        const session = this.driver.session(this.sessionConfig);
         try {
             // Get node counts
             const nodeResult = await session.run(`
-        MATCH (n:Knowledge)
+        MATCH (n)
         RETURN count(n) as totalNodes
       `);
             const totalNodes = nodeResult.records[0]?.get('totalNodes').toNumber() || 0;
@@ -211,7 +212,7 @@ export class Neo4jStorage {
         }
     }
     async findRelated(nodeId, maxDepth = 2) {
-        const session = this.driver.session();
+        const session = this.driver.session(this.sessionConfig);
         try {
             const result = await session.run(`
         MATCH (start:Knowledge {id: $nodeId})
@@ -269,16 +270,14 @@ export class Neo4jStorage {
             AND existing.contentType IN ['insight', 'relationship']
             AND (
               existing.content CONTAINS $searchTerm1 OR
-              existing.content CONTAINS $searchTerm2 OR
-              existing.coachId = $coachId
+              existing.content CONTAINS $searchTerm2
             )
           RETURN existing.id as relatedId
           LIMIT 5
         `, {
                     id: knowledge.id,
                     searchTerm1: knowledge.contentType,
-                    searchTerm2: knowledge.source,
-                    coachId: knowledge.coachId
+                    searchTerm2: knowledge.source
                 });
                 // Create semantic relationships
                 for (const record of result.records) {
@@ -292,7 +291,7 @@ export class Neo4jStorage {
         }
     }
     async createConstraints() {
-        const session = this.driver.session();
+        const session = this.driver.session(this.sessionConfig);
         try {
             // Create unique constraint on Knowledge.id
             await session.run(`
@@ -316,6 +315,157 @@ export class Neo4jStorage {
         }
         catch (error) {
             console.warn('⚠️ Neo4j constraint creation warning:', error);
+        }
+        finally {
+            await session.close();
+        }
+    }
+    /**
+     * Return a brief entity card for a node by ID.
+     * Used by UnifiedSearchTool for context expansion — keeps output small and agent-friendly.
+     */
+    async getEntitySummary(id) {
+        const session = this.driver.session(this.sessionConfig);
+        try {
+            const result = await session.run(`
+        MATCH (n {id: $id})
+        OPTIONAL MATCH (n)-[r]-(related)
+        WHERE related.name IS NOT NULL
+        WITH n, labels(n) AS nodeLabels,
+             collect({
+               rel: type(r),
+               name: related.name,
+               id: related.id,
+               type: labels(related)[0]
+             })[0..4] AS topRelationships
+        RETURN n, nodeLabels, topRelationships
+        LIMIT 1
+      `, { id });
+            if (result.records.length === 0)
+                return null;
+            const rec = result.records[0];
+            const node = rec.get('n').properties;
+            const nodeLabels = rec.get('nodeLabels');
+            const topRelationships = rec.get('topRelationships');
+            // Build a compact summary — only fields an agent needs at a glance
+            const summary = {
+                id: node.id || id,
+                name: node.name,
+                type: nodeLabels,
+                summary: [node.headline, node.profession, node.description, node.notes, node.purpose]
+                    .filter(Boolean)
+                    .join(' | ')
+                    .slice(0, 200) || null,
+                key_props: {},
+                top_relationships: topRelationships.filter((r) => r.name)
+            };
+            // Include a small selection of domain-relevant properties
+            const domainProps = ['expertise', 'industry', 'career', 'role', 'status', 'domain',
+                'taskPattern', 'approach', 'path', 'notes'];
+            for (const prop of domainProps) {
+                if (node[prop])
+                    summary.key_props[prop] = node[prop];
+            }
+            return summary;
+        }
+        catch (error) {
+            console.warn('⚠️ Neo4j getEntitySummary error:', error);
+            return null;
+        }
+        finally {
+            await session.close();
+        }
+    }
+    /**
+     * Return all ContextTrigger and ToolRoute nodes so UnifiedSearchTool
+     * can match them client-side against the current query.
+     */
+    async getOperationalNodes() {
+        const session = this.driver.session(this.sessionConfig);
+        try {
+            const result = await session.run(`
+        MATCH (n)
+        WHERE n.type IN ['ContextTrigger', 'ToolRoute']
+        RETURN n.id AS id, n.type AS type, n.name AS name,
+               coalesce(n.description, n.taskPattern, '') AS description,
+               coalesce(n.actions, []) AS actions,
+               n.taskPattern AS taskPattern
+      `);
+            return result.records.map(r => ({
+                id: r.get('id'),
+                type: r.get('type'),
+                name: r.get('name'),
+                description: r.get('description') || '',
+                actions: r.get('actions') || [],
+                taskPattern: r.get('taskPattern')
+            }));
+        }
+        catch (error) {
+            console.warn('⚠️ Neo4j getOperationalNodes error:', error);
+            return [];
+        }
+        finally {
+            await session.close();
+        }
+    }
+    /**
+     * Return all Person/Organization/Project/Technology/Concept/Service nodes
+     * that have both an id and a name. Used by EntityLinker for entity extraction.
+     * Results are cached by the caller — this fetches fresh from Neo4j each call.
+     */
+    async getEntityCandidates() {
+        const session = this.driver.session(this.sessionConfig);
+        try {
+            const result = await session.run(`
+        MATCH (n)
+        WHERE labels(n)[0] IN ['Person','Organization','Project','Technology','Concept','Service']
+          AND n.id IS NOT NULL
+          AND n.name IS NOT NULL
+        RETURN n.id AS id, n.name AS name,
+               labels(n) AS labels,
+               coalesce(n.aliases, []) AS aliases
+        LIMIT 500
+      `);
+            return result.records.map(r => ({
+                id: r.get('id'),
+                name: r.get('name'),
+                labels: r.get('labels'),
+                aliases: r.get('aliases') || []
+            }));
+        }
+        catch (error) {
+            console.warn('⚠️ Neo4j getEntityCandidates error:', error);
+            return [];
+        }
+        finally {
+            await session.close();
+        }
+    }
+    /**
+     * Create ABOUT relationships from a stored Knowledge node to entity nodes.
+     * Used by EntityLinker after extracting entity mentions from stored content.
+     * Best-effort — silently skips entity IDs that don't exist in the graph.
+     */
+    async createAboutRelationships(sourceId, targetEntityIds) {
+        if (targetEntityIds.length === 0)
+            return;
+        const session = this.driver.session(this.sessionConfig);
+        try {
+            await session.run(`
+        UNWIND $targetIds AS targetId
+        MATCH (e {id: targetId})
+        MERGE (k:Knowledge {id: $sourceId})
+        MERGE (k)-[r:ABOUT]->(e)
+        SET r.createdAt = datetime(), r.source = 'enrichment'
+      `, {
+                sourceId,
+                targetIds: targetEntityIds
+            });
+            console.log(`🔗 Neo4j: created ABOUT relationships: ${sourceId} → [${targetEntityIds.join(', ')}]`);
+        }
+        catch (error) {
+            console.warn('⚠️ Neo4j createAboutRelationships error:', error);
+            // Swallow — enrichment is best-effort
         }
         finally {
             await session.close();

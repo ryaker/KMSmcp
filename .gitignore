@@ -1,5 +1,6 @@
 node_modules/
 dist/
+scripts/
 .env*
 *.env
 .env.local

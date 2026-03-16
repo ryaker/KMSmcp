@@ -43,23 +43,22 @@ export class Mem0Storage {
             console.log(`🧠 Storing in Mem0: ${knowledge.id}`);
             const userId = this.generateUserId(knowledge);
             // Store in Mem0 with rich metadata
-            const memoryData = {
-                messages: [{
-                        role: 'user',
-                        content: knowledge.content
-                    }],
+            const messages = [{
+                    role: 'user',
+                    content: knowledge.content
+                }];
+            const options = {
                 user_id: userId,
                 metadata: {
                     kms_id: knowledge.id,
                     content_type: knowledge.contentType,
                     source: knowledge.source,
                     confidence: knowledge.confidence,
-                    coach_id: knowledge.coachId,
                     timestamp: knowledge.timestamp.toISOString(),
                     ...knowledge.metadata
                 }
             };
-            await this.client.add(memoryData);
+            await this.client.add(messages, options);
             console.log(`✅ Successfully stored in Mem0 for user: ${userId}`);
         }
         catch (error) {
@@ -181,12 +180,8 @@ export class Mem0Storage {
         }
     }
     generateUserId(knowledge) {
-        // Generate consistent user ID based on knowledge context
         if (knowledge.userId) {
             return knowledge.userId;
-        }
-        if (knowledge.coachId) {
-            return `coach_${knowledge.coachId}`;
         }
         if (knowledge.source === 'personal') {
             return this.config.defaultUserId || 'system_personal';
@@ -194,12 +189,8 @@ export class Mem0Storage {
         return `system_${knowledge.source}`;
     }
     generateUserIdFromQuery(query) {
-        // Generate user ID for search context
         if (query.filters?.userId) {
             return query.filters.userId;
-        }
-        if (query.filters?.coachId) {
-            return `coach_${query.filters.coachId}`;
         }
         // MUST use configured default user ID - this should be set in environment
         if (!this.config.defaultUserId) {
@@ -223,15 +214,10 @@ export class Mem0Storage {
         return mem0Filters;
     }
     getKnownUserIds() {
-        // In production, you might want to track this
-        return [
-            'richard_yaker',
-            'system_coaching',
-            'system_technical',
-            'system_global'
-        ];
+        const defaultUserId = this.config.defaultUserId || 'personal';
+        return [defaultUserId, 'system_technical', 'system_global'];
     }
-    async testDirectSearch(query, userId = 'richard_yaker') {
+    async testDirectSearch(query, userId = process.env.KMS_DEFAULT_USER_ID || 'personal') {
         try {
             console.log(`🧪 [Mem0Storage.testDirectSearch] Testing direct search for: "${query}" with user: ${userId}`);
             const searchQuery = query;

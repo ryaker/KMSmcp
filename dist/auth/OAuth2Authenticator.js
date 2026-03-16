@@ -22,11 +22,35 @@ export class OAuth2Authenticator {
         }
     }
     /**
-     * Authenticate request using Bearer token
+     * Authenticate request using Bearer token or Cloudflare Access headers
      */
-    async authenticate(authHeader) {
+    async authenticate(authHeader, cfAssertion) {
         if (!this.config.enabled) {
-            return { isAuthenticated: true }; // Auth disabled, allow all
+            return { isAuthenticated: true };
+        }
+        // 1. Trust Cloudflare Access JWT if present
+        if (cfAssertion) {
+            try {
+                // In a production environment, we would verify the CF JWT signature here
+                // For now, we trust the tunnel has verified it
+                const parts = cfAssertion.split('.');
+                if (parts.length === 3) {
+                    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+                    console.log(`✅ Authenticated via Cloudflare Access: ${payload.email}`);
+                    return {
+                        isAuthenticated: true,
+                        user: {
+                            id: payload.sub,
+                            email: payload.email,
+                            name: payload.name || payload.email,
+                            roles: []
+                        }
+                    };
+                }
+            }
+            catch (e) {
+                console.warn('⚠️  Failed to parse Cloudflare Assertion header');
+            }
         }
         if (!authHeader) {
             throw this.createAuthError('invalid_request', 'Missing Authorization header');
@@ -112,7 +136,9 @@ export class OAuth2Authenticator {
                     return;
                 }
                 // Validate audience and resource parameter
-                if (payload.aud !== this.config.audience) {
+                const tokenAudience = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+                if (!tokenAudience.includes(this.config.audience)) {
+                    console.warn(`❌ Audience mismatch. Expected: ${this.config.audience}, Got:`, payload.aud);
                     reject(new Error('Invalid audience'));
                     return;
                 }

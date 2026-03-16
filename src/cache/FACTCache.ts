@@ -206,10 +206,9 @@ export class FACTCache implements FACTCacheLayer {
   /**
    * Generate cache key for knowledge
    */
-  static generateKnowledgeKey(userId?: string, coachId?: string, type?: string, context?: any): string {
-    const parts = ['knowledge']
+  static generateKnowledgeKey(userId?: string, type?: string, context?: any): string {
+    const parts = ['kms', 'knowledge']
     if (userId) parts.push(`user:${userId}`)
-    if (coachId) parts.push(`coach:${coachId}`)
     if (type) parts.push(`type:${type}`)
     if (context) parts.push(`ctx:${JSON.stringify(context).slice(0, 50)}`)
     
@@ -223,6 +222,6 @@ export class FACTCache implements FACTCacheLayer {
     const queryHash = Buffer.from(query).toString('base64').slice(0, 20)
     const filterHash = filters ? Buffer.from(JSON.stringify(filters)).toString('base64').slice(0, 10) : ''
     
-    return `search:${queryHash}:${filterHash}`
+    return `kms:search:${queryHash}:${filterHash}`
   }
 }

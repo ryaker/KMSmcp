@@ -169,7 +169,7 @@ export class IntelligentStorageRouter {
      */
     determineCacheStrategy(knowledge) {
         // Personal user queries - cache aggressively
-        if (knowledge.userId === 'richard_yaker' || knowledge.source === 'personal') {
+        if (knowledge.source === 'personal') {
             console.log(`🚀 L1 cache for personal user content`);
             return 'L1';
         }

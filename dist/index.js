@@ -10,6 +10,10 @@ import { HttpTransport } from './transport/HttpTransport.js';
 import { FACTCache } from './cache/FACTCache.js';
 import { RedisKeepAlive } from './cache/RedisKeepAlive.js';
 import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js';
+import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js';
+import { OllamaInference } from './inference/OllamaInference.js';
+import { EnrichmentQueue } from './inference/EnrichmentQueue.js';
+import { EntityLinker } from './inference/EntityLinker.js';
 import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index.js';
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool } from './tools/index.js';
 export class UnifiedKMSServer {
@@ -81,18 +85,37 @@ export class UnifiedKMSServer {
             mem0: new Mem0Storage(this.config.mem0)
         };
         // Initialize all storage systems in parallel
-        await Promise.all([
+        console.log('📊 Initializing Storage Systems...');
+        const storageResults = await Promise.allSettled([
             this.storage.mongodb.initialize(),
             this.storage.neo4j.initialize(),
             this.storage.mem0.initialize()
         ]);
+        // Log initialization results
+        const systemNames = ['MongoDB', 'Neo4j', 'Mem0'];
+        storageResults.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                console.log(`✅ ${systemNames[index]} initialized successfully`);
+            }
+            else {
+                console.warn(`⚠️  ${systemNames[index]} failed to initialize (continuing in degraded mode):`, result.reason?.message || result.reason);
+            }
+        });
         // Step 3: Initialize intelligent router
         console.log('🧠 Initializing Intelligent Router...');
         this.router = new IntelligentStorageRouter();
+        // Step 3b: Initialize Ollama inference layer (with regex fallback)
+        console.log('🤖 Initializing Ollama Inference Layer...');
+        const ollamaInference = new OllamaInference(process.env.OLLAMA_BASE_URL || 'http://localhost:11434', process.env.OLLAMA_MODEL || 'qwen3:8b');
+        const ollamaRouter = new OllamaStorageRouter(ollamaInference, this.router);
+        // Enrichment pipeline — linker injected after storage is ready
+        const enrichmentQueue = new EnrichmentQueue(null);
+        const entityLinker = new EntityLinker(ollamaInference, this.storage.neo4j, this.storage.mongodb);
+        enrichmentQueue.setLinker(entityLinker);
         // Step 4: Initialize tools
         console.log('🛠️  Initializing Tools...');
         this.tools = {
-            store: new UnifiedStoreTool(this.router, this.storage, this.factCache),
+            store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue),
             search: new UnifiedSearchTool(this.storage, this.factCache),
             instructions: new KMSInstructionsTool()
         };
@@ -319,16 +342,12 @@ export class UnifiedKMSServer {
                         },
                         source: {
                             type: 'string',
-                            enum: ['coaching', 'personal', 'technical', 'cross_domain'],
+                            enum: ['personal', 'technical', 'cross_domain'],
                             description: 'OPTIONAL - Auto-detected based on content. technical=code/bugs, personal=preferences/insights, cross_domain=general knowledge'
                         },
                         userId: {
                             type: 'string',
                             description: 'OPTIONAL - Defaults to "personal" for your knowledge base'
-                        },
-                        coachId: {
-                            type: 'string',
-                            description: 'OPTIONAL - Only needed for coaching-specific content'
                         },
                         metadata: {
                             type: 'object',
@@ -383,10 +402,6 @@ export class UnifiedKMSServer {
                                 userId: {
                                     type: 'string',
                                     description: 'Filter by user ID'
-                                },
-                                coachId: {
-                                    type: 'string',
-                                    description: 'Filter by coach ID'
                                 },
                                 minConfidence: {
                                     type: 'number',
@@ -531,8 +546,7 @@ export class UnifiedKMSServer {
                         },
                         userId: {
                             type: 'string',
-                            description: 'User ID to search for (defaults to richard_yaker)',
-                            default: 'richard_yaker'
+                            description: 'User ID to search for (defaults to KMS_DEFAULT_USER_ID env var)'
                         }
                     },
                     required: ['query']
@@ -550,6 +564,14 @@ export class UnifiedKMSServer {
                             enum: ['workflow', 'best_practices', 'search_patterns', 'storage_guidelines', 'overview']
                         }
                     }
+                }
+            },
+            {
+                name: 'kms_ping',
+                description: 'Minimal connectivity test. Returns timestamp, server version, and live node counts from Neo4j and Mem0. Use to confirm the KMS tunnel + transport + datastores are all working end-to-end.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {}
                 }
             }
         ];
@@ -594,6 +616,9 @@ export class UnifiedKMSServer {
                         break;
                     case 'kms_instructions':
                         result = await this.tools.instructions.execute(args);
+                        break;
+                    case 'kms_ping':
+                        result = await this.handleKmsPing();
                         break;
                     default:
                         throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
@@ -650,6 +675,45 @@ export class UnifiedKMSServer {
     /**
      * Handle cache invalidation
      */
+    async handleKmsPing() {
+        const start = Date.now();
+        const result = {
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+            version: '2.0.0',
+            datastores: {}
+        };
+        // Neo4j: get real node count to prove connectivity
+        try {
+            const stats = await this.storage.neo4j.getStats();
+            result.datastores.neo4j = {
+                status: 'connected',
+                nodes: stats.totalNodes,
+                relationships: stats.totalRelationships
+            };
+        }
+        catch (e) {
+            result.datastores.neo4j = { status: 'error', error: e instanceof Error ? e.message : String(e) };
+        }
+        // Mem0: quick search to prove connectivity
+        try {
+            const mem0Stats = await this.storage.mem0.getStats();
+            result.datastores.mem0 = { status: 'connected', ...mem0Stats };
+        }
+        catch (e) {
+            result.datastores.mem0 = { status: 'error', error: e instanceof Error ? e.message : String(e) };
+        }
+        // MongoDB: quick stats
+        try {
+            const mongoStats = await this.storage.mongodb.getStats();
+            result.datastores.mongodb = { status: 'connected', ...mongoStats };
+        }
+        catch (e) {
+            result.datastores.mongodb = { status: 'error', error: e instanceof Error ? e.message : String(e) };
+        }
+        result.latencyMs = Date.now() - start;
+        return result;
+    }
     async handleCacheInvalidate(args) {
         console.log(`🗑️ Invalidating cache pattern: ${args.pattern}`);
         if (this.factCache) {
@@ -784,12 +848,13 @@ async function main() {
         neo4j: {
             uri: process.env.NEO4J_AURA_URI || process.env.NEO4J_URI || 'bolt://localhost:7687',
             username: process.env.NEO4J_AURA_USERNAME || process.env.NEO4J_USERNAME || 'neo4j',
-            password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || 'password'
+            password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || 'password',
+            database: process.env.NEO4J_AURA_DATABASE || process.env.NEO4J_DATABASE
         },
         mem0: {
             apiKey: process.env.MEM0_API_KEY,
             orgId: process.env.MEM0_ORG_ID,
-            defaultUserId: process.env.MEM0_DEFAULT_USER_ID
+            defaultUserId: process.env.KMS_DEFAULT_USER_ID || 'personal'
         },
         redis: {
             uri: process.env.REDIS_CLOUD_URI || process.env.REDIS_URI || 'redis://localhost:6379'
@@ -889,13 +954,10 @@ async function main() {
     // Validate required config
     if (!config.mem0.apiKey) {
         console.error('❌ MEM0_API_KEY environment variable is required');
-        console.error('   Ensure Doppler integration is syncing secrets to Railway');
         console.error('\n💡 TROUBLESHOOTING:');
-        console.error('   1. Check Railway dashboard → Settings → Integrations → Doppler');
-        console.error('   2. Verify Doppler project is set to: ry-local');
-        console.error('   3. Verify Doppler config is set to: dev');
-        console.error('   4. Check Doppler dashboard has MEM0_API_KEY in ry-local/dev');
-        console.error('   5. Try re-syncing the Doppler integration in Railway');
+        console.error('   1. Set MEM0_API_KEY environment variable');
+        console.error('   2. If using Doppler: verify MEM0_API_KEY is in your project config');
+        console.error('   3. If using Railway: check Settings → Environment Variables');
         process.exit(1);
     }
     // Validate OAuth config if enabled
