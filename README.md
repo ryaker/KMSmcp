@@ -1,335 +1,338 @@
-# Unified KMS MCP Server
+# KMS MCP — Unified Knowledge Management System
 
-A next-generation Knowledge Management System MCP server that intelligently routes knowledge to optimal storage systems with sub-100ms FACT caching.
+A polyglot memory server built on the [Model Context Protocol](https://modelcontextprotocol.io). Intelligently routes knowledge across Neo4j, Mem0, and MongoDB, surfaces it through semantic search with sub-100ms FACT caching, and exposes everything as MCP tools for Claude Desktop, Claude Code, and any MCP-compatible client.
 
-## 🧠 What is `unified_store`?
+---
 
-The `unified_store` tool is the **brain** of the system that automatically decides where to store each piece of knowledge:
+## Why polyglot memory?
 
-### How It Works:
+Different knowledge has different shapes:
 
-1. **Content Analysis**: AI analyzes text patterns:
-   - `"Client prefers morning sessions"` → **Mem0** (memory pattern)
-   - `"Reframing technique effective for anxiety"` → **Neo4j** (relationship/insight)  
-   - `"Session config: duration 60min"` → **MongoDB** (structured data)
+| Layer | Store | Strength |
+|-------|-------|----------|
+| Knowledge graph | Neo4j | Entities, typed edges, traversal queries — *who worked where, what connects to what* |
+| Semantic / episodic | Mem0 | Natural language recall, personal context, "do I know anything about X?" |
+| Structured documents | MongoDB | Config, procedures, technical specs — exact field queries |
 
-2. **Storage Decision**: Returns intelligent routing:
-   ```json
-   {
-     "primary": "mem0",
-     "secondary": ["mongodb"],
-     "reasoning": "Memory patterns optimize for Mem0 semantic search",
-     "cacheStrategy": "L1"
-   }
-   ```
+**The routing rule is simple:** Neo4j + Mem0 always (graph + semantic layer). MongoDB added only for procedural or technical content. You don't choose — the router chooses.
 
-3. **Multi-System Storage**: Stores in primary + secondary for redundancy
-4. **FACT Caching**: Caches based on importance (richard_yaker = L1, coaching = L2, general = L3)
+---
 
-## 🚀 Features
-
-- **🧠 Intelligent Storage Routing**: AI decides optimal storage system
-- **⚡ FACT Caching**: 3-layer cache for sub-100ms responses  
-- **🔗 Cross-System Linking**: Automatic data relationships
-- **🎯 Unified API**: 6 powerful tools instead of separate servers
-- **📊 Analytics**: Comprehensive performance monitoring
-- **🛡️ Error Resilience**: Graceful degradation when systems are offline
-- **🌐 Remote MCP Support**: HTTP/SSE transport for remote access
-- **🔐 OAuth 2.1 Authentication**: Secure access with JWT and token introspection
-- **🚦 Rate Limiting & CORS**: Production-ready security features
-
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Mem0 Storage  │    │  Neo4j Storage   │    │ MongoDB Storage │
-│   (Memories)    │    │ (Relationships)  │    │ (Structured)    │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                    ┌─────────────────────┐
-                    │ Intelligent Router  │
-                    │ (Pattern Matching)  │
-                    └─────────────────────┘
-                                 │
-                    ┌─────────────────────┐
-                    │   FACT Cache        │
-                    │ L1→L2→L3→Database   │
-                    └─────────────────────┘
-                                 │
-                    ┌─────────────────────┐
-                    │  Unified MCP API    │
-                    │    6 Tools          │
-                    └─────────────────────┘
+Input
+  │
+  ▼
+┌─────────────────────────────────┐
+│  Content Inference              │  Detects type, source, tags
+│  (ContentInference.ts)          │
+└─────────────────────────────────┘
+  │
+  ▼
+┌─────────────────────────────────┐
+│  Storage Router                 │  LLM (Ollama) → regex fallback
+│  OllamaStorageRouter            │
+│  IntelligentStorageRouter       │
+└─────────────────────────────────┘
+  │
+  ├──────────────────────┬─────────────────────────┐
+  ▼                      ▼                         ▼
+Neo4j              Mem0 (always)         MongoDB (if technical/
+(always)           Semantic + episodic   procedural content)
+Knowledge graph    memory layer
+  │
+  ▼
+┌─────────────────────────────────┐
+│  EnrichmentQueue (async)        │  Entity extraction, graph linking
+│  EntityLinker + OllamaInference │  via local Ollama (optional)
+└─────────────────────────────────┘
+  │
+  ▼
+┌─────────────────────────────────┐
+│  FACT Cache                     │  L1 (in-memory) → L2 (Redis) → L3
+│  3-layer, sub-100ms             │
+└─────────────────────────────────┘
+  │
+  ▼
+MCP Tools  /  HTTP API  /  CLI
 ```
 
-## 📋 Prerequisites
+---
 
-This unified KMS requires four cloud services for optimal performance. We recommend using managed services (PAAS) for reliability and scalability:
+## Prerequisites
 
-### 🧠 Mem0 - AI Memory Layer
-**What it does**: Semantic memory storage with natural language understanding  
-**Get it**: [Sign up at Mem0](https://mem0.ai) - Free tier available  
-**Need**: API key from your dashboard
+Four cloud services. All have free tiers.
 
-### 🕸️ Neo4j - Knowledge Graph  
-**What it does**: Stores relationships between concepts and insights  
-**Get it**: [Neo4j Aura (Cloud)](https://neo4j.com/cloud/aura/) - Free tier with 50k nodes  
-**Need**: Connection URI, username, password
+| Service | Purpose | Get it |
+|---------|---------|--------|
+| [Mem0](https://mem0.ai) | Semantic / episodic memory | Free tier, API key from dashboard |
+| [Neo4j Aura](https://neo4j.com/cloud/aura/) | Knowledge graph | Free tier, 50k nodes |
+| [MongoDB Atlas](https://mongodb.com/atlas) | Structured documents | Free 512MB cluster |
+| [Redis Cloud](https://redis.com/redis-cloud/) or [Upstash](https://upstash.com/) | L2 cache (optional) | Free tiers available |
 
-### 🗄️ MongoDB - Structured Data
-**What it does**: Document storage for structured data and configurations  
-**Get it**: [MongoDB Atlas](https://mongodb.com/atlas) - Free 512MB cluster  
-**Need**: Connection string (mongodb+srv://...)
+**Optional:** [Ollama](https://ollama.com) running locally for LLM-powered routing. Falls back gracefully to regex routing if unavailable.
 
-### ⚡ Redis - L2 Cache (Optional)
-**What it does**: Fast caching layer for sub-100ms responses  
-**Get it**: [Redis Cloud](https://redis.com/redis-cloud/) or [Upstash](https://upstash.com/) - Free tiers available  
-**Need**: Connection URI (redis://... or rediss://...)
+---
 
-> **💡 Pro Tip**: All these services offer generous free tiers perfect for getting started. You can upgrade as your knowledge base grows!
-
-## 🛠️ Installation
+## Installation
 
 ```bash
-# Clone and install
-cd /Volumes/Dev/localDev/KMSmcp
+git clone https://github.com/ryaker/KMSmcp
+cd KMSmcp
 npm install
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your service credentials (see Prerequisites above)
-
-# Build
 npm run build
+```
 
+### Environment variables
+
+```bash
+# Storage
+MEM0_API_KEY=your_mem0_api_key
+MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/kms
+NEO4J_URI=neo4j+s://xxxx.databases.neo4j.io
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your_password
+REDIS_URI=redis://...          # Optional — L2 cache
+
+# Identity
+KMS_DEFAULT_USER_ID=your_user_id   # e.g. "alice" — stored with all knowledge
+
+# Transport
+TRANSPORT_MODE=http            # stdio | http | dual
+HTTP_PORT=8180
+HTTP_HOST=0.0.0.0
+
+# LLM routing (optional — improves routing quality)
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen3:8b
+
+# OAuth (optional)
+OAUTH_ENABLED=false
+OAUTH_ISSUER=https://your-auth-server.com
+OAUTH_JWKS_URI=https://your-auth-server.com/.well-known/jwks.json
+```
+
+### Start the server
+
+```bash
 # Development
 npm run dev
 
 # Production
 npm start
+
+# With Doppler (recommended for secret management)
+doppler run -- npm start
 ```
 
-## 🔧 Configuration
+---
 
-### Client Configuration
+## Client configuration
 
-#### Claude Code
-Add to your Claude Code configuration:
+### Claude Code
+
 ```json
 {
   "mcpServers": {
-    "personal-kms": {
+    "kms": {
       "type": "http",
-      "url": "https://your-kms-server.com/mcp"
+      "url": "https://your-kms-server/mcp"
     }
   }
 }
 ```
 
-#### Claude Desktop
-1. Go to Settings → MCP Connectors
-2. Click "Add custom connector"
-3. Enter:
-   - **Name**: `personal-kms`
-   - **Remote MCP server URL**: `https://your-kms-server.com/mcp`
-4. Click "Add"
-
-### Transport Modes
-
-The server supports three transport modes:
-
-#### 1. STDIO Mode (Default)
-Traditional MCP for local use with Claude Desktop:
-```bash
-TRANSPORT_MODE=stdio
-```
-
-#### 2. HTTP Mode  
-Remote MCP server accessible via HTTP/REST:
-```bash
-TRANSPORT_MODE=http
-HTTP_PORT=3001
-HTTP_HOST=0.0.0.0
-```
-
-#### 3. Dual Mode
-Both STDIO and HTTP simultaneously:
-```bash
-TRANSPORT_MODE=dual
-HTTP_PORT=3001
-HTTP_HOST=0.0.0.0
-```
-
-### OAuth 2.1 Authentication
-
-For secure remote access, enable OAuth 2.1:
-
-```bash
-# Enable OAuth
-OAUTH_ENABLED=true
-OAUTH_ISSUER=https://your-auth-server.com
-OAUTH_AUDIENCE=https://your-mcp-server.com
-
-# Token validation (choose one)
-OAUTH_JWKS_URI=https://your-auth-server.com/.well-known/jwks.json
-# OR
-OAUTH_TOKEN_INTROSPECTION_ENDPOINT=https://your-auth-server.com/oauth/introspect
-
-# Optional: Client credentials for introspection
-OAUTH_CLIENT_ID=your-client-id
-OAUTH_CLIENT_SECRET=your-client-secret
-```
-
-### Required Environment Variables
-
-**Core Configuration:**
-- `MEM0_API_KEY`: Your Mem0 API key (required)
-- `MONGODB_URI`: MongoDB connection string
-- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`: Neo4j credentials
-- `REDIS_URI`: Redis connection for L2 cache
-
-**HTTP Transport (if enabled):**
-- `HTTP_PORT`: Server port (default: 3001)
-- `HTTP_HOST`: Bind address (default: 0.0.0.0)
-
-**OAuth (if enabled):**
-- `OAUTH_ISSUER`: Authorization server URL
-- `OAUTH_AUDIENCE`: MCP server resource identifier
-
-## 🎯 Tools Available
-
-### 1. `unified_store` - Intelligent Storage
+For local use:
 ```json
 {
-  "name": "unified_store",
-  "params": {
-    "content": "Client responds well to morning meditation sessions",
-    "contentType": "memory",
-    "source": "coaching",
-    "userId": "client_123",
-    "confidence": 0.9
-  }
-}
-```
-
-### 2. `unified_search` - Cross-System Search
-```json
-{
-  "name": "unified_search", 
-  "params": {
-    "query": "meditation techniques anxiety",
-    "filters": {
-      "contentType": ["insight", "memory"],
-      "minConfidence": 0.7
-    },
-    "options": {
-      "maxResults": 10,
-      "cacheStrategy": "conservative"
+  "mcpServers": {
+    "kms": {
+      "type": "http",
+      "url": "http://localhost:8180/mcp"
     }
   }
 }
 ```
 
-### 3. `get_storage_recommendation` - Routing Preview
+### Claude Desktop
+
+Settings → MCP Connectors → Add custom connector → enter your server URL.
+
+### Transport modes
+
+| Mode | Use case |
+|------|----------|
+| `stdio` | Local Claude Desktop, no network |
+| `http` | Remote access via Cloudflare Tunnel, Railway, etc. |
+| `dual` | Both simultaneously |
+
+---
+
+## MCP Tools
+
+### `unified_store` — Store knowledge
+
 ```json
 {
-  "name": "get_storage_recommendation",
-  "params": {
-    "content": "Bug fix: authentication middleware timeout issue"
+  "content": "Resolved OAuth loop by pinning jwks-rsa to 3.1.0 — later versions break with Auth0",
+  "contentType": "procedure",
+  "source": "technical",
+  "confidence": 0.95
+}
+```
+
+```json
+{
+  "content": "I work best with async-first communication — real-time meetings drain focus",
+  "contentType": "memory",
+  "source": "personal"
+}
+```
+
+**`contentType`:** `memory` | `insight` | `pattern` | `relationship` | `fact` | `procedure`
+**`source`:** `personal` | `technical` | `cross_domain`
+
+The router always targets Neo4j + Mem0. MongoDB is added automatically for `procedure`, `technical` source, or config-pattern content.
+
+### `unified_search` — Search across all systems
+
+```json
+{
+  "query": "OAuth authentication issues",
+  "filters": {
+    "contentType": ["procedure", "fact"],
+    "minConfidence": 0.7
+  },
+  "options": {
+    "maxResults": 10,
+    "cacheStrategy": "conservative"
   }
 }
 ```
 
-### 4. `get_kms_analytics` - Performance Metrics
+Results are merged, deduplicated, and ranked across Neo4j, Mem0, and MongoDB. Entity relationships surfaced from the graph layer.
+
+### `get_storage_recommendation` — Preview routing without storing
+
 ```json
 {
-  "name": "get_kms_analytics",
-  "params": {
-    "timeRange": "24h",
-    "includeCache": true
-  }
+  "content": "Deploy via GitHub Actions to Azure Static Web App on push to main"
 }
 ```
 
-### 5. `cache_invalidate` - Cache Management
+Returns the routing decision (primary + secondary stores, cache strategy, reasoning) without writing anything.
+
+### `kms_ping` — Health check
+
+Returns status of all three storage systems and the cache layer. Use to verify connectivity before storing.
+
+### `get_kms_analytics` — Performance metrics
+
 ```json
 {
-  "name": "cache_invalidate",
-  "params": {
-    "pattern": "user:richard_yaker",
-    "level": "all"
-  }
+  "timeRange": "24h",
+  "includeCache": true
 }
 ```
 
-### 6. `test_routing` - Routing Tests
+### `cache_invalidate` — Invalidate cache entries
+
 ```json
 {
-  "name": "test_routing",
-  "params": {
-    "runTests": true
-  }
+  "pattern": "user:alice",
+  "level": "all"
 }
 ```
 
-## 🎯 Migration from Current Setup
+### `kms_instructions` — Usage guide
 
-### Phase 1: Deploy Alongside
-1. Deploy unified server alongside existing MCP servers
-2. Start using unified tools for new knowledge
-3. Existing data remains accessible
+Returns the KMS CLAUDE.md instructions as a tool response — useful for grounding agents at the start of a session.
 
-### Phase 2: Data Migration  
-1. Use built-in sync tools to migrate existing data
-2. Validate data integrity across systems
-3. Test performance improvements
+---
 
-### Phase 3: Full Transition
-1. Retire individual MCP servers
-2. Optimize cache settings
-3. Enable cross-coach learning features
+## CLI (agent / shell use)
 
-## 📊 Performance Targets
-
-- ✅ **Sub-100ms** responses via FACT caching
-- ✅ **Intelligent routing** based on content analysis
-- ✅ **Cross-system redundancy** for data safety
-- ✅ **Graceful degradation** when systems are offline
-- ✅ **Real-time analytics** for optimization
-
-## 🌐 HTTP Endpoints (Remote MCP)
-
-When HTTP transport is enabled, the server exposes these endpoints:
-
-### Core Endpoints
-- `POST /mcp` - MCP JSON-RPC endpoint
-- `GET /mcp/events` - Server-Sent Events for real-time updates
-- `GET /health` - Health check endpoint
-
-### OAuth Discovery (if enabled)
-- `GET /.well-known/oauth-protected-resource` - OAuth resource metadata
-
-### Example HTTP Usage
+For Claude Code agents and shell scripts that don't have an MCP client. Mirrors the MCP tools exactly.
 
 ```bash
-# Health check
-curl http://localhost:3001/health
+# Install globally after build
+npm link
 
-# MCP request (with OAuth)
-curl -X POST http://localhost:3001/mcp \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/list",
-    "id": 1
-  }'
+# Store knowledge
+doppler run -- kms store "Resolved the Neo4j timeout by setting connection pool to 50" \
+  --type procedure --source technical
+
+# Search
+doppler run -- kms search "Neo4j connection issues" --limit 5
+
+# Preview routing (no secrets needed)
+kms route "npm install --save-dev typescript" --type procedure
+
+# Health check all three stores
+doppler run -- kms ping
+```
+
+**Commands:** `store` | `search` | `ping` | `route`
+
+---
+
+## Routing in detail
+
+### Decision flow
+
+1. **Ollama LLM** (if available, confidence ≥ 0.6) — best signal, understands semantics
+2. **Regex fallback** — pattern matching on content + contentType + source
+
+### Routing rules
+
+| Content | Neo4j | Mem0 | MongoDB |
+|---------|-------|------|---------|
+| Any knowledge | ✅ always | ✅ always | — |
+| `contentType: procedure` | ✅ | ✅ | ✅ |
+| `source: technical` | ✅ | ✅ | ✅ |
+| Config / deploy / API patterns | ✅ | ✅ | ✅ |
+
+### Cache strategy
+
+| Source | Level | TTL |
+|--------|-------|-----|
+| `personal` | L1 | 5 min (in-memory) |
+| `memory` / `insight` contentType | L2 | 30 min (Redis) |
+| High confidence (>0.8) | L2 | 30 min |
+| `technical` / `procedure` | L3 | 1 hour (Redis) |
+
+---
+
+## Async enrichment (optional)
+
+After storing, the `EnrichmentQueue` runs asynchronously if Ollama is available:
+
+1. Extracts entity mentions from stored content
+2. Matches against existing Neo4j nodes via `EntityLinker`
+3. Creates typed relationships in the graph automatically
+
+This builds the knowledge graph incrementally without blocking the store operation. If Ollama is unavailable, enrichment is skipped silently.
+
+---
+
+## HTTP endpoints
+
+```
+POST /mcp           MCP JSON-RPC endpoint
+GET  /mcp           SSE stream (resumable sessions)
+DELETE /mcp         Close session
+GET  /health        Health check
+GET  /.well-known/oauth-protected-resource/mcp   OAuth metadata (if enabled)
+GET  /.well-known/oauth-authorization-server     OAuth metadata (if enabled)
+```
+
+```bash
+# Health
+curl http://localhost:8180/health
 
 # Tool call
-curl -X POST http://localhost:3001/mcp \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+curl -X POST http://localhost:8180/mcp \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -337,70 +340,46 @@ curl -X POST http://localhost:3001/mcp \
     "params": {
       "name": "unified_store",
       "arguments": {
-        "content": "Client responds well to morning meditation sessions",
-        "contentType": "memory",
-        "source": "coaching"
+        "content": "Always add connection timeout to Neo4j driver config",
+        "contentType": "procedure",
+        "source": "technical"
       }
     },
-    "id": 2
+    "id": 1
   }'
 ```
 
-## 🧪 Testing
+---
 
-Run the comprehensive test suite:
+## OAuth 2.1 (optional)
 
 ```bash
-# Install dependencies
-npm install
+OAUTH_ENABLED=true
+OAUTH_ISSUER=https://your-auth-server.com
+OAUTH_AUDIENCE=https://your-kms-server.com
+OAUTH_JWKS_URI=https://your-auth-server.com/.well-known/jwks.json
 
-# Run unit tests
+# Or token introspection
+OAUTH_TOKEN_INTROSPECTION_ENDPOINT=https://your-auth-server.com/oauth/introspect
+OAUTH_CLIENT_ID=your-client-id
+OAUTH_CLIENT_SECRET=your-client-secret
+```
+
+MCP discovery methods (`initialize`, `tools/list`) are allowed without authentication for protocol compatibility.
+
+---
+
+## Testing
+
+```bash
 npm test
-
-# Run tests with coverage
 npm run test:coverage
-
-# Run specific test suites
 npm test -- --testPathPattern=OAuth2Authenticator
 npm test -- --testPathPattern=HttpTransport
 ```
 
-## 🔍 Example Usage
+---
 
-```typescript
-// Store a coaching insight
-const result = await unified_store({
-  content: "Client shows 40% improvement with morning routine consistency",
-  contentType: "insight", 
-  source: "coaching",
-  coachId: "sophia",
-  confidence: 0.85
-});
+## License
 
-// Search across all systems
-const results = await unified_search({
-  query: "morning routine effectiveness",
-  filters: { contentType: ["insight", "pattern"] },
-  options: { cacheStrategy: "aggressive" }
-});
-
-// Get storage recommendation
-const recommendation = await get_storage_recommendation({
-  content: "User authentication session expired"
-});
-```
-
-## 🚀 This is Your Competitive Moat
-
-The unified KMS creates **intelligent, learning coaching systems** that:
-- Remember everything about each client
-- Discover effective techniques automatically  
-- Share insights across coaches
-- Respond in sub-100ms
-- Continuously improve from every interaction
-
-**Your AI coaches become extensions of human expertise that grow smarter over time!** 🧠✨
-
-## 📝 License
-
-MIT - Build amazing coaching platforms!
+MIT
