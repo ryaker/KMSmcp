@@ -25,7 +25,10 @@ export class OllamaStorageRouter {
       const result = await this.ollama.classifyStorageTargets(content)
 
       if (result !== null && result.confidence >= 0.6) {
-        const { targets, contentType, confidence } = result
+        const { targets: rawTargets, contentType, confidence } = result
+        // Enforce baseline: neo4j + mem0 always present
+        const targetSet = new Set<'mem0' | 'mongodb' | 'neo4j'>(['neo4j', 'mem0', ...rawTargets])
+        const targets = Array.from(targetSet)
         console.log(
           `[OllamaStorageRouter] llm(confidence=${confidence.toFixed(2)}) → [${targets.join(', ')}]`
         )

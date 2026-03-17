@@ -4,10 +4,14 @@
   "description": "Unified Knowledge Management System MCP Server with FACT caching and intelligent routing",
   "main": "dist/index.js",
   "type": "module",
+  "bin": {
+    "kms": "./dist/cli/kms.js"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "cli": "doppler run -- tsx src/cli/kms.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",

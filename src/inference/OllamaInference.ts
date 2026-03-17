@@ -46,13 +46,14 @@ export class OllamaInference {
 
   async classifyStorageTargets(content: string): Promise<ClassifyResult | null> {
     const prompt = `Return JSON only. No explanation. No markdown.
-{"targets":["mem0","mongodb","neo4j"],"contentType":"episodic|procedural|relational|factual|insight","confidence":0.0}
+{"targets":["neo4j","mem0"],"contentType":"episodic|procedural|relational|factual|insight","confidence":0.0}
 
 Rules:
-- mem0: personal experiences, preferences, episodic memories, "I" statements, feelings
-- mongodb: procedures, debug notes, configs, technical facts, step-by-step instructions
-- neo4j: relationship definitions only ("X relates to Y", "X is part of Y")
-- Most content should target 2 stores. Rich multi-dimensional content may target all 3.
+- neo4j: ALWAYS include — every fact, memory, or insight creates entities and typed edges in the knowledge graph
+- mem0: ALWAYS include — every piece of knowledge needs semantic recall and episodic memory
+- mongodb: ADD ONLY when content is procedural (step-by-step), config/schema, debug notes, or technical documentation
+- Baseline for ALL content: ["neo4j","mem0"]
+- Add mongodb for: procedures, configs, debug logs, technical specs, deployment steps
 - confidence: how sure you are (0.0-1.0)
 
 Text: "${content.slice(0, 500)}"`
