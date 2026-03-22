@@ -75,11 +75,13 @@ export class EntityLinker {
     const matched = new Set<string>()
 
     for (const candidate of candidates) {
+      // Match canonical name
       if (candidate.name.length > 3 && lower.includes(candidate.name.toLowerCase())) {
         matched.add(candidate.id)
         continue
       }
 
+      // Match any alias (maiden names, married names, nicknames, family titles)
       if (candidate.aliases) {
         for (const alias of candidate.aliases) {
           if (alias.length > 3 && lower.includes(alias.toLowerCase())) {
@@ -91,5 +93,13 @@ export class EntityLinker {
     }
 
     return Array.from(matched)
+  }
+
+  /**
+   * Check if a person name resolves to an existing Neo4j node.
+   * Use this before creating any new Person node to prevent duplicates.
+   */
+  async resolvePersonName(name: string): Promise<string | null> {
+    return this.neo4j.resolvePersonId(name)
   }
 }

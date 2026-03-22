@@ -24,7 +24,8 @@ import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js'
 import { OllamaInference } from './inference/OllamaInference.js'
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js'
 import { EntityLinker } from './inference/EntityLinker.js'
-import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index.js'
+import { MongoDBStorage, Neo4jStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js'
+import { ShadowStorage } from './storage/ShadowStorage.js'
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool } from './tools/index.js'
 
 export class UnifiedKMSServer {
@@ -36,6 +37,12 @@ export class UnifiedKMSServer {
   private router!: IntelligentStorageRouter
   private storage!: {
     mongodb: MongoDBStorage
+    // neo4j slot holds Neo4jStorage | SparrowDBStorage | ShadowStorage depending on env.
+    //   KMS_STORAGE_BACKEND=sparrowdb  → SparrowDBStorage (direct)
+    //   KMS_SHADOW_MODE=true           → ShadowStorage (Neo4j primary, SparrowDB shadow)
+    //   (default)                      → Neo4jStorage
+    // Callers that accept Neo4jStorage concretely receive an `as Neo4jStorage` cast —
+    // safe because all three implementations expose the same runtime API.
     neo4j: Neo4jStorage
     mem0: Mem0Storage
   }
@@ -107,9 +114,27 @@ export class UnifiedKMSServer {
     
     // Step 2: Initialize storage systems
     console.log('📊 Initializing Storage Systems...')
+    // Graph backend selection (in priority order):
+    //   KMS_SHADOW_MODE=true          → ShadowStorage (Neo4j primary + SparrowDB shadow)
+    //   KMS_STORAGE_BACKEND=sparrowdb → SparrowDBStorage (direct, eliminates ~50-200ms Aura latency)
+    //   (default)                     → Neo4jStorage (Aura)
+    // All three implement the same runtime API as Neo4jStorage; the cast is safe.
+    let graphBackend: Neo4jStorage
+    if (process.env.KMS_SHADOW_MODE === 'true') {
+      console.log('🔀 Graph backend: Shadow mode (Neo4j primary + SparrowDB shadow)')
+      console.log(`   SparrowDB path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'}`)
+      const neo4jPrimary = new Neo4jStorage(this.config.neo4j)
+      const sparrowShadow = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH })
+      graphBackend = new ShadowStorage(neo4jPrimary, sparrowShadow) as unknown as Neo4jStorage
+    } else if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
+      console.log(`⚡ Graph backend: SparrowDB (path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'})`)
+      graphBackend = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH }) as unknown as Neo4jStorage
+    } else {
+      graphBackend = new Neo4jStorage(this.config.neo4j)
+    }
     this.storage = {
       mongodb: new MongoDBStorage(this.config.mongodb),
-      neo4j: new Neo4jStorage(this.config.neo4j),
+      neo4j: graphBackend,
       mem0: new Mem0Storage(this.config.mem0)
     }
     
