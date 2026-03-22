@@ -1,6 +1,6 @@
 /**
  * Intelligent Storage Router
- * Neo4j + Mem0 always (knowledge graph + semantic layer).
+ * Graph backend (Neo4j or SparrowDB) + Mem0 always (knowledge graph + semantic layer).
  * MongoDB added only for structured/procedural/technical content.
  */
 
@@ -104,7 +104,7 @@ export class IntelligentStorageRouter {
    */
   getRoutingStats(): Record<string, any> {
     return {
-      architecture: 'neo4j+mem0 always, mongodb additive',
+      architecture: `${process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb' : 'neo4j'}+mem0 always, mongodb additive`,
       baseline: ['neo4j', 'mem0'],
       mongodbTriggers: ['contentType=procedure', 'source=technical', 'MONGODB_PATTERN match']
     }
