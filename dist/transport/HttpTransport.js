@@ -8,7 +8,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { createServer } from 'http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js';
@@ -209,14 +209,18 @@ export class HttpTransport {
             else if (!sessionId && isInitializeRequest(req.body)) {
                 const eventStore = new InMemoryEventStore();
                 const userAgent = req.headers['user-agent'] || 'unknown';
-                const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+                const rawIp = req.ip || req.socket.remoteAddress || 'unknown';
+                // Hash the IP so session records are linkable for debugging without storing PII
+                const clientIpHash = typeof rawIp === 'string'
+                    ? `ip_${createHash('sha256').update(rawIp).digest('hex').slice(0, 12)}`
+                    : 'unknown';
                 transport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => randomUUID(),
                     eventStore,
                     onsessioninitialized: (sessionId) => {
                         console.log(`Session initialized: ${sessionId}`);
                         this.transports.set(sessionId, transport);
-                        registerSessionDirect(sessionId, 'kms-mcp', userAgent, clientIp);
+                        registerSessionDirect(sessionId, 'kms-mcp', userAgent, clientIpHash);
                     }
                 });
                 transport.onclose = () => {

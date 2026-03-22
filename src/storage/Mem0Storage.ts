@@ -126,25 +126,24 @@ export class Mem0Storage implements StorageSystem {
 
   async getStats(): Promise<Record<string, any>> {
     try {
-      // Mem0 doesn't have a direct stats API, so we estimate based on user data
-      // In production, you might want to maintain your own stats
-      
+      // v1 API returns { count, next, previous, results } — use page_size=1 for efficiency
+      const userId = this.config.defaultUserId || 'personal'
+      const url = `https://api.mem0.ai/v1/memories/?user_id=${encodeURIComponent(userId)}&page=1&page_size=1`
+      const resp = await fetch(url, {
+        headers: { Authorization: `Token ${this.config.apiKey}` }
+      })
+      if (!resp.ok) throw new Error(`Mem0 count HTTP ${resp.status}`)
+      const data = await resp.json() as { count?: number }
       return {
-        totalMemories: 'estimated', // Mem0 doesn't provide direct count
+        totalMemories: data.count ?? 'unknown',
+        userId,
         status: 'connected',
-        userNamespaces: this.getKnownUserIds(),
-        features: {
-          semanticSearch: true,
-          contextualRetrieval: true,
-          memoryEvolution: true,
-          crossUserSearch: false // Privacy-focused
-        },
-        apiEndpoint: 'Mem0 Cloud Service'
+        apiEndpoint: 'Mem0 Cloud (v1)'
       }
     } catch (error) {
       console.error('❌ Mem0 stats error:', error)
       return {
-        totalMemories: 0,
+        totalMemories: 'unknown',
         status: 'error',
         error: error instanceof Error ? error.message : String(error)
       }

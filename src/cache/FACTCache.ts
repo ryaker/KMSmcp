@@ -18,12 +18,32 @@ export class FACTCache implements FACTCacheLayer {
     l3Hits: 0, l3Misses: 0
   }
 
+  // Track whether L2 was ever successfully connected
+  private l2Active = false
+
   constructor(private config: KMSConfig['fact'], redisClient: Redis) {
     this.redis = redisClient
-    
+
+    // Monitor Redis connection state changes to keep l2Active accurate
+    this.redis.on('ready', () => {
+      this.l2Active = true
+    })
+    this.redis.on('close', () => {
+      if (this.l2Active) {
+        console.warn('⚠️ L2 Redis cache INACTIVE — degraded to L3 only. All queries will be 50-200ms.')
+      }
+      this.l2Active = false
+    })
+    this.redis.on('error', () => {
+      if (this.l2Active) {
+        console.warn('⚠️ L2 Redis cache INACTIVE — degraded to L3 only. All queries will be 50-200ms.')
+      }
+      this.l2Active = false
+    })
+
     // L1 Cache cleanup interval (every minute)
     setInterval(() => this.cleanupL1(), 60000)
-    
+
     console.log(`🚀 FACT Cache initialized:`)
     console.log(`  L1 Cache: ${Math.round(config.l1CacheSize / 1024 / 1024)}MB`)
     console.log(`  L2 TTL: ${Math.round(config.l2CacheTTL / 1000 / 60)}min`)
@@ -44,7 +64,7 @@ export class FACTCache implements FACTCacheLayer {
     this.stats.l1Misses++
 
     // L2 Cache (Redis) - ~1-5ms access (fallback gracefully if unavailable)
-    if (this.redis.status === 'ready') {
+    if (this.l2Active && this.redis.status === 'ready') {
       try {
         const l2Value = await this.redis.get(key)
         if (l2Value) {
@@ -66,6 +86,11 @@ export class FACTCache implements FACTCacheLayer {
     }
     this.stats.l2Misses++
 
+    // Warn once when L2 is not available so operators notice the degraded state
+    if (!this.l2Active && this.redis.status !== 'ready') {
+      console.warn('⚠️ L2 Redis cache INACTIVE — degraded to L3 only. All queries will be 50-200ms.')
+    }
+
     // L3 Cache miss - caller will query database
     this.stats.l3Misses++
     console.log(`💾 Cache MISS: ${key} - will query database`)
@@ -84,7 +109,7 @@ export class FACTCache implements FACTCacheLayer {
     })
 
     // Set in L2 (Redis) with full TTL (fallback gracefully if unavailable)
-    if (this.redis.status === 'ready') {
+    if (this.l2Active && this.redis.status === 'ready') {
       try {
         await this.redis.setex(key, Math.floor(ttl / 1000), JSON.stringify(value))
         console.log(`📝 Cached: ${key} (L1: ${Math.round(l1TTL/1000)}s, L2: ${Math.round(ttl/1000)}s)`)
@@ -113,7 +138,7 @@ export class FACTCache implements FACTCacheLayer {
     })
 
     // Invalidate L2 (Redis) - skip if unavailable
-    if (this.redis.status === 'ready') {
+    if (this.l2Active && this.redis.status === 'ready') {
       try {
         const redisKeys = await this.redis.keys(`*${pattern}*`)
         if (redisKeys.length > 0) {
@@ -146,6 +171,7 @@ export class FACTCache implements FACTCacheLayer {
       },
       l2: {
         connected: this.redis.status === 'ready',
+        active: this.l2Active,
         hitRate: totalL2 > 0 ? this.stats.l2Hits / totalL2 : 0,
         hits: this.stats.l2Hits,
         misses: this.stats.l2Misses,

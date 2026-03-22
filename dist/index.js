@@ -283,7 +283,7 @@ export class UnifiedKMSServer {
                 result = await this.tools.store.store(args);
                 break;
             case 'unified_search':
-                result = await this.tools.search.search(args);
+                result = this.truncateSearchResult(await this.tools.search.search(args));
                 break;
             case 'get_storage_recommendation':
                 result = this.tools.store.getStorageRecommendation(args);
@@ -305,6 +305,9 @@ export class UnifiedKMSServer {
                 break;
             case 'kms_instructions':
                 result = await this.tools.instructions.execute(args);
+                break;
+            case 'kms_ping':
+                result = await this.handleKmsPing();
                 break;
             default:
                 throw new Error(`Tool ${name} not found`);
@@ -594,7 +597,7 @@ export class UnifiedKMSServer {
                         result = await this.tools.store.store(args);
                         break;
                     case 'unified_search':
-                        result = await this.tools.search.search(args);
+                        result = this.truncateSearchResult(await this.tools.search.search(args));
                         break;
                     case 'get_storage_recommendation':
                         result = this.tools.store.getStorageRecommendation(args);
@@ -673,6 +676,39 @@ export class UnifiedKMSServer {
         return analytics;
     }
     /**
+     * Truncate unified_search results so MCP transport doesn't silently cut the payload.
+     * MCP stdio transport hard-caps responses at ~77 KB; we leave a 7 KB buffer.
+     */
+    truncateSearchResult(result) {
+        const MAX_BYTES = 70 * 1024; // 70 KB — leaves ~7 KB buffer under the 77 KB MCP limit
+        const serialized = JSON.stringify(result);
+        if (serialized.length <= MAX_BYTES) {
+            return result; // fits — no changes needed
+        }
+        // Binary-search for the largest results array that fits within the budget
+        const items = Array.isArray(result.results) ? result.results : [];
+        let lo = 0;
+        let hi = items.length;
+        while (lo < hi) {
+            const mid = Math.floor((lo + hi + 1) / 2);
+            const probe = JSON.stringify({ ...result, results: items.slice(0, mid), truncated: true, truncatedAt: mid, nextCursor: null });
+            if (probe.length <= MAX_BYTES) {
+                lo = mid;
+            }
+            else {
+                hi = mid - 1;
+            }
+        }
+        console.warn(`⚠️ unified_search response truncated: ${items.length} → ${lo} results (${serialized.length} bytes > ${MAX_BYTES} byte limit)`);
+        return {
+            ...result,
+            results: items.slice(0, lo),
+            truncated: true,
+            truncatedAt: lo,
+            nextCursor: null
+        };
+    }
+    /**
      * Handle cache invalidation
      */
     async handleKmsPing() {
@@ -681,16 +717,22 @@ export class UnifiedKMSServer {
             status: 'ok',
             timestamp: new Date().toISOString(),
             version: '2.0.0',
-            datastores: {}
+            datastores: {},
+            cache: {}
         };
         // Neo4j: get real node count to prove connectivity
         try {
             const stats = await this.storage.neo4j.getStats();
-            result.datastores.neo4j = {
-                status: 'connected',
-                nodes: stats.totalNodes,
-                relationships: stats.totalRelationships
-            };
+            if (stats.status === 'error') {
+                result.datastores.neo4j = stats;
+            }
+            else {
+                result.datastores.neo4j = {
+                    status: 'connected',
+                    nodes: stats.totalNodes,
+                    relationships: stats.totalRelationships
+                };
+            }
         }
         catch (e) {
             result.datastores.neo4j = { status: 'error', error: e instanceof Error ? e.message : String(e) };
@@ -698,7 +740,12 @@ export class UnifiedKMSServer {
         // Mem0: quick search to prove connectivity
         try {
             const mem0Stats = await this.storage.mem0.getStats();
-            result.datastores.mem0 = { status: 'connected', ...mem0Stats };
+            if (mem0Stats.status === 'error') {
+                result.datastores.mem0 = mem0Stats;
+            }
+            else {
+                result.datastores.mem0 = { status: 'connected', ...mem0Stats };
+            }
         }
         catch (e) {
             result.datastores.mem0 = { status: 'error', error: e instanceof Error ? e.message : String(e) };
@@ -706,15 +753,38 @@ export class UnifiedKMSServer {
         // MongoDB: quick stats
         try {
             const mongoStats = await this.storage.mongodb.getStats();
-            result.datastores.mongodb = { status: 'connected', ...mongoStats };
+            if (mongoStats.status === 'error') {
+                result.datastores.mongodb = mongoStats;
+            }
+            else {
+                result.datastores.mongodb = { status: 'connected', ...mongoStats };
+            }
         }
         catch (e) {
             result.datastores.mongodb = { status: 'error', error: e instanceof Error ? e.message : String(e) };
         }
+        // Cache tier connectivity
+        try {
+            const cacheStats = await this.factCache.getStats();
+            result.cache = {
+                l1Active: true, // L1 (in-memory) is always available
+                l2Active: cacheStats.l2?.active ?? false,
+                l2Connected: cacheStats.l2?.connected ?? false,
+                warning: !cacheStats.l2?.active
+                    ? 'L2 Redis cache INACTIVE — degraded to L3 only. All queries will be 50-200ms.'
+                    : undefined
+            };
+        }
+        catch (e) {
+            result.cache = { error: e instanceof Error ? e.message : String(e) };
+        }
         result.latencyMs = Date.now() - start;
-        result.status = Object.values(result.datastores).some((store) => store?.status === 'error')
-            ? 'degraded'
-            : 'ok';
+        const datastoreStatuses = Object.values(result.datastores).map((store) => store?.status);
+        result.status = datastoreStatuses.every(s => s === 'error')
+            ? 'error'
+            : datastoreStatuses.some(s => s === 'error')
+                ? 'degraded'
+                : 'ok';
         return result;
     }
     async handleCacheInvalidate(args) {

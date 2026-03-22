@@ -117,19 +117,31 @@ export class Neo4jStorage implements StorageSystem {
       const whereClause = filterClauses.length > 0 ? `WHERE ${filterClauses.join(' AND ')}` : ''
 
       if (query.options?.includeRelationships) {
+        // Two patterns handle the mixed index results:
+        // 1. k is a Knowledge node → ABOUT → mid-entity → semantic rel → neighbor
+        // 2. k is an Entity node itself → direct semantic rels (excluding ABOUT which is boring)
         cypher = `
           CALL db.index.fulltext.queryNodes('knowledge_search', $query)
           YIELD node AS k, score
           ${whereClause}
-          OPTIONAL MATCH (k)-[r]-(related)
-          WHERE related.name IS NOT NULL
-          RETURN k, score,
-            collect({
-              relationship: type(r),
-              relatedNode: related.id,
-              relatedContent: coalesce(related.name, related.content, ''),
-              strength: r.strength
+          OPTIONAL MATCH (k)-[:ABOUT]->(mid)-[r1]-(rel1)
+          WHERE rel1.name IS NOT NULL AND rel1 <> k AND type(r1) <> 'ABOUT'
+          OPTIONAL MATCH (k)-[r2]-(rel2)
+          WHERE rel2.name IS NOT NULL AND rel2 <> k AND type(r2) <> 'ABOUT'
+          WITH k, score,
+            collect(DISTINCT {
+              relationship: type(r1),
+              relatedNode: coalesce(rel1.id, rel1.name),
+              relatedContent: coalesce(rel1.name, rel1.content, ''),
+              strength: r1.strength
+            }) +
+            collect(DISTINCT {
+              relationship: type(r2),
+              relatedNode: coalesce(rel2.id, rel2.name),
+              relatedContent: coalesce(rel2.name, rel2.content, ''),
+              strength: r2.strength
             }) as relationships
+          RETURN k, score, relationships
           ORDER BY score DESC
           LIMIT ${maxResults}
         `
@@ -381,21 +393,12 @@ export class Neo4jStorage implements StorageSystem {
       `)
 
       // Full-text index used by search() for broad keyword search across all node types.
-      // knowledge_search covers the main content/name fields on Knowledge and entity nodes.
-      try {
-        await session.run(`
-          CALL db.index.fulltext.createNodeIndex(
-            'knowledge_search',
-            ['Knowledge','Person','Organization','Project','Technology','Concept','Service','Event'],
-            ['name','content','description','notes','headline','profession','career','purpose','industry']
-          )
-        `)
-      } catch (ftErr: any) {
-        // Index already exists — this is not an error; Neo4j throws if the name is taken
-        if (!String(ftErr?.message || '').includes('already exists')) {
-          throw ftErr
-        }
-      }
+      // Uses Neo4j 5.x / Aura syntax — replaces deprecated db.index.fulltext.createNodeIndex()
+      await session.run(`
+        CREATE FULLTEXT INDEX knowledge_search IF NOT EXISTS
+        FOR (n:Knowledge|Person|Organization|Project|Technology|Concept|Service|Event)
+        ON EACH [n.name, n.content, n.description, n.notes, n.headline, n.profession, n.career, n.purpose, n.industry]
+      `)
 
       console.log('🔗 Neo4j constraints and indexes created')
     } catch (error) {

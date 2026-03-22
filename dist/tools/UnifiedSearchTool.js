@@ -38,7 +38,7 @@ export class UnifiedSearchTool {
         };
         // Step 1: Check cache first
         const cacheCheckStart = Date.now();
-        const cacheKey = this.cache ? FACTCache.generateSearchKey(args.query, args.filters) : '';
+        const cacheKey = this.cache ? FACTCache.generateSearchKey(args.query, args.filters, args.options) : '';
         const cached = this.cache ? await this.cache.get(cacheKey) : null;
         const cacheCheckTime = Date.now() - cacheCheckStart;
         if (cached && query.options?.cacheStrategy !== 'realtime') {
@@ -87,8 +87,9 @@ export class UnifiedSearchTool {
         // Remove duplicates (same ID from different systems)
         const uniqueResults = this.deduplicateResults(allResults);
         // Sort by relevance and confidence
+        const maxResults = query.options?.maxResults ?? 10;
         const sortedResults = this.rankResults(uniqueResults, args.query)
-            .slice(0, query.options?.maxResults || 10);
+            .slice(0, maxResults);
         const mergingTime = Date.now() - mergingStart;
         // Step 4: Context expansion — entity cards + triggered actions
         // Runs AFTER merging so we know which entities surfaced before deciding what to expand.

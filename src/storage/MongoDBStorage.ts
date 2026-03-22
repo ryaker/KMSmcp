@@ -3,6 +3,7 @@
  */
 
 import { MongoClient, Db, Collection } from 'mongodb'
+import { createHash } from 'node:crypto'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
 
 export class MongoDBStorage implements StorageSystem {
@@ -26,11 +27,35 @@ export class MongoDBStorage implements StorageSystem {
     console.log(`✅ MongoDB connected to database: ${this.config.database}`)
   }
 
+  /**
+   * Compute a content fingerprint for deduplication.
+   * Uses first 300 chars of trimmed, lowercased content so that timestamps
+   * and minor whitespace differences don't create duplicate documents.
+   */
+  private contentFingerprint(content: string): string {
+    const normalized = content.trim().toLowerCase().slice(0, 300)
+    return createHash('sha256').update(normalized).digest('hex')
+  }
+
   async store(knowledge: UnifiedKnowledge): Promise<void> {
     try {
       console.log(`📄 Storing in MongoDB: ${knowledge.id}`)
-      await this.collection.insertOne(knowledge)
-      console.log(`✅ Successfully stored in MongoDB`)
+      const contentHash = this.contentFingerprint(knowledge.content)
+      const docWithHash = { ...knowledge, contentHash }
+
+      // Upsert on contentHash — prevents duplicate documents when the same
+      // content is stored at different timestamps.
+      const result = await this.collection.updateOne(
+        { contentHash },
+        { $setOnInsert: docWithHash },
+        { upsert: true }
+      )
+
+      if (result.upsertedCount > 0) {
+        console.log(`✅ Successfully stored in MongoDB (new document)`)
+      } else {
+        console.log(`⚠️  MongoDB: duplicate content detected, skipped insert (contentHash: ${contentHash.slice(0, 8)}…)`)
+      }
     } catch (error) {
       console.error('❌ MongoDB storage error:', error)
       throw error
@@ -202,6 +227,9 @@ export class MongoDBStorage implements StorageSystem {
       await this.collection.createIndex({ userId: 1 })
       await this.collection.createIndex({ confidence: -1 })
       await this.collection.createIndex({ timestamp: -1 })
+
+      // Unique index for deduplication via content fingerprint
+      await this.collection.createIndex({ contentHash: 1 }, { unique: true, sparse: true })
 
       // Compound indexes for common queries
       await this.collection.createIndex({ userId: 1, contentType: 1 })

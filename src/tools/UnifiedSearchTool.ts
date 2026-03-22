@@ -157,8 +157,9 @@ export class UnifiedSearchTool {
     const uniqueResults = this.deduplicateResults(allResults)
 
     // Sort by relevance and confidence
+    const maxResults = query.options?.maxResults ?? 10
     const sortedResults = this.rankResults(uniqueResults, args.query)
-      .slice(0, query.options?.maxResults || 10)
+      .slice(0, maxResults)
 
     const mergingTime = Date.now() - mergingStart
 
