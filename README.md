@@ -369,6 +369,51 @@ MCP discovery methods (`initialize`, `tools/list`) are allowed without authentic
 
 ---
 
+## SparrowDB Backend (Local Graph)
+
+KMS supports SparrowDB as a local, zero-latency alternative to Neo4j Aura.
+
+### Prerequisites
+
+- [SparrowDB](https://github.com/ryaker/SparrowDB) cloned locally (default: `~/Dev/SparrowDB`)
+- Rust stable toolchain
+
+### Build the NAPI binary
+
+```bash
+# From KMSmcp root:
+npm run build:sparrowdb
+
+# Or directly:
+bash scripts/build-sparrowdb-node.sh [/path/to/SparrowDB]
+```
+
+### Import from Neo4j
+
+```bash
+SPARROWDB_PATH=~/.kms-sparrowdb \
+doppler run --project ry-local --config dev_personal -- \
+  node scripts/import-neo4j-to-sparrowdb.mjs
+```
+
+### Start KMS with SparrowDB backend
+
+```bash
+SPARROWDB_PATH=~/.kms-sparrowdb \
+KMS_STORAGE_BACKEND=sparrowdb \
+doppler run --project ry-local --config dev_personal -- npm run dev
+```
+
+### Shadow mode (Neo4j primary + SparrowDB diff logging)
+
+```bash
+KMS_SHADOW_MODE=true \
+SPARROWDB_PATH=~/.kms-sparrowdb \
+doppler run --project ry-local --config dev_personal -- npm run dev
+```
+
+---
+
 ## Testing
 
 ```bash
