@@ -340,9 +340,9 @@ export class SparrowDBStorage implements StorageSystem {
       const totalNodes = Number(nodeResult.rows[0]?.['count(n)'] ?? 0)
 
       const relResult = this.db.execute(
-        `MATCH (a:Knowledge)-[:RELATED_TO]->(b:Knowledge) RETURN count(a)`
+        `MATCH ()-[r]->() RETURN count(r) AS cnt`
       )
-      const totalRelationships = Number(relResult.rows[0]?.['count(a)'] ?? 0)
+      const totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0)
 
       // Content type distribution from sidecar (authoritative — SparrowDB strings truncated).
       const contentTypes: Record<string, number> = {}
@@ -354,7 +354,7 @@ export class SparrowDBStorage implements StorageSystem {
         totalNodes: Math.max(totalNodes, this.contentIndex.size),
         totalRelationships,
         contentTypes,
-        relationshipTypes: { RELATED_TO: totalRelationships },
+        relationshipTypes: { total: totalRelationships },
         knowledgeHubs: [],
         status: 'connected',
         graphDensity: totalNodes > 0 ? totalRelationships / totalNodes : 0,
