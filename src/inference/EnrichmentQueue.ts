@@ -1,3 +1,5 @@
+import { logger } from '../logger.js'
+
 export interface EnrichmentJob {
   id: string
   content: string
@@ -31,7 +33,7 @@ export class EnrichmentQueue {
     }
 
     this.queue.push(job)
-    console.log(`[EnrichmentQueue] Queued ${id} (queue depth: ${this.queue.length})`)
+    logger.debug(`[EnrichmentQueue] Queued ${id} (queue depth: ${this.queue.length})`)
     this.scheduleDrain()
   }
 
@@ -57,10 +59,10 @@ export class EnrichmentQueue {
       try {
         if (this.linker) {
           await this.linker.enrich(job.id, job.content, job.sourceSystem)
-          console.log(`[EnrichmentQueue] Enriched ${job.id}`)
+          logger.debug(`[EnrichmentQueue] Enriched ${job.id}`)
         }
       } catch (err) {
-        console.warn(
+        logger.warn(
           `[EnrichmentQueue] Failed to enrich ${job.id}:`,
           err instanceof Error ? err.message : String(err)
         )
