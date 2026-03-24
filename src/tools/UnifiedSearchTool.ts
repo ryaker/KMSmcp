@@ -68,10 +68,10 @@ export class UnifiedSearchTool {
   }> {
     const startTime = Date.now()
     
-    console.log(`\n🔍 UNIFIED SEARCH Starting...`)
-    console.log(`📝 Query: "${args.query}"`)
-    console.log(`🎯 Filters: ${JSON.stringify(args.filters || {})}`)
-    console.log(`⚙️  Options: ${JSON.stringify(args.options || {})}`)
+    console.error(`\n🔍 UNIFIED SEARCH Starting...`)
+    console.error(`📝 Query: "${args.query}"`)
+    console.error(`🎯 Filters: ${JSON.stringify(args.filters || {})}`)
+    console.error(`⚙️  Options: ${JSON.stringify(args.options || {})}`)
 
     const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal'
     const enforceUserId = (filters?: typeof args.filters) => {
@@ -101,7 +101,7 @@ export class UnifiedSearchTool {
     const cacheCheckTime = Date.now() - cacheCheckStart
     
     if (cached && query.options?.cacheStrategy !== 'realtime') {
-      console.log(`⚡ CACHE HIT - Returning cached results`)
+      console.error(`⚡ CACHE HIT - Returning cached results`)
       
       return {
         query: query.query,
@@ -119,7 +119,7 @@ export class UnifiedSearchTool {
       }
     }
 
-    console.log(`💾 Cache miss - Searching all systems...`)
+    console.error(`💾 Cache miss - Searching all systems...`)
 
     // Step 2: Search across all systems in parallel
     const searchStart = Date.now()
@@ -141,10 +141,10 @@ export class UnifiedSearchTool {
       mongodb: mongoResults.status === 'fulfilled' ? mongoResults.value : []
     }
 
-    console.log(`📊 Results found:`)
-    console.log(`   Mem0: ${processedResults.mem0.length}`)
-    console.log(`   Neo4j: ${processedResults.neo4j.length}`)
-    console.log(`   MongoDB: ${processedResults.mongodb.length}`)
+    console.error(`📊 Results found:`)
+    console.error(`   Mem0: ${processedResults.mem0.length}`)
+    console.error(`   Neo4j: ${processedResults.neo4j.length}`)
+    console.error(`   MongoDB: ${processedResults.mongodb.length}`)
 
     // Merge all results
     const allResults = [
@@ -208,14 +208,14 @@ export class UnifiedSearchTool {
     if (this.cache && query.options?.cacheStrategy !== 'realtime') {
       const ttl = this.getCacheTTL(query.options?.cacheStrategy || 'conservative')
       await this.cache.set(cacheKey, result, ttl)
-      console.log(`💾 Results cached for ${Math.round(ttl/1000)}s`)
+      console.error(`💾 Results cached for ${Math.round(ttl/1000)}s`)
     }
 
-    console.log(`\n✅ UNIFIED SEARCH COMPLETE`)
-    console.log(`   Found: ${sortedResults.length} unique results`)
-    console.log(`   Entities: ${Object.keys(entity_context).length}`)
-    console.log(`   Triggered: ${triggered_actions.length}`)
-    console.log(`   Total Time: ${result.searchTime}ms`)
+    console.error(`\n✅ UNIFIED SEARCH COMPLETE`)
+    console.error(`   Found: ${sortedResults.length} unique results`)
+    console.error(`   Entities: ${Object.keys(entity_context).length}`)
+    console.error(`   Triggered: ${triggered_actions.length}`)
+    console.error(`   Total Time: ${result.searchTime}ms`)
 
     return result
   }
@@ -323,7 +323,7 @@ export class UnifiedSearchTool {
     system: 'mem0' | 'neo4j' | 'mongodb',
     query: KnowledgeQuery
   ): Promise<any[]> {
-    console.log(`🔍 Searching ${system} only...`)
+    console.error(`🔍 Searching ${system} only...`)
     
     switch (system) {
       case 'mem0':
