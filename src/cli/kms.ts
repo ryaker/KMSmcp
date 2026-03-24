@@ -25,6 +25,7 @@
 import { parseArgs } from 'node:util'
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 import { Neo4jStorage } from '../storage/Neo4jStorage.js'
+import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
@@ -119,12 +120,21 @@ async function getTools() {
   const cfg = buildConfig()
 
   const mongodb = new MongoDBStorage(cfg.mongodb)
-  const neo4j = new Neo4jStorage(cfg.neo4j)
   const mem0 = new Mem0Storage(cfg.mem0)
+
+  // Honour KMS_STORAGE_BACKEND=sparrowdb — same logic as index.ts
+  let graphBackend: Neo4jStorage
+  if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
+    const sparrowPath = process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'
+    console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
+    graphBackend = new SparrowDBStorage({ dbPath: sparrowPath }) as unknown as Neo4jStorage
+  } else {
+    graphBackend = new Neo4jStorage(cfg.neo4j)
+  }
 
   await Promise.allSettled([
     mongodb.initialize(),
-    neo4j.initialize(),
+    graphBackend.initialize(),
     mem0.initialize()
   ])
 
@@ -133,10 +143,10 @@ async function getTools() {
   const ollamaRouter = new OllamaStorageRouter(ollama, router)
 
   const enrichmentQueue = new EnrichmentQueue(null)
-  const entityLinker = new EntityLinker(ollama, neo4j, mongodb)
+  const entityLinker = new EntityLinker(ollama, graphBackend, mongodb)
   enrichmentQueue.setLinker(entityLinker)
 
-  const storage = { mongodb, neo4j, mem0 }
+  const storage = { mongodb, neo4j: graphBackend, mem0 }
 
   // CLI runs without Redis cache (null = no caching)
   _storeTool = new UnifiedStoreTool(router, storage, null, ollamaRouter, enrichmentQueue)
