@@ -6,25 +6,9 @@ import neo4j, { Driver, Session } from 'neo4j-driver'
 import { readFileSync, existsSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
+import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig, KnownPersonEntry, KnownPeopleConfig } from '../types/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-
-interface KnownPersonEntry {
-  canonical: string
-  allNames: string[]
-  sex: string | null
-  relationshipToRich: string | null
-  status: string
-  businessRole: string | null
-  familyTitle: string | null
-}
-
-interface KnownPeopleConfig {
-  _meta: { generatedAt: string; totalPeople: number; totalNameVariants: number }
-  people: Record<string, KnownPersonEntry>
-  nameIndex: Record<string, string>  // normalized name → canonical node id
-}
 
 export class Neo4jStorage implements StorageSystem {
   public name = 'neo4j'
