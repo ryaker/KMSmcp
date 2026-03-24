@@ -42,6 +42,7 @@
  */
 
 import { createRequire } from 'module'
+import { logger } from '../logger.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
@@ -173,7 +174,7 @@ export class SparrowDBStorage implements StorageSystem {
   // -------------------------------------------------------------------------
 
   async initialize(): Promise<void> {
-    console.log(`⚡ Opening SparrowDB at ${this.dbPath}…`)
+    logger.debug(`⚡ Opening SparrowDB at ${this.dbPath}…`)
     if (!existsSync(this.dbPath)) {
       mkdirSync(this.dbPath, { recursive: true })
     }
@@ -186,7 +187,7 @@ export class SparrowDBStorage implements StorageSystem {
     // Load identity registry
     this._loadKnownPeople()
 
-    console.log(
+    logger.debug(
       `✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar`
     )
   }
@@ -195,7 +196,7 @@ export class SparrowDBStorage implements StorageSystem {
     if (this.db) {
       this._saveSidecar()
       this.db.checkpoint()
-      console.log('✅ SparrowDB checkpointed and sidecar saved')
+      logger.debug('✅ SparrowDB checkpointed and sidecar saved')
     }
   }
 
@@ -204,7 +205,7 @@ export class SparrowDBStorage implements StorageSystem {
   // -------------------------------------------------------------------------
 
   async store(knowledge: UnifiedKnowledge): Promise<void> {
-    console.log(`⚡ Storing in SparrowDB: ${knowledge.id}`)
+    logger.debug(`⚡ Storing in SparrowDB: ${knowledge.id}`)
 
     // Delete any existing node (upsert via DELETE+CREATE, since MERGE+SET is unsupported).
     try {
@@ -255,7 +256,7 @@ export class SparrowDBStorage implements StorageSystem {
     // Semantic auto-relationships (best-effort).
     await this._createSemanticRelationships(knowledge)
 
-    console.log(
+    logger.debug(
       `✅ SparrowDB stored ${knowledge.id} with ` +
       `${knowledge.relationships?.length ?? 0} relationships`
     )
@@ -266,7 +267,7 @@ export class SparrowDBStorage implements StorageSystem {
   // -------------------------------------------------------------------------
 
   async search(query: KnowledgeQuery): Promise<any[]> {
-    console.log(`🔍 Searching SparrowDB: "${query.query}"`)
+    logger.debug(`🔍 Searching SparrowDB: "${query.query}"`)
 
     try {
       const maxResults = Math.floor(query.options?.maxResults ?? 10)
@@ -329,10 +330,10 @@ export class SparrowDBStorage implements StorageSystem {
         })
       )
 
-      console.log(`⚡ SparrowDB found ${results.length} results`)
+      logger.debug(`⚡ SparrowDB found ${results.length} results`)
       return results
     } catch (error) {
-      console.warn('⚠️ SparrowDB search error:', error)
+      logger.warn('⚠️ SparrowDB search error:', error)
       return []
     }
   }
@@ -372,7 +373,7 @@ export class SparrowDBStorage implements StorageSystem {
         sidecarEntries: this.contentIndex.size
       }
     } catch (error) {
-      console.error('❌ SparrowDB stats error:', error)
+      logger.error('❌ SparrowDB stats error:', error)
       return {
         totalNodes: 0,
         totalRelationships: 0,
@@ -444,7 +445,7 @@ export class SparrowDBStorage implements StorageSystem {
         return rawId || null
       }
     } catch (e) {
-      console.warn('⚠️ SparrowDB resolvePersonId search error:', e)
+      logger.warn('⚠️ SparrowDB resolvePersonId search error:', e)
     }
 
     return null
@@ -509,7 +510,7 @@ export class SparrowDBStorage implements StorageSystem {
 
       return results.slice(0, 20)
     } catch (error) {
-      console.warn('⚠️ SparrowDB findRelated error:', error)
+      logger.warn('⚠️ SparrowDB findRelated error:', error)
       return []
     }
   }
@@ -681,10 +682,10 @@ export class SparrowDBStorage implements StorageSystem {
           `CREATE (k)-[:ABOUT]->(e)`
         )
       } catch (error) {
-        console.warn(`⚠️ SparrowDB createAboutRelationships ${sourceId} → ${targetId}:`, error)
+        logger.warn(`⚠️ SparrowDB createAboutRelationships ${sourceId} → ${targetId}:`, error)
       }
     }
-    console.log(
+    logger.debug(
       `⚡ SparrowDB: created ABOUT relationships: ${sourceId} → [${targetEntityIds.join(', ')}]`
     )
   }
@@ -740,7 +741,7 @@ export class SparrowDBStorage implements StorageSystem {
         `CREATE (a)-[:${safeRelType}]->(b)`
       )
     } catch (error) {
-      console.warn(`⚠️ SparrowDB createRelationship ${relationshipType}:`, error)
+      logger.warn(`⚠️ SparrowDB createRelationship ${relationshipType}:`, error)
     }
   }
 
@@ -760,7 +761,7 @@ export class SparrowDBStorage implements StorageSystem {
         await this._createRelationship(knowledge.id, rel.id, 'RELATED_TO')
       }
     } catch (error) {
-      console.warn('⚠️ SparrowDB createSemanticRelationships:', error)
+      logger.warn('⚠️ SparrowDB createSemanticRelationships:', error)
     }
   }
 
@@ -800,7 +801,7 @@ export class SparrowDBStorage implements StorageSystem {
         } catch { continue }
       }
     } catch (error) {
-      console.warn('⚠️ SparrowDB _getRelationships error:', error)
+      logger.warn('⚠️ SparrowDB _getRelationships error:', error)
     }
     return relationships.filter(r => r.relatedNode)
   }
@@ -816,7 +817,7 @@ export class SparrowDBStorage implements StorageSystem {
   private _loadKnownPeople(): void {
     const configPath = join(__dirname, '..', '..', 'config', 'known-people.json')
     if (!existsSync(configPath)) {
-      console.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs')
+      logger.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs')
       return
     }
     try {
@@ -832,10 +833,10 @@ export class SparrowDBStorage implements StorageSystem {
         throw new Error('invalid known-people.json structure')
       }
       this.knownPeople = raw as KnownPeopleConfig
-      console.log(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`)
+      logger.debug(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`)
     } catch (e) {
       this.knownPeople = null
-      console.warn('⚠️ Failed to load known-people.json:', e)
+      logger.warn('⚠️ Failed to load known-people.json:', e)
     }
   }
 
@@ -853,7 +854,7 @@ export class SparrowDBStorage implements StorageSystem {
         }
       }
     } catch (error) {
-      console.warn('⚠️ SparrowDB: failed to load content sidecar:', error)
+      logger.warn('⚠️ SparrowDB: failed to load content sidecar:', error)
     }
   }
 
@@ -865,7 +866,7 @@ export class SparrowDBStorage implements StorageSystem {
       }
       writeFileSync(this.sidecarPath, JSON.stringify(data, null, 2), 'utf8')
     } catch (error) {
-      console.warn('⚠️ SparrowDB: failed to save content sidecar:', error)
+      logger.warn('⚠️ SparrowDB: failed to save content sidecar:', error)
     }
   }
 }

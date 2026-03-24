@@ -1,4 +1,5 @@
 import { OllamaInference, EntityMention } from '../inference/OllamaInference.js'
+import { logger } from '../logger.js'
 import { GraphStorage } from '../types/index.js'
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 
@@ -21,7 +22,7 @@ export class EntityLinker {
     const candidates = await this.getCandidates()
 
     if (candidates.length === 0) {
-      console.warn('[EntityLinker] no entity candidates available — skipping enrichment')
+      logger.warn('[EntityLinker] no entity candidates available — skipping enrichment')
       return
     }
 
@@ -46,7 +47,7 @@ export class EntityLinker {
 
     await this.neo4j.createAboutRelationships(id, foundIds)
 
-    console.log(`[EntityLinker] ${id}: linked ${foundIds.length} entities via ${method}: [${foundIds.join(', ')}]`)
+    logger.debug(`[EntityLinker] ${id}: linked ${foundIds.length} entities via ${method}: [${foundIds.join(', ')}]`)
   }
 
   private async getCandidates(): Promise<EntityMention[]> {
