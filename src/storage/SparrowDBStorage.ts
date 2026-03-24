@@ -439,7 +439,7 @@ export class SparrowDBStorage implements StorageSystem {
     // 2. SparrowDB CONTAINS search fallback
     try {
       const result = this.db.execute(
-        `MATCH (n:Person) WHERE toLower(n.name) CONTAINS toLower('${normalized.replace(/'/g, "\\'")}') RETURN n.id LIMIT 5`
+        `MATCH (n:Person) WHERE toLower(n.name) CONTAINS '${normalized}' RETURN n.id LIMIT 5`
       )
       if (result.rows.length > 0) {
         return String(result.rows[0]['n.id'] ?? '') || null
@@ -821,9 +821,12 @@ export class SparrowDBStorage implements StorageSystem {
       return
     }
     try {
-      this.knownPeople = JSON.parse(readFileSync(configPath, 'utf-8')) as KnownPeopleConfig
+      const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as KnownPeopleConfig
+      if (!parsed || !parsed.nameIndex) throw new Error('invalid structure')
+      this.knownPeople = parsed
       console.log(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`)
     } catch (e) {
+      this.knownPeople = null
       console.warn('⚠️ Failed to load known-people.json:', e)
     }
   }

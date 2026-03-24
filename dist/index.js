@@ -14,7 +14,8 @@ import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js';
 import { OllamaInference } from './inference/OllamaInference.js';
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js';
 import { EntityLinker } from './inference/EntityLinker.js';
-import { MongoDBStorage, Neo4jStorage, Mem0Storage } from './storage/index.js';
+import { MongoDBStorage, Neo4jStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js';
+import { ShadowStorage } from './storage/ShadowStorage.js';
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool } from './tools/index.js';
 export class UnifiedKMSServer {
     config;
@@ -79,9 +80,34 @@ export class UnifiedKMSServer {
         });
         // Step 2: Initialize storage systems
         console.log('📊 Initializing Storage Systems...');
+        // Graph backend selection (in priority order):
+        //   KMS_SHADOW_MODE=true          → ShadowStorage (Neo4j primary + SparrowDB shadow)
+        //   KMS_STORAGE_BACKEND=sparrowdb → SparrowDBStorage (direct, eliminates ~50-200ms Aura latency)
+        //   (default)                     → Neo4jStorage (Aura)
+        // All three implement the same runtime API as Neo4jStorage; the cast is safe.
+        let graphBackend;
+        if (process.env.KMS_SHADOW_MODE === 'true') {
+            console.log('🔀 Graph backend: Shadow mode (Neo4j primary + SparrowDB shadow)');
+            console.log(`   SparrowDB path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'}`);
+            const neo4jPrimary = new Neo4jStorage(this.config.neo4j);
+            const sparrowShadow = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH });
+            graphBackend = new ShadowStorage(neo4jPrimary, sparrowShadow);
+        }
+        else if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
+            console.log(`⚡ Graph backend: SparrowDB (path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'})`);
+            graphBackend = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH });
+        }
+        else {
+            graphBackend = new Neo4jStorage(this.config.neo4j);
+        }
+        const graphBackendName = process.env.KMS_SHADOW_MODE === 'true'
+            ? 'Shadow (Neo4j+SparrowDB)'
+            : process.env.KMS_STORAGE_BACKEND === 'sparrowdb'
+                ? 'SparrowDB'
+                : 'Neo4j';
         this.storage = {
             mongodb: new MongoDBStorage(this.config.mongodb),
-            neo4j: new Neo4jStorage(this.config.neo4j),
+            neo4j: graphBackend,
             mem0: new Mem0Storage(this.config.mem0)
         };
         // Initialize all storage systems in parallel
@@ -92,7 +118,7 @@ export class UnifiedKMSServer {
             this.storage.mem0.initialize()
         ]);
         // Log initialization results
-        const systemNames = ['MongoDB', 'Neo4j', 'Mem0'];
+        const systemNames = ['MongoDB', graphBackendName, 'Mem0'];
         storageResults.forEach((result, index) => {
             if (result.status === 'fulfilled') {
                 console.log(`✅ ${systemNames[index]} initialized successfully`);
@@ -571,7 +597,7 @@ export class UnifiedKMSServer {
             },
             {
                 name: 'kms_ping',
-                description: 'Minimal connectivity test. Returns timestamp, server version, and live node counts from Neo4j and Mem0. Use to confirm the KMS tunnel + transport + datastores are all working end-to-end.',
+                description: 'Minimal connectivity test. Returns timestamp, server version, and live node counts from the active graph backend and Mem0. Use to confirm the KMS tunnel + transport + datastores are all working end-to-end.',
                 inputSchema: {
                     type: 'object',
                     properties: {}
@@ -650,23 +676,26 @@ export class UnifiedKMSServer {
      */
     async getKMSAnalytics(args) {
         console.log('📊 Gathering KMS analytics...');
-        const [cacheStats, mongoStats, neo4jStats, mem0Stats] = await Promise.allSettled([
+        const [cacheStats, mongoStats, graphStats, mem0Stats] = await Promise.allSettled([
             this.factCache ? this.factCache.getStats() : Promise.resolve({ disabled: true }),
             this.storage.mongodb.getStats(),
             this.storage.neo4j.getStats(),
             this.storage.mem0.getStats()
         ]);
+        const graphKey = process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb'
+            : process.env.KMS_SHADOW_MODE === 'true' ? 'shadow'
+                : 'neo4j';
         const analytics = {
             timestamp: new Date().toISOString(),
             cache: cacheStats.status === 'fulfilled' ? cacheStats.value : { error: cacheStats.reason },
             systems: {
                 mongodb: mongoStats.status === 'fulfilled' ? mongoStats.value : { error: mongoStats.reason },
-                neo4j: neo4jStats.status === 'fulfilled' ? neo4jStats.value : { error: neo4jStats.reason },
+                [graphKey]: graphStats.status === 'fulfilled' ? graphStats.value : { error: graphStats.reason },
                 mem0: mem0Stats.status === 'fulfilled' ? mem0Stats.value : { error: mem0Stats.reason }
             },
             routing: this.tools.store.getRoutingStats(),
             overall: {
-                systemsHealthy: [mongoStats, neo4jStats, mem0Stats].filter(s => s.status === 'fulfilled').length,
+                systemsHealthy: [mongoStats, graphStats, mem0Stats].filter(s => s.status === 'fulfilled').length,
                 totalSystems: 3,
                 cacheEfficiency: cacheStats.status === 'fulfilled' && cacheStats.value && typeof cacheStats.value === 'object' && 'overall' in cacheStats.value
                     ? cacheStats.value.overall?.cacheEfficiency || 0
@@ -720,14 +749,17 @@ export class UnifiedKMSServer {
             datastores: {},
             cache: {}
         };
-        // Neo4j: get real node count to prove connectivity
+        // Graph backend: get real node count to prove connectivity
+        const graphKey = process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb'
+            : process.env.KMS_SHADOW_MODE === 'true' ? 'shadow'
+                : 'neo4j';
         try {
             const stats = await this.storage.neo4j.getStats();
             if (stats.status === 'error') {
-                result.datastores.neo4j = stats;
+                result.datastores[graphKey] = stats;
             }
             else {
-                result.datastores.neo4j = {
+                result.datastores[graphKey] = {
                     status: 'connected',
                     nodes: stats.totalNodes,
                     relationships: stats.totalRelationships
@@ -735,7 +767,7 @@ export class UnifiedKMSServer {
             }
         }
         catch (e) {
-            result.datastores.neo4j = { status: 'error', error: e instanceof Error ? e.message : String(e) };
+            result.datastores[graphKey] = { status: 'error', error: e instanceof Error ? e.message : String(e) };
         }
         // Mem0: quick search to prove connectivity
         try {

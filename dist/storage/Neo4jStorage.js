@@ -2,11 +2,16 @@
  * Neo4j Storage System Implementation
  */
 import neo4j from 'neo4j-driver';
+import { readFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+const __dirname = dirname(fileURLToPath(import.meta.url));
 export class Neo4jStorage {
     config;
     name = 'neo4j';
     driver;
     sessionConfig;
+    knownPeople = null;
     constructor(config) {
         this.config = config;
         this.sessionConfig = config.database ? { database: config.database } : {};
@@ -25,6 +30,91 @@ export class Neo4jStorage {
         }
         // Create constraints and indexes
         await this.createConstraints();
+        // Load identity registry
+        this.loadKnownPeople();
+    }
+    /**
+     * Load config/known-people.json into memory.
+     * Called on initialize(); silently skipped if file not yet generated.
+     */
+    loadKnownPeople() {
+        const configPath = join(__dirname, '..', '..', 'config', 'known-people.json');
+        if (!existsSync(configPath)) {
+            console.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs');
+            return;
+        }
+        try {
+            this.knownPeople = JSON.parse(readFileSync(configPath, 'utf-8'));
+            console.log(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`);
+        }
+        catch (e) {
+            console.warn('⚠️ Failed to load known-people.json:', e);
+        }
+    }
+    /**
+     * PersonResolver — resolve any name variant to a canonical Neo4j node ID.
+     *
+     * Checks (fastest → slowest):
+     *   1. In-memory nameIndex from known-people.json  (O(1))
+     *   2. Normalized first+last name lookup in nameIndex
+     *   3. Neo4j fulltext search on name + aliases
+     *
+     * Returns the canonical node ID, or null if no match found.
+     * The caller should only create a new Person node when this returns null.
+     */
+    async resolvePersonId(rawName) {
+        if (!rawName?.trim())
+            return null;
+        const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+        const normalized = normalize(rawName);
+        // 1. Fast in-memory lookup
+        if (this.knownPeople) {
+            const directHit = this.knownPeople.nameIndex[normalized];
+            if (directHit)
+                return directHit;
+            // Try first + last only (e.g. "Jesse David Yaker" → "jesse yaker")
+            const parts = normalized.split(' ');
+            if (parts.length > 2) {
+                const firstLast = `${parts[0]} ${parts[parts.length - 1]}`;
+                const hit = this.knownPeople.nameIndex[firstLast];
+                if (hit)
+                    return hit;
+            }
+        }
+        // 2. Neo4j fulltext search
+        const session = this.driver.session(this.sessionConfig);
+        try {
+            const result = await session.run(`
+        CALL db.index.fulltext.queryNodes('knowledge_search', $query)
+        YIELD node AS n, score
+        WHERE 'Person' IN labels(n) AND score > 0.8
+        RETURN n.id AS id, n.name AS name, coalesce(n.aliases, []) AS aliases, score
+        LIMIT 5
+      `, { query: rawName });
+            for (const rec of result.records) {
+                const name = (rec.get('name') || '').toLowerCase();
+                const aliases = rec.get('aliases').map(a => a.toLowerCase());
+                const score = rec.get('score');
+                if (name === normalized || aliases.includes(normalized)) {
+                    return rec.get('id');
+                }
+                // High-confidence partial: first+last match
+                const parts = normalized.split(' ');
+                if (parts.length >= 2 && score > 1.5) {
+                    const firstLast = `${parts[0]} ${parts[parts.length - 1]}`;
+                    if (name.includes(parts[0]) && name.includes(parts[parts.length - 1])) {
+                        return rec.get('id');
+                    }
+                }
+            }
+        }
+        catch (e) {
+            console.warn('⚠️ PersonResolver search error:', e);
+        }
+        finally {
+            await session.close();
+        }
+        return null;
     }
     async store(knowledge) {
         const session = this.driver.session(this.sessionConfig);
@@ -144,9 +234,16 @@ export class Neo4jStorage {
                 const node = record.get('k').properties;
                 const score = record.get('score');
                 const relationships = record.get('relationships');
-                // Derive a unified content string from whatever text properties exist on the node
+                // Derive a unified content string from whatever text properties exist on the node.
+                // relationshipToRich comes first so context injection surfaces it prominently.
+                const relLabel = node.relationshipToRich
+                    ? `(${node.relationshipToRich})`
+                    : null;
                 const content = [
                     node.name,
+                    relLabel,
+                    node.businessRole,
+                    node.familyTitle,
                     node.notes || node.note,
                     node.description,
                     node.content,
