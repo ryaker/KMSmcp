@@ -9,6 +9,7 @@ import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
 import { EnrichmentQueue } from '../inference/EnrichmentQueue.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Neo4jStorage, Mem0Storage } from '../storage/index.js'
+import type { GraphStorage } from '../types/index.js'
 import { ContentInference } from '../inference/ContentInference.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
@@ -17,7 +18,7 @@ export class UnifiedStoreTool {
   private router: IntelligentStorageRouter
   private storage: {
     mongodb: MongoDBStorage
-    neo4j: Neo4jStorage
+    neo4j: GraphStorage
     mem0: Mem0Storage
   }
   private cache: FACTCache
@@ -26,7 +27,7 @@ export class UnifiedStoreTool {
 
   constructor(
     router: IntelligentStorageRouter,
-    storage: { mongodb: MongoDBStorage, neo4j: Neo4jStorage, mem0: Mem0Storage },
+    storage: { mongodb: MongoDBStorage, neo4j: GraphStorage, mem0: Mem0Storage },
     cache: FACTCache | null,
     ollamaRouter?: OllamaStorageRouter | null,
     enrichmentQueue?: EnrichmentQueue | null

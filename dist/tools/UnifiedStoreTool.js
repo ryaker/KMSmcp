@@ -4,6 +4,8 @@
 import crypto from 'crypto';
 import { FACTCache } from '../cache/FACTCache.js';
 import { ContentInference } from '../inference/ContentInference.js';
+const debug = (...args) => { if (process.env.KMS_DEBUG)
+    console.error(...args); };
 export class UnifiedStoreTool {
     router;
     storage;
@@ -23,15 +25,15 @@ export class UnifiedStoreTool {
      */
     async store(args) {
         const startTime = Date.now();
-        console.log(`\n🚀 UNIFIED STORE Starting...`);
-        console.log(`📝 Content: "${args.content.slice(0, 100)}${args.content.length > 100 ? '...' : ''}"`);
+        debug(`\n🚀 UNIFIED STORE Starting...`);
+        debug(`📝 Content: "${args.content.slice(0, 100)}${args.content.length > 100 ? '...' : ''}"`);
         // Apply smart inference if needed
         let enrichedArgs = { ...args };
         const inference = ContentInference.analyze(args.content);
         // Use inference to fill in missing parameters
         if (!args.contentType) {
             enrichedArgs.contentType = inference.contentType;
-            console.log(`🧠 Inferred content type: ${inference.contentType} (confidence: ${inference.confidence})`);
+            debug(`🧠 Inferred content type: ${inference.contentType} (confidence: ${inference.confidence})`);
         }
         if (!args.source) {
             // Infer source based on content and project
@@ -44,7 +46,7 @@ export class UnifiedStoreTool {
             else {
                 enrichedArgs.source = 'cross_domain';
             }
-            console.log(`🧠 Inferred source: ${enrichedArgs.source}`);
+            debug(`🧠 Inferred source: ${enrichedArgs.source}`);
         }
         // Enhance metadata with inference
         const enhancedMetadata = ContentInference.generateMetadata(args.content, args.metadata);
@@ -57,12 +59,12 @@ export class UnifiedStoreTool {
         if (!args.relationships || args.relationships.length === 0) {
             const suggestedRelationships = ContentInference.suggestRelationships(args.content);
             if (suggestedRelationships.length > 0) {
-                console.log(`💡 Suggested relationships: ${suggestedRelationships.map(r => r.type).join(', ')}`);
+                debug(`💡 Suggested relationships: ${suggestedRelationships.map(r => r.type).join(', ')}`);
             }
         }
-        console.log(`🏷️  Type: ${enrichedArgs.contentType}, Source: ${enrichedArgs.source}`);
-        console.log(`👤 User: ${enrichedArgs.userId || 'auto'}, Context: ${inference.detectedProject || 'general'}`);
-        console.log(`🏷️  Tags: ${enhancedMetadata.tags?.join(', ') || 'none'}`);
+        debug(`🏷️  Type: ${enrichedArgs.contentType}, Source: ${enrichedArgs.source}`);
+        debug(`👤 User: ${enrichedArgs.userId || 'auto'}, Context: ${inference.detectedProject || 'general'}`);
+        debug(`🏷️  Tags: ${enhancedMetadata.tags?.join(', ') || 'none'}`);
         const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal';
         const resolvedUserId = enrichedArgs.userId || defaultUserId;
         // Create unified knowledge object
@@ -108,11 +110,11 @@ export class UnifiedStoreTool {
             secondarySystems = decision.secondary ?? [];
         }
         const routingTime = Date.now() - routingStartTime;
-        console.log(`\n🧠 STORAGE DECISION:`);
-        console.log(`   Primary: ${decision.primary}`);
-        console.log(`   Secondary: ${decision.secondary?.join(', ') || 'none'}`);
-        console.log(`   Cache Strategy: ${decision.cacheStrategy}`);
-        console.log(`   Reasoning: ${decision.reasoning}`);
+        debug(`\n🧠 STORAGE DECISION:`);
+        debug(`   Primary: ${decision.primary}`);
+        debug(`   Secondary: ${decision.secondary?.join(', ') || 'none'}`);
+        debug(`   Cache Strategy: ${decision.cacheStrategy}`);
+        debug(`   Reasoning: ${decision.reasoning}`);
         // Step 2: Store in systems
         const storageStartTime = Date.now();
         try {
@@ -120,11 +122,11 @@ export class UnifiedStoreTool {
             await this.storeInSystem(knowledge, primarySystem);
             // Store in secondary systems (for cross-linking)
             if (secondarySystems.length > 0) {
-                console.log(`\n🔗 Cross-linking to secondary systems...`);
+                debug(`\n🔗 Cross-linking to secondary systems...`);
                 await Promise.all(secondarySystems.map(async (system) => {
                     try {
                         await this.storeInSystem(knowledge, system);
-                        console.log(`✅ Cross-stored in ${system}`);
+                        debug(`✅ Cross-stored in ${system}`);
                     }
                     catch (error) {
                         console.warn(`⚠️ Failed to cross-store in ${system}:`, error instanceof Error ? error.message : String(error));
@@ -144,14 +146,14 @@ export class UnifiedStoreTool {
                     const ttl = this.getCacheTTL(decision.cacheStrategy);
                     await this.cache.set(cacheKey, knowledge, ttl);
                     cached = true;
-                    console.log(`💾 Cached with ${decision.cacheStrategy} strategy (TTL: ${Math.round(ttl / 1000)}s)`);
+                    debug(`💾 Cached with ${decision.cacheStrategy} strategy (TTL: ${Math.round(ttl / 1000)}s)`);
                 }
             }
             const totalTime = Date.now() - startTime;
-            console.log(`\n✅ UNIFIED STORE COMPLETE`);
-            console.log(`   ID: ${knowledge.id}`);
-            console.log(`   Total Time: ${totalTime}ms`);
-            console.log(`   Systems: ${[decision.primary, ...(decision.secondary || [])].join(', ')}`);
+            debug(`\n✅ UNIFIED STORE COMPLETE`);
+            debug(`   ID: ${knowledge.id}`);
+            debug(`   Total Time: ${totalTime}ms`);
+            debug(`   Systems: ${[decision.primary, ...(decision.secondary || [])].join(', ')}`);
             return {
                 success: true,
                 id: knowledge.id,
@@ -183,7 +185,7 @@ export class UnifiedStoreTool {
      * Store knowledge in a specific system
      */
     async storeInSystem(knowledge, system) {
-        console.log(`📊 Storing in ${system}...`);
+        debug(`📊 Storing in ${system}...`);
         switch (system) {
             case 'mem0':
                 await this.storage.mem0.store(knowledge);
@@ -197,7 +199,7 @@ export class UnifiedStoreTool {
             default:
                 throw new Error(`Unknown storage system: ${system}`);
         }
-        console.log(`✅ Successfully stored in ${system}`);
+        debug(`✅ Successfully stored in ${system}`);
     }
     /**
      * Get cache TTL based on strategy
@@ -215,26 +217,26 @@ export class UnifiedStoreTool {
      * This supports the "get_storage_recommendation" tool
      */
     getStorageRecommendation(args) {
-        console.log(`\n🤔 STORAGE RECOMMENDATION REQUEST`);
-        console.log(`📝 Content: "${args.content.slice(0, 100)}..."`);
-        console.log(`🏷️  Type: ${args.contentType || 'auto-detect'}`);
+        debug(`\n🤔 STORAGE RECOMMENDATION REQUEST`);
+        debug(`📝 Content: "${args.content.slice(0, 100)}..."`);
+        debug(`🏷️  Type: ${args.contentType || 'auto-detect'}`);
         const decision = this.router.determineStorage({
             content: args.content,
             contentType: args.contentType,
             metadata: args.metadata
         });
-        console.log(`\n💡 RECOMMENDATION:`);
-        console.log(`   Primary: ${decision.primary}`);
-        console.log(`   Secondary: ${decision.secondary?.join(', ') || 'none'}`);
-        console.log(`   Cache: ${decision.cacheStrategy}`);
-        console.log(`   Why: ${decision.reasoning}`);
+        debug(`\n💡 RECOMMENDATION:`);
+        debug(`   Primary: ${decision.primary}`);
+        debug(`   Secondary: ${decision.secondary?.join(', ') || 'none'}`);
+        debug(`   Cache: ${decision.cacheStrategy}`);
+        debug(`   Why: ${decision.reasoning}`);
         return decision;
     }
     /**
      * Test the routing logic with sample data
      */
     async testRouting() {
-        console.log(`\n🧪 TESTING ROUTING LOGIC`);
+        debug(`\n🧪 TESTING ROUTING LOGIC`);
         const testCases = [
             {
                 content: "Client prefers morning coaching sessions and responds well to visualization techniques",
@@ -262,9 +264,9 @@ export class UnifiedStoreTool {
                 content: test.content,
                 contentType: test.contentType
             });
-            console.log(`\n📝 "${test.content.slice(0, 50)}..."`);
-            console.log(`   Type: ${test.contentType} → ${decision.primary}`);
-            console.log(`   Reasoning: ${decision.reasoning}`);
+            debug(`\n📝 "${test.content.slice(0, 50)}..."`);
+            debug(`   Type: ${test.contentType} → ${decision.primary}`);
+            debug(`   Reasoning: ${decision.reasoning}`);
             return {
                 content: test.content,
                 contentType: test.contentType,
