@@ -422,6 +422,7 @@ export class SparrowDBStorage implements StorageSystem {
 
     const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
     const normalized = normalize(rawName)
+    if (!normalized) return null  // e.g. input was "!!!" — would produce CONTAINS '' which matches all
 
     // 1. Fast in-memory lookup from known-people.json
     if (this.knownPeople) {
@@ -453,7 +454,14 @@ export class SparrowDBStorage implements StorageSystem {
         `MATCH (n:Person) WHERE toLower(n.name) CONTAINS '${safeNorm}' RETURN n.id LIMIT 5`
       )
       if (partial.rows.length === 1) {
-        return String(partial.rows[0]['n.id'] ?? '') || null
+        const rawId = String(partial.rows[0]['n.id'] ?? '').trim()
+        if (!rawId) return null
+        // SparrowDB may truncate string properties to 7 chars — try to expand prefix
+        if (this.knownPeople && rawId.length <= 7) {
+          const matches = Object.keys(this.knownPeople.people).filter(id => id.startsWith(rawId))
+          if (matches.length === 1) return matches[0]
+        }
+        return rawId || null
       }
     } catch (e) {
       console.warn('⚠️ SparrowDB resolvePersonId search error:', e)
@@ -832,6 +840,7 @@ export class SparrowDBStorage implements StorageSystem {
       return
     }
     try {
+      this.knownPeople = null  // reset first; ensures clean state if re-called or validation fails
       const raw: unknown = JSON.parse(readFileSync(configPath, 'utf-8'))
       if (
         !raw ||
