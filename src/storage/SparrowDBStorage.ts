@@ -817,7 +817,7 @@ export class SparrowDBStorage implements StorageSystem {
   private _loadKnownPeople(): void {
     const configPath = join(__dirname, '..', '..', 'config', 'known-people.json')
     if (!existsSync(configPath)) {
-      logger.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs')
+      logger.debug('config/known-people.json not found — optional; run scripts/generate-known-people.mjs to enable identity registry')
       return
     }
     try {

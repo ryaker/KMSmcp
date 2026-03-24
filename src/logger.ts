@@ -18,4 +18,11 @@ export const logger = {
   info:  (...args: unknown[]) => emit('info',  ...args),
   warn:  (...args: unknown[]) => emit('warn',  ...args),
   error: (...args: unknown[]) => emit('error', ...args),
+  /** Lazy variant — skips string building when level is disabled.
+   *  Use when the message involves expensive operations (joins, serialization):
+   *  logger.lazy('debug', () => `big ${array.join(', ')}`)
+   */
+  lazy: (level: Level, msg: () => string) => {
+    if (LEVELS[level] >= threshold) console.error(`[${level.toUpperCase()}]`, msg())
+  },
 }
