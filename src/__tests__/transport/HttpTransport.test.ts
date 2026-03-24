@@ -7,7 +7,6 @@ import { HttpTransport, HttpTransportConfig } from '../../transport/HttpTranspor
 import { AuthContext } from '../../auth/types.js'
 
 // Mock dependencies
-jest.mock('../../auth/OAuth2Authenticator.js')
 
 describe('HttpTransport', () => {
   let transport: HttpTransport
