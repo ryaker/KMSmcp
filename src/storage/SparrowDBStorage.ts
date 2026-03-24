@@ -451,60 +451,59 @@ export class SparrowDBStorage implements StorageSystem {
   }
 
   async findRelated(nodeId: string, maxDepth = 2): Promise<any[]> {
-    // Variable-length paths not yet implemented — manual BFS.
+    // Batched BFS: 2 queries per depth level (out + in) covering the entire
+    // frontier, instead of 2 queries per node. Reduces O(N×D) to O(D).
     try {
       const visited = new Set<string>([nodeId])
       let frontier = [nodeId]
       const results: any[] = []
 
       for (let depth = 1; depth <= maxDepth; depth++) {
+        if (frontier.length === 0) break
+        const idList = frontier.map(id => cypherStr(id)).join(', ')
+
+        // Two queries cover all outgoing and incoming edges for the whole frontier.
+        const neighbourRows: Array<Record<string, unknown>> = []
+        try {
+          const out = this.db.execute(
+            `MATCH (a:Knowledge)-[:RELATED_TO]->(b:Knowledge) WHERE a.id IN [${idList}] RETURN b.id`
+          )
+          neighbourRows.push(...out.rows)
+        } catch (e) { console.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
+        try {
+          const inc = this.db.execute(
+            `MATCH (b:Knowledge)-[:RELATED_TO]->(a:Knowledge) WHERE a.id IN [${idList}] RETURN b.id`
+          )
+          neighbourRows.push(...inc.rows)
+        } catch (e) { console.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
+
         const next: string[] = []
-        for (const id of frontier) {
-          // SparrowDB only supports directed edges in MATCH patterns.
-          // Query both outgoing and incoming directions separately.
-          const neighbourRows: Array<Record<string, unknown>> = []
-          try {
-            const out = this.db.execute(
-              `MATCH (a:Knowledge {id: ${cypherStr(id)}})-[:RELATED_TO]->(b:Knowledge) RETURN b.id`
-            )
-            neighbourRows.push(...out.rows)
-          } catch { /* ignore */ }
-          try {
-            const inc = this.db.execute(
-              `MATCH (b:Knowledge)-[:RELATED_TO]->(a:Knowledge {id: ${cypherStr(id)}}) RETURN b.id`
-            )
-            neighbourRows.push(...inc.rows)
-          } catch { /* ignore */ }
-          const neighbours = { rows: neighbourRows } as QueryResult
+        for (const row of neighbourRows) {
+          const rawId = String(row['b.id'] ?? '')
+          // rawId may be truncated to 7 chars — use prefix search to
+          // resolve all matching sidecar entries.
+          const matches = this._findAllEntriesByPrefix(rawId)
+          const toProcess: ContentEntry[] = matches.length > 0
+            ? matches
+            : [{ id: rawId, content: '', confidence: 0, contentType: '',
+                 source: '', userId: '', timestamp: '', metadata: {} }]
 
-          for (const row of neighbours.rows) {
-            const rawId = String(row['b.id'] ?? '')
-            // rawId may be truncated to 7 chars — use prefix search to
-            // resolve all matching sidecar entries.
-            const matches = this._findAllEntriesByPrefix(rawId)
-            const toProcess: ContentEntry[] = matches.length > 0
-              ? matches
-              : [{ id: rawId, content: '', confidence: 0, contentType: '',
-                   source: '', userId: '', timestamp: '', metadata: {} }]
-
-            for (const fullEntry of toProcess) {
-              const fullId = fullEntry.id
-              if (!fullId || visited.has(fullId)) continue
-              visited.add(fullId)
-              next.push(fullId)
-              results.push({
-                id: fullId,
-                content: fullEntry.content,
-                confidence: fullEntry.confidence,
-                distance: depth,
-                pathTypes: ['RELATED_TO'],
-                sourceSystem: 'sparrowdb'
-              })
-            }
+          for (const fullEntry of toProcess) {
+            const fullId = fullEntry.id
+            if (!fullId || visited.has(fullId)) continue
+            visited.add(fullId)
+            next.push(fullId)
+            results.push({
+              id: fullId,
+              content: fullEntry.content,
+              confidence: fullEntry.confidence,
+              distance: depth,
+              pathTypes: ['RELATED_TO'],
+              sourceSystem: 'sparrowdb'
+            })
           }
         }
         frontier = next
-        if (frontier.length === 0) break
       }
 
       return results.slice(0, 20)
