@@ -6,11 +6,11 @@ import neo4j, { Driver, Session } from 'neo4j-driver'
 import { readFileSync, existsSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig, KnownPersonEntry, KnownPeopleConfig } from '../types/index.js'
+import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig, KnownPersonEntry, KnownPeopleConfig, GraphStorage } from '../types/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-export class Neo4jStorage implements StorageSystem {
+export class Neo4jStorage implements GraphStorage {
   public name = 'neo4j'
   private driver!: Driver
   private sessionConfig: { database?: string }

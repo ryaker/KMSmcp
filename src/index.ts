@@ -16,7 +16,7 @@ import { HttpTransport } from './transport/HttpTransport.js'
 import { AuthContext } from './auth/types.js'
 
 // Import our components
-import { KMSConfig } from './types/index.js'
+import { KMSConfig, GraphStorage } from './types/index.js'
 import { FACTCache } from './cache/FACTCache.js'
 import { RedisKeepAlive } from './cache/RedisKeepAlive.js'
 import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js'
@@ -43,7 +43,7 @@ export class UnifiedKMSServer {
     //   (default)                      → Neo4jStorage
     // Callers that accept Neo4jStorage concretely receive an `as Neo4jStorage` cast —
     // safe because all three implementations expose the same runtime API.
-    neo4j: Neo4jStorage
+    neo4j: GraphStorage
     mem0: Mem0Storage
   }
   private tools!: {
@@ -119,16 +119,16 @@ export class UnifiedKMSServer {
     //   KMS_STORAGE_BACKEND=sparrowdb → SparrowDBStorage (direct, eliminates ~50-200ms Aura latency)
     //   (default)                     → Neo4jStorage (Aura)
     // All three implement the same runtime API as Neo4jStorage; the cast is safe.
-    let graphBackend: Neo4jStorage
+    let graphBackend: GraphStorage
     if (process.env.KMS_SHADOW_MODE === 'true') {
       console.log('🔀 Graph backend: Shadow mode (Neo4j primary + SparrowDB shadow)')
       console.log(`   SparrowDB path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'}`)
       const neo4jPrimary = new Neo4jStorage(this.config.neo4j)
       const sparrowShadow = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH })
-      graphBackend = new ShadowStorage(neo4jPrimary, sparrowShadow) as unknown as Neo4jStorage
+      graphBackend = new ShadowStorage(neo4jPrimary, sparrowShadow) as GraphStorage
     } else if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
       console.log(`⚡ Graph backend: SparrowDB (path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'})`)
-      graphBackend = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH }) as unknown as Neo4jStorage
+      graphBackend = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH }) as GraphStorage
     } else {
       graphBackend = new Neo4jStorage(this.config.neo4j)
     }

@@ -25,6 +25,7 @@
 import { parseArgs } from 'node:util'
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 import { Neo4jStorage } from '../storage/Neo4jStorage.js'
+import type { GraphStorage } from '../types/index.js'
 import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
@@ -123,11 +124,11 @@ async function getTools() {
   const mem0 = new Mem0Storage(cfg.mem0)
 
   // Honour KMS_STORAGE_BACKEND=sparrowdb — same logic as index.ts
-  let graphBackend: Neo4jStorage
+  let graphBackend: GraphStorage
   if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
     const sparrowPath = process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'
     console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
-    graphBackend = new SparrowDBStorage({ dbPath: sparrowPath }) as unknown as Neo4jStorage
+    graphBackend = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
   } else {
     graphBackend = new Neo4jStorage(cfg.neo4j)
   }

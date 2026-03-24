@@ -126,3 +126,27 @@ export interface KnownPeopleConfig {
   people: Record<string, KnownPersonEntry>
   nameIndex: Record<string, string>  // normalized name → canonical node id
 }
+
+// Graph storage backend interface — implemented by Neo4jStorage, SparrowDBStorage, ShadowStorage
+export interface GraphStorage extends StorageSystem {
+  initialize(): Promise<void>
+  close(): Promise<void>
+  resolvePersonId(rawName: string): Promise<string | null>
+  findRelated(nodeId: string, maxDepth?: number): Promise<any[]>
+  getEntitySummary(id: string): Promise<Record<string, any> | null>
+  getOperationalNodes(): Promise<Array<{
+    id: string
+    type: string
+    name: string
+    description: string
+    actions: string[]
+    taskPattern?: string
+  }>>
+  getEntityCandidates(): Promise<Array<{
+    id: string
+    name: string
+    labels: string[]
+    aliases: string[]
+  }>>
+  createAboutRelationships(sourceId: string, targetEntityIds: string[]): Promise<void>
+}

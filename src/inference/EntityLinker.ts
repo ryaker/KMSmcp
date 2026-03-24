@@ -1,5 +1,5 @@
 import { OllamaInference, EntityMention } from '../inference/OllamaInference.js'
-import { Neo4jStorage } from '../storage/Neo4jStorage.js'
+import { GraphStorage } from '../types/index.js'
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 
 interface CachedCandidates {
@@ -13,7 +13,7 @@ export class EntityLinker {
 
   constructor(
     private ollama: OllamaInference,
-    private neo4j: Neo4jStorage,
+    private neo4j: GraphStorage,
     private mongodb: MongoDBStorage
   ) {}
 
