@@ -109,3 +109,20 @@ export interface RoutingRule {
 
 export type CacheLevel = 'L1' | 'L2' | 'L3' | 'skip'
 export type SystemName = 'mem0' | 'neo4j' | 'mongodb'
+
+// Shared interfaces for graph storage backends (Neo4jStorage, SparrowDBStorage)
+export interface KnownPersonEntry {
+  canonical: string
+  allNames: string[]
+  sex: string | null
+  relationshipToRich: string | null
+  status: string
+  businessRole: string | null
+  familyTitle: string | null
+}
+
+export interface KnownPeopleConfig {
+  _meta: { generatedAt: string; totalPeople: number; totalNameVariants: number }
+  people: Record<string, KnownPersonEntry>
+  nameIndex: Record<string, string>  // normalized name → canonical node id
+}

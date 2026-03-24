@@ -46,7 +46,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { StorageSystem, UnifiedKnowledge, KnowledgeQuery } from '../types/index.js'
+import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig } from '../types/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -74,26 +74,6 @@ interface SparrowDBClass {
 
 interface SparrowDBModule {
   SparrowDB: SparrowDBClass
-}
-
-// ---------------------------------------------------------------------------
-// Known-people identity registry (mirrors Neo4jStorage)
-// ---------------------------------------------------------------------------
-
-interface KnownPersonEntry {
-  canonical: string
-  allNames: string[]
-  sex: string | null
-  relationshipToRich: string | null
-  status: string
-  businessRole: string | null
-  familyTitle: string | null
-}
-
-interface KnownPeopleConfig {
-  _meta: { generatedAt: string; totalPeople: number; totalNameVariants: number }
-  people: Record<string, KnownPersonEntry>
-  nameIndex: Record<string, string>  // normalized name → canonical node id
 }
 
 // ---------------------------------------------------------------------------
