@@ -469,13 +469,13 @@ export class SparrowDBStorage implements StorageSystem {
             `MATCH (a:Knowledge)-[:RELATED_TO]->(b:Knowledge) WHERE a.id IN [${idList}] RETURN b.id`
           )
           neighbourRows.push(...out.rows)
-        } catch { /* ignore */ }
+        } catch (e) { console.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
         try {
           const inc = this.db.execute(
             `MATCH (b:Knowledge)-[:RELATED_TO]->(a:Knowledge) WHERE a.id IN [${idList}] RETURN b.id`
           )
           neighbourRows.push(...inc.rows)
-        } catch { /* ignore */ }
+        } catch (e) { console.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
 
         const next: string[] = []
         for (const row of neighbourRows) {
