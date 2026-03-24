@@ -6,11 +6,26 @@ import { MongoClient, Db, Collection } from 'mongodb'
 import { createHash } from 'node:crypto'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
 
+export interface StoredDocument {
+  id: string
+  title: string
+  content: string
+  docType: string
+  sourceUrl?: string
+  publishedDate?: string
+  tags: string[]
+  wordCount: number
+  storedAt: Date
+  userId: string
+  contentHash: string
+}
+
 export class MongoDBStorage implements StorageSystem {
   public name = 'mongodb'
   private client!: MongoClient
   private db!: Db
   private collection!: Collection<UnifiedKnowledge>
+  private documents!: Collection<StoredDocument>
 
   constructor(private config: KMSConfig['mongodb']) {}
 
@@ -20,7 +35,8 @@ export class MongoDBStorage implements StorageSystem {
     await this.client.connect()
     this.db = this.client.db(this.config.database)
     this.collection = this.db.collection<UnifiedKnowledge>('unified_knowledge')
-    
+    this.documents = this.db.collection<StoredDocument>('documents')
+
     // Create indexes for better search performance
     await this.createIndexes()
     
@@ -213,6 +229,39 @@ export class MongoDBStorage implements StorageSystem {
     }
   }
 
+  async storeDocument(doc: Omit<StoredDocument, 'contentHash'>): Promise<{ id: string; isNew: boolean }> {
+    const contentHash = createHash('sha256')
+      .update(doc.content.trim().toLowerCase().slice(0, 500))
+      .digest('hex')
+    const docWithHash: StoredDocument = { ...doc, contentHash }
+
+    const result = await this.documents.updateOne(
+      { contentHash },
+      { $setOnInsert: docWithHash },
+      { upsert: true }
+    )
+    return { id: doc.id, isNew: result.upsertedCount > 0 }
+  }
+
+  async searchDocuments(query: string, tags?: string[], limit = 10): Promise<StoredDocument[]> {
+    const filter: any = {}
+    if (query) {
+      const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const kws = query.split(/\s+/).filter(k => k.length >= 2)
+      if (kws.length > 0) {
+        filter.$or = kws.flatMap(k => [
+          { content: { $regex: esc(k), $options: 'i' } },
+          { title: { $regex: esc(k), $options: 'i' } },
+          { tags: { $regex: esc(k), $options: 'i' } }
+        ])
+      }
+    }
+    if (tags?.length) {
+      filter.tags = { $in: tags }
+    }
+    return this.documents.find(filter).sort({ storedAt: -1 }).limit(limit).toArray()
+  }
+
   private async createIndexes(): Promise<void> {
     try {
       // Text index for search
@@ -233,7 +282,14 @@ export class MongoDBStorage implements StorageSystem {
 
       // Compound indexes for common queries
       await this.collection.createIndex({ userId: 1, contentType: 1 })
-      
+
+      // documents collection indexes
+      await this.documents.createIndex({ contentHash: 1 }, { unique: true, sparse: true })
+      await this.documents.createIndex({ content: 'text', title: 'text', tags: 'text' })
+      await this.documents.createIndex({ storedAt: -1 })
+      await this.documents.createIndex({ docType: 1 })
+      await this.documents.createIndex({ tags: 1 })
+
       console.log('📄 MongoDB indexes created successfully')
     } catch (error) {
       console.warn('⚠️ MongoDB index creation warning:', error)
