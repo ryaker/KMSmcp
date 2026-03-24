@@ -22,7 +22,7 @@ export class Neo4jStorage implements GraphStorage {
   }
 
   async initialize(): Promise<void> {
-    logger.debug('🔗 Connecting to Neo4j...')
+    logger.info('🔗 Connecting to Neo4j...')
     this.driver = neo4j.driver(
       this.config.uri,
       neo4j.auth.basic(this.config.username, this.config.password)
@@ -32,7 +32,7 @@ export class Neo4jStorage implements GraphStorage {
     const session = this.driver.session(this.sessionConfig)
     try {
       await session.run('RETURN 1')
-      logger.debug('✅ Neo4j connected successfully')
+      logger.info('✅ Neo4j connected successfully')
     } finally {
       await session.close()
     }
