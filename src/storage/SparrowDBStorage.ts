@@ -438,11 +438,22 @@ export class SparrowDBStorage implements StorageSystem {
 
     // 2. SparrowDB CONTAINS search fallback
     try {
-      const result = this.db.execute(
-        `MATCH (n:Person) WHERE toLower(n.name) CONTAINS '${normalized}' RETURN n.id LIMIT 5`
+      const safeNorm = normalized.replace(/'/g, "\\'")
+
+      // Prefer exact normalized match first
+      const exact = this.db.execute(
+        `MATCH (n:Person) WHERE toLower(n.name) = '${safeNorm}' RETURN n.id LIMIT 1`
       )
-      if (result.rows.length > 0) {
-        return String(result.rows[0]['n.id'] ?? '') || null
+      if (exact.rows.length === 1) {
+        return String(exact.rows[0]['n.id'] ?? '') || null
+      }
+
+      // Partial match — only safe if exactly one result (ambiguous = skip)
+      const partial = this.db.execute(
+        `MATCH (n:Person) WHERE toLower(n.name) CONTAINS '${safeNorm}' RETURN n.id LIMIT 5`
+      )
+      if (partial.rows.length === 1) {
+        return String(partial.rows[0]['n.id'] ?? '') || null
       }
     } catch (e) {
       console.warn('⚠️ SparrowDB resolvePersonId search error:', e)
@@ -821,9 +832,17 @@ export class SparrowDBStorage implements StorageSystem {
       return
     }
     try {
-      const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as KnownPeopleConfig
-      if (!parsed || !parsed.nameIndex) throw new Error('invalid structure')
-      this.knownPeople = parsed
+      const raw: unknown = JSON.parse(readFileSync(configPath, 'utf-8'))
+      if (
+        !raw ||
+        typeof raw !== 'object' ||
+        typeof (raw as any).nameIndex !== 'object' ||
+        !(raw as any)._meta ||
+        typeof (raw as any)._meta.totalPeople !== 'number'
+      ) {
+        throw new Error('invalid known-people.json structure')
+      }
+      this.knownPeople = raw as KnownPeopleConfig
       console.log(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`)
     } catch (e) {
       this.knownPeople = null
