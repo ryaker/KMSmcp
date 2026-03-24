@@ -44,8 +44,11 @@
 import { createRequire } from 'module'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery } from '../types/index.js'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ---------------------------------------------------------------------------
 // Native binding types (mirrors npm/sparrowdb/index.d.ts)
@@ -71,6 +74,26 @@ interface SparrowDBClass {
 
 interface SparrowDBModule {
   SparrowDB: SparrowDBClass
+}
+
+// ---------------------------------------------------------------------------
+// Known-people identity registry (mirrors Neo4jStorage)
+// ---------------------------------------------------------------------------
+
+interface KnownPersonEntry {
+  canonical: string
+  allNames: string[]
+  sex: string | null
+  relationshipToRich: string | null
+  status: string
+  businessRole: string | null
+  familyTitle: string | null
+}
+
+interface KnownPeopleConfig {
+  _meta: { generatedAt: string; totalPeople: number; totalNameVariants: number }
+  people: Record<string, KnownPersonEntry>
+  nameIndex: Record<string, string>  // normalized name → canonical node id
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +177,9 @@ export class SparrowDBStorage implements StorageSystem {
   // Persisted to a JSON sidecar so it survives restarts.
   private contentIndex = new Map<string, ContentEntry>()
 
+  // Identity registry loaded from config/known-people.json.
+  private knownPeople: KnownPeopleConfig | null = null
+
   constructor(config?: SparrowDBConfig) {
     this.dbPath =
       config?.dbPath ||
@@ -176,6 +202,9 @@ export class SparrowDBStorage implements StorageSystem {
 
     // Load content sidecar
     this._loadSidecar()
+
+    // Load identity registry
+    this._loadKnownPeople()
 
     console.log(
       `✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar`
@@ -376,6 +405,51 @@ export class SparrowDBStorage implements StorageSystem {
   // -------------------------------------------------------------------------
   // Extended Neo4jStorage-compatible API
   // -------------------------------------------------------------------------
+
+  /**
+   * PersonResolver — resolve any name variant to a canonical SparrowDB node ID.
+   *
+   * Checks (fastest → slowest):
+   *   1. In-memory nameIndex from known-people.json  (O(1))
+   *   2. Normalized first+last name lookup in nameIndex
+   *   3. SparrowDB CONTAINS search on Person nodes
+   *
+   * Returns the canonical node ID, or null if no match found.
+   * The caller should only create a new Person node when this returns null.
+   */
+  async resolvePersonId(rawName: string): Promise<string | null> {
+    if (!rawName?.trim()) return null
+
+    const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+    const normalized = normalize(rawName)
+
+    // 1. Fast in-memory lookup from known-people.json
+    if (this.knownPeople) {
+      const directHit = this.knownPeople.nameIndex[normalized]
+      if (directHit) return directHit
+
+      const parts = normalized.split(' ')
+      if (parts.length > 2) {
+        const firstLast = `${parts[0]} ${parts[parts.length - 1]}`
+        const hit = this.knownPeople.nameIndex[firstLast]
+        if (hit) return hit
+      }
+    }
+
+    // 2. SparrowDB CONTAINS search fallback
+    try {
+      const result = this.db.execute(
+        `MATCH (n:Person) WHERE toLower(n.name) CONTAINS toLower('${normalized.replace(/'/g, "\\'")}') RETURN n.id LIMIT 5`
+      )
+      if (result.rows.length > 0) {
+        return String(result.rows[0]['n.id'] ?? '') || null
+      }
+    } catch (e) {
+      console.warn('⚠️ SparrowDB resolvePersonId search error:', e)
+    }
+
+    return null
+  }
 
   async findRelated(nodeId: string, maxDepth = 2): Promise<any[]> {
     // Variable-length paths not yet implemented — manual BFS.
@@ -730,6 +804,28 @@ export class SparrowDBStorage implements StorageSystem {
       console.warn('⚠️ SparrowDB _getRelationships error:', error)
     }
     return relationships.filter(r => r.relatedNode)
+  }
+
+  // -------------------------------------------------------------------------
+  // Identity registry
+  // -------------------------------------------------------------------------
+
+  /**
+   * Load config/known-people.json into memory.
+   * Called on initialize(); silently skipped if file not yet generated.
+   */
+  private _loadKnownPeople(): void {
+    const configPath = join(__dirname, '..', '..', 'config', 'known-people.json')
+    if (!existsSync(configPath)) {
+      console.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs')
+      return
+    }
+    try {
+      this.knownPeople = JSON.parse(readFileSync(configPath, 'utf-8')) as KnownPeopleConfig
+      console.log(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`)
+    } catch (e) {
+      console.warn('⚠️ Failed to load known-people.json:', e)
+    }
   }
 
   // -------------------------------------------------------------------------
