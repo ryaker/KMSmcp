@@ -25,8 +25,7 @@ export class IntelligentStorageRouter {
     const contentType = knowledge.contentType
     const source = knowledge.source
 
-    logger.debug(`🧠 Analyzing storage for: "${content.slice(0, 50)}..."`)
-    logger.debug(`   Content Type: ${contentType}, Source: ${source}`)
+    logger.debug(`🧠 Routing decision: type=${contentType}, source=${source}, len=${content.length}`)
 
     const addMongoDB = this.needsStructuredStorage(content, contentType, source)
 
