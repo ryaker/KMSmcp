@@ -246,10 +246,10 @@ export class SparrowDBStorage implements StorageSystem {
     this.contentIndex.set(knowledge.id, entry)
     this._saveSidecar()
 
-    // Create explicit relationships (no properties on edges — SparrowDB limitation).
+    // Create explicit relationships with optional strength property.
     if (knowledge.relationships && knowledge.relationships.length > 0) {
       for (const rel of knowledge.relationships) {
-        await this._createRelationship(knowledge.id, rel.targetId, rel.type)
+        await this._createRelationship(knowledge.id, rel.targetId, rel.type, rel.strength)
       }
     }
 
@@ -467,13 +467,13 @@ export class SparrowDBStorage implements StorageSystem {
         const neighbourRows: Array<Record<string, unknown>> = []
         try {
           const out = this.db.execute(
-            `MATCH (a:Knowledge)-[:RELATED_TO]->(b:Knowledge) WHERE a.id IN [${idList}] RETURN b.id`
+            `MATCH (a:Knowledge)-[r:RELATED_TO]->(b:Knowledge) WHERE a.id IN [${idList}] RETURN b.id, r.strength`
           )
           neighbourRows.push(...out.rows)
         } catch (e) { console.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
         try {
           const inc = this.db.execute(
-            `MATCH (b:Knowledge)-[:RELATED_TO]->(a:Knowledge) WHERE a.id IN [${idList}] RETURN b.id`
+            `MATCH (b:Knowledge)-[r:RELATED_TO]->(a:Knowledge) WHERE a.id IN [${idList}] RETURN b.id, r.strength`
           )
           neighbourRows.push(...inc.rows)
         } catch (e) { console.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
@@ -481,6 +481,11 @@ export class SparrowDBStorage implements StorageSystem {
         const next: string[] = []
         for (const row of neighbourRows) {
           const rawId = String(row['b.id'] ?? '')
+          // Stored as integer × 100 — divide back to 0.0–1.0 float (SparrowDB#229 workaround).
+          const rawStrength = row['r.strength']
+          const edgeStrength = rawStrength !== undefined && rawStrength !== null
+            ? Math.round(parseFloatSafe(rawStrength)) / 100
+            : undefined
           // rawId may be truncated to 7 chars — use prefix search to
           // resolve all matching sidecar entries.
           const matches = this._findAllEntriesByPrefix(rawId)
@@ -499,6 +504,7 @@ export class SparrowDBStorage implements StorageSystem {
               content: fullEntry.content,
               confidence: fullEntry.confidence,
               distance: depth,
+              ...(edgeStrength !== undefined && { strength: edgeStrength }),
               pathTypes: ['RELATED_TO'],
               sourceSystem: 'sparrowdb'
             })
@@ -678,7 +684,7 @@ export class SparrowDBStorage implements StorageSystem {
         this.db.execute(
           `MATCH (k:Knowledge {id: ${cypherStr(sourceId)}}), ` +
           `(e {id: ${cypherStr(targetId)}}) ` +
-          `CREATE (k)-[:ABOUT]->(e)`
+          `CREATE (k)-[:ABOUT {strength: 100}]->(e)`
         )
       } catch (error) {
         logger.warn(`⚠️ SparrowDB createAboutRelationships ${sourceId} → ${targetId}:`, error)
@@ -730,14 +736,20 @@ export class SparrowDBStorage implements StorageSystem {
   private async _createRelationship(
     sourceId: string,
     targetId: string,
-    relationshipType: string
+    relationshipType: string,
+    strength?: number
   ): Promise<void> {
     try {
       const safeRelType = relationshipType.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+      // SparrowDB edge props only support integers (SparrowDB#229: float panics).
+      // Store strength × 100 as integer (0–100); divide by 100 on read.
+      const props = (strength !== undefined && strength >= 0 && strength <= 1)
+        ? ` {strength: ${Math.round(strength * 100)}}`
+        : ''
       this.db.execute(
         `MATCH (a:Knowledge {id: ${cypherStr(sourceId)}}), ` +
         `(b:Knowledge {id: ${cypherStr(targetId)}}) ` +
-        `CREATE (a)-[:${safeRelType}]->(b)`
+        `CREATE (a)-[:${safeRelType}${props}]->(b)`
       )
     } catch (error) {
       logger.warn(`⚠️ SparrowDB createRelationship ${relationshipType}:`, error)
