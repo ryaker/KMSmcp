@@ -31,7 +31,8 @@ export class DocumentStoreTool {
     storedAt: string
   }> {
     const id = `doc_${crypto.randomBytes(8).toString('hex')}`
-    const wordCount = args.content.trim().split(/\s+/).length
+    const trimmedContent = args.content.trim()
+    const wordCount = trimmedContent.length === 0 ? 0 : trimmedContent.split(/\s+/).length
     const storedAt = new Date()
 
     const doc: Omit<StoredDocument, 'contentHash'> = {

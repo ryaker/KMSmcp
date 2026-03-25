@@ -255,8 +255,8 @@ export class MongoDBStorage implements StorageSystem {
     if (userId) {
       filter.userId = userId
     }
-    if (query) {
-      const kws = query.split(/\s+/).map(k => k.trim()).filter(k => k.length >= 2)
+    if (query && query.trim().length > 0) {
+      const kws = query.trim().split(/\s+/).filter(k => k.length >= 2)
       if (kws.length === 0 && !tags?.length) {
         return []
       }
