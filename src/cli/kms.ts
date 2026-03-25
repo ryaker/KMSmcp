@@ -312,6 +312,21 @@ async function cmdRoute(args: string[]) {
   out({ regex: decision, llm: ollamaDecision })
 }
 
+// ── Shared helper: load SparrowDB native binding ──────────────────────────────
+
+async function loadSparrowDBNative(): Promise<any> {
+  const { existsSync } = await import('node:fs')
+  const candidatePaths = [
+    join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
+    join(homedir(), 'Dev', 'SparrowDB', 'target', 'release', 'sparrowdb.node'),
+    join(homedir(), 'Dev', 'SparrowDB', 'target', 'debug', 'sparrowdb.node'),
+  ]
+  for (const p of candidatePaths) {
+    if (existsSync(p)) return require(p)
+  }
+  return null
+}
+
 // ── Command: export ───────────────────────────────────────────────────────────
 
 async function cmdExport(args: string[]) {
@@ -332,9 +347,11 @@ async function cmdExport(args: string[]) {
   const backupDir = homedir() + '/.kms-backups'
   const outPath = (values.output as string | undefined) || `${backupDir}/kms-export-${timestamp}.jsonl`
 
-  // Ensure backup dir exists
+  // Ensure output parent directory exists (handles both default backupDir and custom --output paths)
   const { mkdirSync, createWriteStream, existsSync, readFileSync } = await import('node:fs')
-  if (!existsSync(backupDir)) mkdirSync(backupDir, { recursive: true })
+  const { dirname } = await import('node:path')
+  const outDir = dirname(outPath)
+  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true })
 
   console.error(`📦 Exporting SparrowDB at: ${dbPath}`)
   console.error(`📄 Output: ${outPath}`)
@@ -342,15 +359,7 @@ async function cmdExport(args: string[]) {
   // Load native binding and open DB
   // We access SparrowDB directly here (not via SparrowDBStorage) so we can
   // run raw Cypher without the high-level abstraction getting in the way.
-  const candidatePaths = [
-    join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
-    join(homedir(), 'Dev', 'SparrowDB', 'target', 'release', 'sparrowdb.node'),
-    join(homedir(), 'Dev', 'SparrowDB', 'target', 'debug', 'sparrowdb.node'),
-  ]
-  let native: any = null
-  for (const p of candidatePaths) {
-    if (existsSync(p)) { native = require(p); break }
-  }
+  const native = await loadSparrowDBNative()
   if (!native) die('sparrowdb.node not found — cannot export')
 
   const db = native.SparrowDB.open(dbPath)
@@ -367,8 +376,8 @@ async function cmdExport(args: string[]) {
   // Write manifest
   write({ type: 'manifest', exportedAt: new Date().toISOString(), dbPath, version: 1 })
 
-  // Export all nodes (all known labels)
-  const labels = ['Knowledge', 'Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event']
+  // Export all nodes (all known labels, including operational ones)
+  const labels = ['Knowledge', 'Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event', 'ContextTrigger', 'ToolRoute']
   let nodeCount = 0
   for (const label of labels) {
     try {
@@ -395,9 +404,20 @@ async function cmdExport(args: string[]) {
     } catch { /* label may not exist in this DB */ }
   }
 
-  // Export all edges (RELATED_TO and ABOUT)
+  // Discover all relationship types dynamically, falling back to known types
+  let relTypes: string[] = []
+  try {
+    const relResult = db.execute(`MATCH ()-[r]->() RETURN DISTINCT type(r) AS rel`)
+    relTypes = relResult.rows
+      .map((row: Record<string, unknown>) => String(row['rel'] ?? ''))
+      .filter(Boolean)
+  } catch {
+    relTypes = ['RELATED_TO', 'ABOUT']
+  }
+
+  // Export all edges
   let edgeCount = 0
-  for (const rel of ['RELATED_TO', 'ABOUT']) {
+  for (const rel of relTypes) {
     try {
       const result = db.execute(`MATCH (a)-[:${rel}]->(b) RETURN a.id, b.id`)
       for (const row of result.rows) {
@@ -442,15 +462,7 @@ async function cmdImport(args: string[]) {
   if (!existsSync(dbPath)) mkdirSync(dbPath, { recursive: true })
 
   // Load native binding
-  const candidatePaths = [
-    join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
-    join(homedir(), 'Dev', 'SparrowDB', 'target', 'release', 'sparrowdb.node'),
-    join(homedir(), 'Dev', 'SparrowDB', 'target', 'debug', 'sparrowdb.node'),
-  ]
-  let native: any = null
-  for (const p of candidatePaths) {
-    if (existsSync(p)) { native = require(p); break }
-  }
+  const native = await loadSparrowDBNative()
   if (!native) die('sparrowdb.node not found — cannot import')
 
   console.error(`📦 Importing into SparrowDB at: ${dbPath}`)
@@ -473,14 +485,22 @@ async function cmdImport(args: string[]) {
       console.error(`  Source: ${record.dbPath}, exported: ${record.exportedAt}`)
     } else if (record.type === 'node') {
       const { label, id, props, sidecar: sc } = record
-      if (!id) { skipCount++; continue }
+      // Validate label against allowlist to prevent Cypher injection
+      const VALID_LABELS = ['Knowledge', 'Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event', 'ContextTrigger', 'ToolRoute']
+      if (!id || !label || !VALID_LABELS.includes(label)) { skipCount++; continue }
       // Upsert: DELETE existing then CREATE
       try { db.execute(`MATCH (n:${label} {id: ${q(id)}}) DELETE n`) } catch { }
       try {
-        const nameProp = props.name ? `, name: ${q(String(props.name))}` : ''
+        // Restore all exported properties to maintain round-trip fidelity
+        const nodeProps = props ?? {}
+        const nameProp        = nodeProps.name        ? `, name: ${q(String(nodeProps.name))}`               : ''
+        const contentTypeProp = nodeProps.contentType ? `, contentType: ${q(String(nodeProps.contentType))}` : ''
+        const sourceProp      = nodeProps.source      ? `, source: ${q(String(nodeProps.source))}`           : ''
+        const userIdProp      = nodeProps.userId      ? `, userId: ${q(String(nodeProps.userId))}`           : ''
+        const confidenceProp  = nodeProps.confidence !== undefined ? `, confidence: ${q(String(nodeProps.confidence))}` : ''
         db.execute(
           `CREATE (n:${label} {id: ${q(id)}` +
-          `${nameProp}` +
+          `${nameProp}${contentTypeProp}${sourceProp}${userIdProp}${confidenceProp}` +
           `})`
         )
         nodeCount++
@@ -492,7 +512,9 @@ async function cmdImport(args: string[]) {
       if (sc) sidecar[id] = sc
     } else if (record.type === 'edge') {
       const { rel, from, to } = record
-      if (!from || !to) { skipCount++; continue }
+      // Validate rel type against allowlist to prevent Cypher injection
+      const VALID_REL_TYPES = ['RELATED_TO', 'ABOUT']
+      if (!from || !to || !rel || !VALID_REL_TYPES.includes(rel)) { skipCount++; continue }
       try {
         db.execute(
           `MATCH (a {id: ${q(from)}}), (b {id: ${q(to)}}) ` +
