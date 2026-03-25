@@ -250,8 +250,11 @@ export class MongoDBStorage implements StorageSystem {
     return { id: existing?.id ?? doc.id, isNew: false }
   }
 
-  async searchDocuments(query: string, tags?: string[], limit = 10): Promise<StoredDocument[]> {
+  async searchDocuments(query: string, tags?: string[], limit = 10, userId?: string): Promise<StoredDocument[]> {
     const filter: any = {}
+    if (userId) {
+      filter.userId = userId
+    }
     if (query) {
       const kws = query.split(/\s+/).map(k => k.trim()).filter(k => k.length >= 2)
       if (kws.length === 0 && !tags?.length) {

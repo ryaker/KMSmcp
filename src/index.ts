@@ -416,6 +416,9 @@ export class UnifiedKMSServer {
         break
 
       case 'document_search':
+        if (authContext.user?.id && !args.userId) {
+          args.userId = authContext.user.id
+        }
         result = this.truncateSearchResult(await this.tools.documentStore.search(args as any))
         break
 
@@ -722,7 +725,7 @@ export class UnifiedKMSServer {
             },
             userId: {
               type: 'string',
-              description: 'OPTIONAL — defaults to richard_yaker'
+              description: 'OPTIONAL — user identifier; defaults to KMS_DEFAULT_USER_ID env var'
             }
           },
           required: ['title', 'content']
@@ -748,6 +751,10 @@ export class UnifiedKMSServer {
               minimum: 1,
               maximum: 100,
               description: 'OPTIONAL — max results (default: 10, max: 100)'
+            },
+            userId: {
+              type: 'string',
+              description: 'OPTIONAL — scope results to a specific user'
             }
           },
           required: ['query']

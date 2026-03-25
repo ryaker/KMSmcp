@@ -64,6 +64,7 @@ export class DocumentStoreTool {
     query: string
     tags?: string[]
     limit?: number
+    userId?: string
   }): Promise<{
     results: Array<{
       id: string
@@ -76,7 +77,7 @@ export class DocumentStoreTool {
     }>
     count: number
   }> {
-    const docs = await this.mongodb.searchDocuments(args.query, args.tags, args.limit ?? 10)
+    const docs = await this.mongodb.searchDocuments(args.query, args.tags, args.limit ?? 10, args.userId)
     const results = docs.map(d => ({
       id: d.id,
       title: d.title,

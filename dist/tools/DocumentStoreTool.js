@@ -41,7 +41,7 @@ export class DocumentStoreTool {
         };
     }
     async search(args) {
-        const docs = await this.mongodb.searchDocuments(args.query, args.tags, args.limit ?? 10);
+        const docs = await this.mongodb.searchDocuments(args.query, args.tags, args.limit ?? 10, args.userId);
         const results = docs.map(d => ({
             id: d.id,
             title: d.title,

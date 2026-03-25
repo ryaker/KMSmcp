@@ -199,8 +199,11 @@ export class MongoDBStorage {
         const existing = await this.documents.findOne({ contentHash }, { projection: { id: 1 } });
         return { id: existing?.id ?? doc.id, isNew: false };
     }
-    async searchDocuments(query, tags, limit = 10) {
+    async searchDocuments(query, tags, limit = 10, userId) {
         const filter = {};
+        if (userId) {
+            filter.userId = userId;
+        }
         if (query) {
             const kws = query.split(/\s+/).map(k => k.trim()).filter(k => k.length >= 2);
             if (kws.length === 0 && !tags?.length) {
