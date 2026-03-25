@@ -409,11 +409,14 @@ export class UnifiedKMSServer {
         break
 
       case 'document_store':
+        if (authContext.user?.id && !args.userId) {
+          args.userId = authContext.user.id
+        }
         result = await this.tools.documentStore.store(args as any)
         break
 
       case 'document_search':
-        result = await this.tools.documentStore.search(args as any)
+        result = this.truncateSearchResult(await this.tools.documentStore.search(args as any))
         break
 
       default:
@@ -741,8 +744,10 @@ export class UnifiedKMSServer {
               description: 'OPTIONAL — filter by tags'
             },
             limit: {
-              type: 'number',
-              description: 'OPTIONAL — max results (default: 10)'
+              type: 'integer',
+              minimum: 1,
+              maximum: 100,
+              description: 'OPTIONAL — max results (default: 10, max: 100)'
             }
           },
           required: ['query']
@@ -813,7 +818,7 @@ export class UnifiedKMSServer {
             break
 
           case 'document_search':
-            result = await this.tools.documentStore.search(args as any)
+            result = this.truncateSearchResult(await this.tools.documentStore.search(args as any))
             break
 
           default:

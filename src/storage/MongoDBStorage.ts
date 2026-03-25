@@ -231,7 +231,7 @@ export class MongoDBStorage implements StorageSystem {
 
   async storeDocument(doc: Omit<StoredDocument, 'contentHash'>): Promise<{ id: string; isNew: boolean }> {
     const contentHash = createHash('sha256')
-      .update(doc.content.trim().toLowerCase().slice(0, 500))
+      .update(doc.content.trim().toLowerCase())
       .digest('hex')
     const docWithHash: StoredDocument = { ...doc, contentHash }
 
@@ -240,15 +240,25 @@ export class MongoDBStorage implements StorageSystem {
       { $setOnInsert: docWithHash },
       { upsert: true }
     )
-    return { id: doc.id, isNew: result.upsertedCount > 0 }
+
+    if (result.upsertedCount > 0) {
+      return { id: doc.id, isNew: true }
+    }
+
+    // Duplicate detected — return the existing persisted document's id
+    const existing = await this.documents.findOne({ contentHash }, { projection: { id: 1 } })
+    return { id: existing?.id ?? doc.id, isNew: false }
   }
 
   async searchDocuments(query: string, tags?: string[], limit = 10): Promise<StoredDocument[]> {
     const filter: any = {}
     if (query) {
-      const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const kws = query.split(/\s+/).filter(k => k.length >= 2)
+      const kws = query.split(/\s+/).map(k => k.trim()).filter(k => k.length >= 2)
+      if (kws.length === 0 && !tags?.length) {
+        return []
+      }
       if (kws.length > 0) {
+        const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
         filter.$or = kws.flatMap(k => [
           { content: { $regex: esc(k), $options: 'i' } },
           { title: { $regex: esc(k), $options: 'i' } },
@@ -259,7 +269,8 @@ export class MongoDBStorage implements StorageSystem {
     if (tags?.length) {
       filter.tags = { $in: tags }
     }
-    return this.documents.find(filter).sort({ storedAt: -1 }).limit(limit).toArray()
+    const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 10))
+    return this.documents.find(filter).sort({ storedAt: -1 }).limit(safeLimit).toArray()
   }
 
   private async createIndexes(): Promise<void> {

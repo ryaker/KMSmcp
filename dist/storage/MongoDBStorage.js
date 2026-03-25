@@ -9,6 +9,7 @@ export class MongoDBStorage {
     client;
     db;
     collection;
+    documents;
     constructor(config) {
         this.config = config;
     }
@@ -18,6 +19,7 @@ export class MongoDBStorage {
         await this.client.connect();
         this.db = this.client.db(this.config.database);
         this.collection = this.db.collection('unified_knowledge');
+        this.documents = this.db.collection('documents');
         // Create indexes for better search performance
         await this.createIndexes();
         console.log(`✅ MongoDB connected to database: ${this.config.database}`);
@@ -184,6 +186,41 @@ export class MongoDBStorage {
             return false;
         }
     }
+    async storeDocument(doc) {
+        const contentHash = createHash('sha256')
+            .update(doc.content.trim().toLowerCase())
+            .digest('hex');
+        const docWithHash = { ...doc, contentHash };
+        const result = await this.documents.updateOne({ contentHash }, { $setOnInsert: docWithHash }, { upsert: true });
+        if (result.upsertedCount > 0) {
+            return { id: doc.id, isNew: true };
+        }
+        // Duplicate detected — return the existing persisted document's id
+        const existing = await this.documents.findOne({ contentHash }, { projection: { id: 1 } });
+        return { id: existing?.id ?? doc.id, isNew: false };
+    }
+    async searchDocuments(query, tags, limit = 10) {
+        const filter = {};
+        if (query) {
+            const kws = query.split(/\s+/).map(k => k.trim()).filter(k => k.length >= 2);
+            if (kws.length === 0 && !tags?.length) {
+                return [];
+            }
+            if (kws.length > 0) {
+                const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                filter.$or = kws.flatMap(k => [
+                    { content: { $regex: esc(k), $options: 'i' } },
+                    { title: { $regex: esc(k), $options: 'i' } },
+                    { tags: { $regex: esc(k), $options: 'i' } }
+                ]);
+            }
+        }
+        if (tags?.length) {
+            filter.tags = { $in: tags };
+        }
+        const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 10));
+        return this.documents.find(filter).sort({ storedAt: -1 }).limit(safeLimit).toArray();
+    }
     async createIndexes() {
         try {
             // Text index for search
@@ -201,6 +238,12 @@ export class MongoDBStorage {
             await this.collection.createIndex({ contentHash: 1 }, { unique: true, sparse: true });
             // Compound indexes for common queries
             await this.collection.createIndex({ userId: 1, contentType: 1 });
+            // documents collection indexes
+            await this.documents.createIndex({ contentHash: 1 }, { unique: true, sparse: true });
+            await this.documents.createIndex({ content: 'text', title: 'text', tags: 'text' });
+            await this.documents.createIndex({ storedAt: -1 });
+            await this.documents.createIndex({ docType: 1 });
+            await this.documents.createIndex({ tags: 1 });
             console.log('📄 MongoDB indexes created successfully');
         }
         catch (error) {

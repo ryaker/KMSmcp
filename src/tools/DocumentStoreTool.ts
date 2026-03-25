@@ -44,7 +44,7 @@ export class DocumentStoreTool {
       tags: args.tags ?? [],
       wordCount,
       storedAt,
-      userId: args.userId ?? process.env.KMS_DEFAULT_USER_ID ?? 'richard_yaker',
+      userId: args.userId ?? process.env.KMS_DEFAULT_USER_ID ?? '',
     }
 
     logger.debug(`📄 DocumentStore: "${args.title}" (${wordCount} words)`)
