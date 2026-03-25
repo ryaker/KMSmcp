@@ -16,7 +16,7 @@ import { EnrichmentQueue } from './inference/EnrichmentQueue.js';
 import { EntityLinker } from './inference/EntityLinker.js';
 import { MongoDBStorage, Neo4jStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js';
 import { ShadowStorage } from './storage/ShadowStorage.js';
-import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool } from './tools/index.js';
+import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js';
 export class UnifiedKMSServer {
     config;
     server;
@@ -143,7 +143,8 @@ export class UnifiedKMSServer {
         this.tools = {
             store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue),
             search: new UnifiedSearchTool(this.storage, this.factCache),
-            instructions: new KMSInstructionsTool()
+            instructions: new KMSInstructionsTool(),
+            documentStore: new DocumentStoreTool(this.storage.mongodb)
         };
         // Step 5: Initialize HTTP transport if needed
         if (this.config.transport.mode === 'http' || this.config.transport.mode === 'dual') {
@@ -334,6 +335,18 @@ export class UnifiedKMSServer {
                 break;
             case 'kms_ping':
                 result = await this.handleKmsPing();
+                break;
+            case 'document_store':
+                if (authContext.user?.id && !args.userId) {
+                    args.userId = authContext.user.id;
+                }
+                result = await this.tools.documentStore.store(args);
+                break;
+            case 'document_search':
+                if (authContext.user?.id && !args.userId) {
+                    args.userId = authContext.user.id;
+                }
+                result = this.truncateSearchResult(await this.tools.documentStore.search(args));
                 break;
             default:
                 throw new Error(`Tool ${name} not found`);
@@ -602,6 +615,74 @@ export class UnifiedKMSServer {
                     type: 'object',
                     properties: {}
                 }
+            },
+            {
+                name: 'document_store',
+                description: 'Store a full-text document (article, transcript, report, spec) directly into MongoDB. No routing logic — always writes to the documents collection. Use for large archival content that needs full-text search later.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        title: {
+                            type: 'string',
+                            description: 'Document title'
+                        },
+                        content: {
+                            type: 'string',
+                            description: 'Full document text. No size limit.'
+                        },
+                        docType: {
+                            type: 'string',
+                            description: 'OPTIONAL — article, transcript, report, spec, note (default: document)'
+                        },
+                        sourceUrl: {
+                            type: 'string',
+                            description: 'OPTIONAL — original URL or file path'
+                        },
+                        publishedDate: {
+                            type: 'string',
+                            description: 'OPTIONAL — publication date (ISO 8601 or human-readable)'
+                        },
+                        tags: {
+                            type: 'array',
+                            items: { type: 'string' },
+                            description: 'OPTIONAL — topic tags for later filtering'
+                        },
+                        userId: {
+                            type: 'string',
+                            description: 'OPTIONAL — user identifier; defaults to KMS_DEFAULT_USER_ID env var'
+                        }
+                    },
+                    required: ['title', 'content']
+                }
+            },
+            {
+                name: 'document_search',
+                description: 'Search documents stored via document_store. Returns title, docType, wordCount, and a 300-char excerpt. Full content retrievable by id.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        query: {
+                            type: 'string',
+                            description: 'Keywords to search for in title, content, and tags'
+                        },
+                        tags: {
+                            type: 'array',
+                            items: { type: 'string' },
+                            description: 'OPTIONAL — filter by tags'
+                        },
+                        limit: {
+                            type: 'integer',
+                            minimum: 1,
+                            maximum: 100,
+                            description: 'OPTIONAL — max results (default: 10, max: 100)'
+                        },
+                        userId: {
+                            type: 'string',
+                            description: 'OPTIONAL — scope results to a specific user'
+                        }
+                    },
+                    required: ['query']
+                }
             }
         ];
     }
@@ -648,6 +729,12 @@ export class UnifiedKMSServer {
                         break;
                     case 'kms_ping':
                         result = await this.handleKmsPing();
+                        break;
+                    case 'document_store':
+                        result = await this.tools.documentStore.store(args);
+                        break;
+                    case 'document_search':
+                        result = this.truncateSearchResult(await this.tools.documentStore.search(args));
                         break;
                     default:
                         throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
