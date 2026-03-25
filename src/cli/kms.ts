@@ -23,6 +23,11 @@
  */
 
 import { parseArgs } from 'node:util'
+import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+const require = createRequire(import.meta.url)
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 import { Neo4jStorage } from '../storage/Neo4jStorage.js'
 import type { GraphStorage } from '../types/index.js'
@@ -56,6 +61,8 @@ Commands:
   search <query>    Search KMS
   ping              Health check all storage systems
   route <content>   Show routing decision without storing
+  export            Dump all nodes, edges, and sidecar to JSONL backup file
+  import <file>     Replay a JSONL backup into a (new) SparrowDB instance
 
 Options for store:
   --type, -t        Content type: memory|insight|pattern|relationship|fact|procedure
@@ -305,6 +312,231 @@ async function cmdRoute(args: string[]) {
   out({ regex: decision, llm: ollamaDecision })
 }
 
+// ── Shared helper: load SparrowDB native binding ──────────────────────────────
+
+async function loadSparrowDBNative(): Promise<any> {
+  const { existsSync } = await import('node:fs')
+  const candidatePaths = [
+    join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
+    join(homedir(), 'Dev', 'SparrowDB', 'target', 'release', 'sparrowdb.node'),
+    join(homedir(), 'Dev', 'SparrowDB', 'target', 'debug', 'sparrowdb.node'),
+  ]
+  for (const p of candidatePaths) {
+    if (existsSync(p)) return require(p)
+  }
+  return null
+}
+
+// ── Command: export ───────────────────────────────────────────────────────────
+
+async function cmdExport(args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      output: { type: 'string', short: 'o' },
+      path:   { type: 'string' }   // override SPARROWDB_PATH
+    },
+    strict: false
+  })
+
+  const dbPath = (values.path as string | undefined)
+    || process.env.SPARROWDB_PATH
+    || homedir() + '/.kms-sparrowdb'
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const backupDir = homedir() + '/.kms-backups'
+  const outPath = (values.output as string | undefined) || `${backupDir}/kms-export-${timestamp}.jsonl`
+
+  // Ensure output parent directory exists (handles both default backupDir and custom --output paths)
+  const { mkdirSync, createWriteStream, existsSync, readFileSync } = await import('node:fs')
+  const { dirname } = await import('node:path')
+  const outDir = dirname(outPath)
+  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true })
+
+  console.error(`📦 Exporting SparrowDB at: ${dbPath}`)
+  console.error(`📄 Output: ${outPath}`)
+
+  // Load native binding and open DB
+  // We access SparrowDB directly here (not via SparrowDBStorage) so we can
+  // run raw Cypher without the high-level abstraction getting in the way.
+  const native = await loadSparrowDBNative()
+  if (!native) die('sparrowdb.node not found — cannot export')
+
+  const db = native.SparrowDB.open(dbPath)
+
+  // Load content sidecar (full-length strings)
+  const sidecarPath = join(dbPath, 'content-index.json')
+  const sidecar: Record<string, any> = existsSync(sidecarPath)
+    ? JSON.parse(readFileSync(sidecarPath, 'utf8'))
+    : {}
+
+  const stream = createWriteStream(outPath, { flags: 'w' })
+  const write = (obj: object) => stream.write(JSON.stringify(obj) + '\n')
+
+  // Write manifest
+  write({ type: 'manifest', exportedAt: new Date().toISOString(), dbPath, version: 1 })
+
+  // Export all nodes (all known labels, including operational ones)
+  const labels = ['Knowledge', 'Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event', 'ContextTrigger', 'ToolRoute']
+  let nodeCount = 0
+  for (const label of labels) {
+    try {
+      const result = db.execute(`MATCH (n:${label}) RETURN n.id, n.name, n.contentType, n.source, n.userId, n.confidence`)
+      for (const row of result.rows) {
+        const id = String(row['n.id'] ?? '')
+        const sidecarEntry = sidecar[id] ?? null
+        write({
+          type: 'node',
+          label,
+          id,
+          props: {
+            name:        row['n.name'],
+            contentType: row['n.contentType'],
+            source:      row['n.source'],
+            userId:      row['n.userId'],
+            confidence:  row['n.confidence'],
+          },
+          // Sidecar carries the full-length content + metadata
+          sidecar: sidecarEntry
+        })
+        nodeCount++
+      }
+    } catch { /* label may not exist in this DB */ }
+  }
+
+  // Discover all relationship types dynamically, falling back to known types
+  let relTypes: string[] = []
+  try {
+    const relResult = db.execute(`MATCH ()-[r]->() RETURN DISTINCT type(r) AS rel`)
+    relTypes = relResult.rows
+      .map((row: Record<string, unknown>) => String(row['rel'] ?? ''))
+      .filter(Boolean)
+  } catch {
+    relTypes = ['RELATED_TO', 'ABOUT']
+  }
+
+  // Export all edges
+  let edgeCount = 0
+  for (const rel of relTypes) {
+    try {
+      const result = db.execute(`MATCH (a)-[:${rel}]->(b) RETURN a.id, b.id`)
+      for (const row of result.rows) {
+        write({ type: 'edge', rel, from: String(row['a.id'] ?? ''), to: String(row['b.id'] ?? '') })
+        edgeCount++
+      }
+    } catch { /* relationship type may not exist */ }
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    stream.end((err: Error | null) => err ? reject(err) : resolve())
+  })
+
+  console.error(`✅ Export complete: ${nodeCount} nodes, ${edgeCount} edges → ${outPath}`)
+  out({ success: true, nodes: nodeCount, edges: edgeCount, sidecarEntries: Object.keys(sidecar).length, output: outPath })
+}
+
+// ── Command: import ───────────────────────────────────────────────────────────
+
+async function cmdImport(args: string[]) {
+  const file = args[0]
+  if (!file) die('import requires a backup file path')
+
+  const { values } = parseArgs({
+    args: args.slice(1),
+    options: {
+      path: { type: 'string' }   // override SPARROWDB_PATH for target
+    },
+    strict: false
+  })
+
+  const dbPath = (values.path as string | undefined)
+    || process.env.SPARROWDB_PATH
+    || homedir() + '/.kms-sparrowdb'
+
+  const { existsSync, mkdirSync, createReadStream, writeFileSync } = await import('node:fs')
+  const readline = await import('node:readline')
+
+  if (!existsSync(file)) die(`File not found: ${file}`)
+
+  // Ensure target DB dir exists
+  if (!existsSync(dbPath)) mkdirSync(dbPath, { recursive: true })
+
+  // Load native binding
+  const native = await loadSparrowDBNative()
+  if (!native) die('sparrowdb.node not found — cannot import')
+
+  console.error(`📦 Importing into SparrowDB at: ${dbPath}`)
+
+  const db = native.SparrowDB.open(dbPath)
+  const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+  const q = (s: string) => `'${esc(s)}'`
+
+  const sidecar: Record<string, any> = {}
+  let nodeCount = 0, edgeCount = 0, skipCount = 0
+
+  const rl = readline.createInterface({ input: createReadStream(file), crlfDelay: Infinity })
+
+  for await (const line of rl) {
+    if (!line.trim()) continue
+    let record: any
+    try { record = JSON.parse(line) } catch { continue }
+
+    if (record.type === 'manifest') {
+      console.error(`  Source: ${record.dbPath}, exported: ${record.exportedAt}`)
+    } else if (record.type === 'node') {
+      const { label, id, props, sidecar: sc } = record
+      // Validate label against allowlist to prevent Cypher injection
+      const VALID_LABELS = ['Knowledge', 'Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event', 'ContextTrigger', 'ToolRoute']
+      if (!id || !label || !VALID_LABELS.includes(label)) { skipCount++; continue }
+      // Upsert: DELETE existing then CREATE
+      try { db.execute(`MATCH (n:${label} {id: ${q(id)}}) DELETE n`) } catch { }
+      try {
+        // Restore all exported properties to maintain round-trip fidelity
+        const nodeProps = props ?? {}
+        const nameProp        = nodeProps.name        ? `, name: ${q(String(nodeProps.name))}`               : ''
+        const contentTypeProp = nodeProps.contentType ? `, contentType: ${q(String(nodeProps.contentType))}` : ''
+        const sourceProp      = nodeProps.source      ? `, source: ${q(String(nodeProps.source))}`           : ''
+        const userIdProp      = nodeProps.userId      ? `, userId: ${q(String(nodeProps.userId))}`           : ''
+        const confidenceProp  = nodeProps.confidence !== undefined ? `, confidence: ${q(String(nodeProps.confidence))}` : ''
+        db.execute(
+          `CREATE (n:${label} {id: ${q(id)}` +
+          `${nameProp}${contentTypeProp}${sourceProp}${userIdProp}${confidenceProp}` +
+          `})`
+        )
+        nodeCount++
+      } catch (err) {
+        console.error(`  ⚠️  Failed to create node ${id}:`, (err as Error).message)
+        skipCount++
+      }
+      // Rebuild sidecar from embedded entry
+      if (sc) sidecar[id] = sc
+    } else if (record.type === 'edge') {
+      const { rel, from, to } = record
+      // Validate rel type against allowlist to prevent Cypher injection
+      const VALID_REL_TYPES = ['RELATED_TO', 'ABOUT']
+      if (!from || !to || !rel || !VALID_REL_TYPES.includes(rel)) { skipCount++; continue }
+      try {
+        db.execute(
+          `MATCH (a {id: ${q(from)}}), (b {id: ${q(to)}}) ` +
+          `CREATE (a)-[:${rel}]->(b)`
+        )
+        edgeCount++
+      } catch {
+        // Source or target node missing — silently skip
+        skipCount++
+      }
+    }
+  }
+
+  // Write rebuilt sidecar
+  const sidecarPath = join(dbPath, 'content-index.json')
+  writeFileSync(sidecarPath, JSON.stringify(sidecar, null, 2), 'utf8')
+
+  console.error(`✅ Import complete: ${nodeCount} nodes, ${edgeCount} edges (${skipCount} skipped) → ${dbPath}`)
+  console.error(`   Sidecar rebuilt: ${Object.keys(sidecar).length} entries → ${sidecarPath}`)
+  out({ success: true, nodes: nodeCount, edges: edgeCount, skipped: skipCount, sidecarEntries: Object.keys(sidecar).length })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 async function main() {
@@ -324,6 +556,8 @@ async function main() {
       case 'search': await cmdSearch(rest); break
       case 'ping':   await cmdPing();       break
       case 'route':  await cmdRoute(rest);  break
+      case 'export': await cmdExport(rest); break
+      case 'import': await cmdImport(rest); break
       default:
         console.error(`Unknown command: ${command}`)
         usage()
