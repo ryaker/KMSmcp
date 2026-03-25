@@ -483,7 +483,7 @@ export class SparrowDBStorage implements StorageSystem {
           const rawId = String(row['b.id'] ?? '')
           // Stored as integer × 100 — divide back to 0.0–1.0 float (SparrowDB#229 workaround).
           const rawStrength = row['r.strength']
-          const edgeStrength = rawStrength !== undefined && rawStrength !== null
+          const edgeStrength = rawStrength != null
             ? Math.round(parseFloatSafe(rawStrength)) / 100
             : undefined
           // rawId may be truncated to 7 chars — use prefix search to
@@ -743,9 +743,14 @@ export class SparrowDBStorage implements StorageSystem {
       const safeRelType = relationshipType.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
       // SparrowDB edge props only support integers (SparrowDB#229: float panics).
       // Store strength × 100 as integer (0–100); divide by 100 on read.
-      const props = (strength !== undefined && strength >= 0 && strength <= 1)
-        ? ` {strength: ${Math.round(strength * 100)}}`
-        : ''
+      let props = ''
+      if (strength !== undefined) {
+        if (strength >= 0 && strength <= 1) {
+          props = ` {strength: ${Math.round(strength * 100)}}`
+        } else {
+          logger.warn(`⚠️ Invalid strength value for relationship ${relationshipType}: ${strength}. Must be between 0 and 1. Ignoring strength property.`)
+        }
+      }
       this.db.execute(
         `MATCH (a:Knowledge {id: ${cypherStr(sourceId)}}), ` +
         `(b:Knowledge {id: ${cypherStr(targetId)}}) ` +
