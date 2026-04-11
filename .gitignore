@@ -45,4 +45,6 @@ temp/
 .cache/
 .vscode/settings.local.json
 .idea/
-.claude/
+.claude/.mcp.json
+DEDUP_*.md
+people-registry.csv

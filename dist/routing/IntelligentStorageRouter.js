@@ -3,6 +3,7 @@
  * Graph backend (Neo4j or SparrowDB) + Mem0 always (knowledge graph + semantic layer).
  * MongoDB added only for structured/procedural/technical content.
  */
+import { logger } from '../logger.js';
 // Pattern that signals content needs MongoDB structured storage in addition to the baseline
 const MONGODB_PATTERN = /config|configuration|setting|schema|setup|installation|procedure|step.*by.*step|documentation|specification|authentication|API|endpoint|database|server|deployment|build|compile|debug|error.*log|stack.*trace/i;
 export class IntelligentStorageRouter {
@@ -18,8 +19,7 @@ export class IntelligentStorageRouter {
         const content = knowledge.content || '';
         const contentType = knowledge.contentType;
         const source = knowledge.source;
-        console.log(`🧠 Analyzing storage for: "${content.slice(0, 50)}..."`);
-        console.log(`   Content Type: ${contentType}, Source: ${source}`);
+        logger.debug(`🧠 Routing decision: type=${contentType}, source=${source}, len=${content.length}`);
         const addMongoDB = this.needsStructuredStorage(content, contentType, source);
         const secondary = ['mem0'];
         if (addMongoDB)
@@ -33,11 +33,11 @@ export class IntelligentStorageRouter {
             reasoning,
             cacheStrategy: this.determineCacheStrategy(knowledge)
         };
-        console.log(`✅ Storage Decision:`);
-        console.log(`   Primary: ${decision.primary}`);
-        console.log(`   Secondary: ${decision.secondary?.join(', ')}`);
-        console.log(`   Cache: ${decision.cacheStrategy}`);
-        console.log(`   Reasoning: ${decision.reasoning}`);
+        logger.debug(`✅ Storage Decision:`);
+        logger.debug(`   Primary: ${decision.primary}`);
+        logger.debug(`   Secondary: ${decision.secondary?.join(', ')}`);
+        logger.debug(`   Cache: ${decision.cacheStrategy}`);
+        logger.debug(`   Reasoning: ${decision.reasoning}`);
         return decision;
     }
     /**
@@ -58,26 +58,26 @@ export class IntelligentStorageRouter {
     determineCacheStrategy(knowledge) {
         // Personal user queries - cache aggressively
         if (knowledge.source === 'personal') {
-            console.log(`🚀 L1 cache for personal user content`);
+            logger.debug(`🚀 L1 cache for personal user content`);
             return 'L1';
         }
         // Personal memories and insights - cache moderately
         if (knowledge.contentType === 'memory' || knowledge.contentType === 'insight') {
-            console.log(`⚡ L2 cache for personal memory/insight content`);
+            logger.debug(`⚡ L2 cache for personal memory/insight content`);
             return 'L2';
         }
         // High confidence knowledge - cache moderately
         if (knowledge.confidence && knowledge.confidence > 0.8) {
-            console.log(`⚡ L2 cache for high confidence content`);
+            logger.debug(`⚡ L2 cache for high confidence content`);
             return 'L2';
         }
         // Technical knowledge - cache conservatively
         if (knowledge.source === 'technical' || knowledge.contentType === 'procedure') {
-            console.log(`💾 L3 cache for technical/procedural content`);
+            logger.debug(`💾 L3 cache for technical/procedural content`);
             return 'L3';
         }
         // Everything else - conservative caching
-        console.log(`💾 L3 cache for general content`);
+        logger.debug(`💾 L3 cache for general content`);
         return 'L3';
     }
     /**

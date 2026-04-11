@@ -108,6 +108,12 @@ interface ContentEntry {
 
 function loadNativeBinding(): SparrowDBModule {
   const require = createRequire(import.meta.url)
+  // Prefer npm package; fall back to local dev builds
+  try {
+    return require('sparrowdb') as SparrowDBModule
+  } catch {
+    // npm package not installed — try local dev paths
+  }
   const candidates = [
     join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
     join(homedir(), 'Dev', 'SparrowDB', 'target', 'release', 'sparrowdb.node'),
@@ -120,8 +126,9 @@ function loadNativeBinding(): SparrowDBModule {
     }
   }
   throw new Error(
-    'SparrowDBStorage: cannot find sparrowdb.node binary.\n' +
-    'Run: cargo build --release -p sparrowdb-node  in ~/Dev/SparrowDB'
+    'SparrowDBStorage: cannot find sparrowdb.\n' +
+    'Install: npm install sparrowdb\n' +
+    'Or build locally: cargo build --release -p sparrowdb-node  in ~/Dev/SparrowDB'
   )
 }
 
