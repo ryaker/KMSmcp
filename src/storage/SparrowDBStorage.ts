@@ -477,13 +477,13 @@ export class SparrowDBStorage implements StorageSystem {
             `MATCH (a:Knowledge)-[r:RELATED_TO]->(b:Knowledge) WHERE a.id IN [${idList}] RETURN b.id, r.strength`
           )
           neighbourRows.push(...out.rows)
-        } catch (e) { console.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
+        } catch (e) { logger.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
         try {
           const inc = this.db.execute(
             `MATCH (b:Knowledge)-[r:RELATED_TO]->(a:Knowledge) WHERE a.id IN [${idList}] RETURN b.id, r.strength`
           )
           neighbourRows.push(...inc.rows)
-        } catch (e) { console.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
+        } catch (e) { logger.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
 
         const next: string[] = []
         for (const row of neighbourRows) {
@@ -850,6 +850,7 @@ export class SparrowDBStorage implements StorageSystem {
         !raw ||
         typeof raw !== 'object' ||
         typeof (raw as any).nameIndex !== 'object' ||
+        typeof (raw as any).people !== 'object' ||
         !(raw as any)._meta ||
         typeof (raw as any)._meta.totalPeople !== 'number'
       ) {
