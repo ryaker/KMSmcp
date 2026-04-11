@@ -282,7 +282,17 @@ export class Neo4jStorage implements GraphStorage {
         return {
           id: node.id || node.name,
           content,
-          confidence: Math.min(score / 5, 1), // normalize fulltext score to 0-1
+          // Normalize fulltext score with a document-length penalty.
+          // Long documents (archive articles, full texts) match many query terms and
+          // generate inflated scores, pushing out precise short facts. Penalize content
+          // >500 chars so large documents can't dominate context injection results.
+          // A 4000-char article gets ~0.60× penalty; a 200-char fact gets no penalty.
+          confidence: (() => {
+            const raw = Math.min(score / 5, 1)
+            const len = content.length
+            const lengthPenalty = len <= 500 ? 1.0 : Math.pow(500 / len, 0.25)
+            return raw * lengthPenalty
+          })(),
           metadata: (() => {
             if (!node.metadata) return node
             try { return JSON.parse(node.metadata) } catch { return node }
