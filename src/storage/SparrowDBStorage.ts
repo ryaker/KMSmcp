@@ -108,6 +108,12 @@ interface ContentEntry {
 
 function loadNativeBinding(): SparrowDBModule {
   const require = createRequire(import.meta.url)
+  // Prefer npm package; fall back to local dev builds
+  try {
+    return require('sparrowdb') as SparrowDBModule
+  } catch {
+    // npm package not installed — try local dev paths
+  }
   const candidates = [
     join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
     join(homedir(), 'Dev', 'SparrowDB', 'target', 'release', 'sparrowdb.node'),
@@ -120,8 +126,9 @@ function loadNativeBinding(): SparrowDBModule {
     }
   }
   throw new Error(
-    'SparrowDBStorage: cannot find sparrowdb.node binary.\n' +
-    'Run: cargo build --release -p sparrowdb-node  in ~/Dev/SparrowDB'
+    'SparrowDBStorage: cannot find sparrowdb.\n' +
+    'Install: npm install sparrowdb\n' +
+    'Or build locally: cargo build --release -p sparrowdb-node  in ~/Dev/SparrowDB'
   )
 }
 
@@ -470,13 +477,13 @@ export class SparrowDBStorage implements StorageSystem {
             `MATCH (a:Knowledge)-[r:RELATED_TO]->(b:Knowledge) WHERE a.id IN [${idList}] RETURN b.id, r.strength`
           )
           neighbourRows.push(...out.rows)
-        } catch (e) { console.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
+        } catch (e) { logger.warn('⚠️ SparrowDB findRelated outgoing query failed at depth', depth, e) }
         try {
           const inc = this.db.execute(
             `MATCH (b:Knowledge)-[r:RELATED_TO]->(a:Knowledge) WHERE a.id IN [${idList}] RETURN b.id, r.strength`
           )
           neighbourRows.push(...inc.rows)
-        } catch (e) { console.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
+        } catch (e) { logger.warn('⚠️ SparrowDB findRelated incoming query failed at depth', depth, e) }
 
         const next: string[] = []
         for (const row of neighbourRows) {
@@ -843,6 +850,7 @@ export class SparrowDBStorage implements StorageSystem {
         !raw ||
         typeof raw !== 'object' ||
         typeof (raw as any).nameIndex !== 'object' ||
+        typeof (raw as any).people !== 'object' ||
         !(raw as any)._meta ||
         typeof (raw as any)._meta.totalPeople !== 'number'
       ) {

@@ -14,6 +14,7 @@ scripts/
 !package-lock.json
 !tsconfig.json
 *.sh
+!examples/**/*.sh
 *.tf
 *.key
 *.pem
@@ -45,4 +46,6 @@ temp/
 .cache/
 .vscode/settings.local.json
 .idea/
-.claude/
+.claude/.mcp.json
+DEDUP_*.md
+people-registry.csv

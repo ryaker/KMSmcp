@@ -2,6 +2,7 @@
  * Neo4j Storage System Implementation
  */
 import neo4j from 'neo4j-driver';
+import { logger } from '../logger.js';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -17,13 +18,13 @@ export class Neo4jStorage {
         this.sessionConfig = config.database ? { database: config.database } : {};
     }
     async initialize() {
-        console.log('🔗 Connecting to Neo4j...');
+        logger.info('🔗 Connecting to Neo4j...');
         this.driver = neo4j.driver(this.config.uri, neo4j.auth.basic(this.config.username, this.config.password));
         // Test connection
         const session = this.driver.session(this.sessionConfig);
         try {
             await session.run('RETURN 1');
-            console.log('✅ Neo4j connected successfully');
+            logger.info('✅ Neo4j connected successfully');
         }
         finally {
             await session.close();
@@ -40,15 +41,15 @@ export class Neo4jStorage {
     loadKnownPeople() {
         const configPath = join(__dirname, '..', '..', 'config', 'known-people.json');
         if (!existsSync(configPath)) {
-            console.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs');
+            logger.warn('⚠️ config/known-people.json not found — run scripts/generate-known-people.mjs');
             return;
         }
         try {
             this.knownPeople = JSON.parse(readFileSync(configPath, 'utf-8'));
-            console.log(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`);
+            logger.debug(`✅ Identity registry loaded: ${this.knownPeople._meta.totalPeople} people, ${this.knownPeople._meta.totalNameVariants} name variants`);
         }
         catch (e) {
-            console.warn('⚠️ Failed to load known-people.json:', e);
+            logger.warn('⚠️ Failed to load known-people.json:', e);
         }
     }
     /**
@@ -109,7 +110,7 @@ export class Neo4jStorage {
             }
         }
         catch (e) {
-            console.warn('⚠️ PersonResolver search error:', e);
+            logger.warn('⚠️ PersonResolver search error:', e);
         }
         finally {
             await session.close();
@@ -119,7 +120,7 @@ export class Neo4jStorage {
     async store(knowledge) {
         const session = this.driver.session(this.sessionConfig);
         try {
-            console.log(`🔗 Storing in Neo4j: ${knowledge.id}`);
+            logger.debug(`🔗 Storing in Neo4j: ${knowledge.id}`);
             // Create the knowledge node
             await session.run(`
         CREATE (k:Knowledge {
@@ -150,10 +151,10 @@ export class Neo4jStorage {
             }
             // Create semantic relationships based on content
             await this.createSemanticRelationships(session, knowledge);
-            console.log(`✅ Successfully stored in Neo4j with ${knowledge.relationships?.length || 0} relationships`);
+            logger.debug(`✅ Successfully stored in Neo4j with ${knowledge.relationships?.length || 0} relationships`);
         }
         catch (error) {
-            console.error('❌ Neo4j storage error:', error);
+            logger.error('❌ Neo4j storage error:', error);
             throw error;
         }
         finally {
@@ -163,7 +164,7 @@ export class Neo4jStorage {
     async search(query) {
         const session = this.driver.session(this.sessionConfig);
         try {
-            console.log(`🔍 Searching Neo4j: "${query.query}"`);
+            logger.debug(`🔍 Searching Neo4j: "${query.query}"`);
             // Use fulltext index for broad search across Person, Organization, Project, etc.
             // The old MATCH (k:Knowledge) query returned 0 results because there are 0 Knowledge nodes —
             // all data lives under Person/Organization/Project/Technology/Concept/Service/Event labels.
@@ -275,11 +276,11 @@ export class Neo4jStorage {
                     relationships: relationships.filter((r) => r.relatedNode)
                 };
             });
-            console.log(`🔗 Neo4j found ${results.length} results`);
+            logger.debug(`🔗 Neo4j found ${results.length} results`);
             return results;
         }
         catch (error) {
-            console.warn('⚠️ Neo4j search error:', error);
+            logger.warn('⚠️ Neo4j search error:', error);
             return [];
         }
         finally {
@@ -338,7 +339,7 @@ export class Neo4jStorage {
             };
         }
         catch (error) {
-            console.error('❌ Neo4j stats error:', error);
+            logger.error('❌ Neo4j stats error:', error);
             return {
                 totalNodes: 0,
                 totalRelationships: 0,
@@ -395,7 +396,7 @@ export class Neo4jStorage {
             });
         }
         catch (error) {
-            console.warn(`⚠️ Failed to create relationship ${relationshipType}:`, error);
+            logger.warn(`⚠️ Failed to create relationship ${relationshipType}:`, error);
         }
     }
     async createSemanticRelationships(session, knowledge) {
@@ -426,7 +427,7 @@ export class Neo4jStorage {
             }
         }
         catch (error) {
-            console.warn('⚠️ Failed to create semantic relationships:', error);
+            logger.warn('⚠️ Failed to create semantic relationships:', error);
         }
     }
     async createConstraints() {
@@ -457,10 +458,10 @@ export class Neo4jStorage {
         FOR (n:Knowledge|Person|Organization|Project|Technology|Concept|Service|Event)
         ON EACH [n.name, n.content, n.description, n.notes, n.headline, n.profession, n.career, n.purpose, n.industry]
       `);
-            console.log('🔗 Neo4j constraints and indexes created');
+            logger.debug('🔗 Neo4j constraints and indexes created');
         }
         catch (error) {
-            console.warn('⚠️ Neo4j constraint creation warning:', error);
+            logger.warn('⚠️ Neo4j constraint creation warning:', error);
         }
         finally {
             await session.close();
@@ -515,7 +516,7 @@ export class Neo4jStorage {
             return summary;
         }
         catch (error) {
-            console.warn('⚠️ Neo4j getEntitySummary error:', error);
+            logger.warn('⚠️ Neo4j getEntitySummary error:', error);
             return null;
         }
         finally {
@@ -550,7 +551,7 @@ export class Neo4jStorage {
             }));
         }
         catch (error) {
-            console.warn('⚠️ Neo4j getOperationalNodes error:', error);
+            logger.warn('⚠️ Neo4j getOperationalNodes error:', error);
             return [];
         }
         finally {
@@ -583,7 +584,7 @@ export class Neo4jStorage {
             }));
         }
         catch (error) {
-            console.warn('⚠️ Neo4j getEntityCandidates error:', error);
+            logger.warn('⚠️ Neo4j getEntityCandidates error:', error);
             return [];
         }
         finally {
@@ -610,10 +611,10 @@ export class Neo4jStorage {
                 sourceId,
                 targetIds: targetEntityIds
             });
-            console.log(`🔗 Neo4j: created ABOUT relationships: ${sourceId} → [${targetEntityIds.join(', ')}]`);
+            logger.debug(`🔗 Neo4j: created ABOUT relationships: ${sourceId} → [${targetEntityIds.join(', ')}]`);
         }
         catch (error) {
-            console.warn('⚠️ Neo4j createAboutRelationships error:', error);
+            logger.warn('⚠️ Neo4j createAboutRelationships error:', error);
             // Swallow — enrichment is best-effort
         }
         finally {
@@ -623,7 +624,7 @@ export class Neo4jStorage {
     async close() {
         if (this.driver) {
             await this.driver.close();
-            console.log('🔗 Neo4j connection closed');
+            logger.debug('🔗 Neo4j connection closed');
         }
     }
 }
