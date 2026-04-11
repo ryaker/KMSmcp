@@ -38,7 +38,12 @@ relationship links — not prose, not a summary for the user.
    - Items under 40 characters (too thin to be useful)
    - Pure acknowledgements ("thanks", "got it", "ok")
 
-3. For each surviving item, construct the `unified_store` arguments:
+3. For each surviving item, call `mcp__claude_ai_PersonalKMS__unified_search` with the
+   item content as the query. If the search returns a result with the same meaning
+   (same fact, same decision, same correction), skip that item — it is already in KMS.
+   Only proceed with items that return no close match.
+
+4. For each item that survives the search check, construct the `unified_store` arguments:
    - `content`: the knowledge in one or two sentences, verbatim where the item is a user correction
    - `contentType`: one of `insight | fact | pattern | procedure`
    - `source`: `technical` for code/config/bugs, `personal` for preferences/corrections
@@ -46,10 +51,10 @@ relationship links — not prose, not a summary for the user.
    - `confidence`: 0.85 for facts and procedures, 0.90 for verbatim corrections, 0.80 for insights
    - `relationships`: include when the item links to a known project, person, or concept
 
-4. Call `mcp__claude_ai_PersonalKMS__unified_store` once per item. Do NOT batch into
+5. Call `mcp__claude_ai_PersonalKMS__unified_store` once per item. Do NOT batch into
    a single call — relationships and contentType must be per-item.
 
-5. After all calls return, output ONE line to the user: `Saved N items to KMS
+6. After all calls return, output ONE line to the user: `Saved N items to KMS
    (breakdown: X insight, Y fact, Z pattern, W procedure).` Do NOT summarize what
    was saved — the user can query KMS for that.
 
@@ -162,6 +167,6 @@ correction with full context. If the user declines to clarify, skip it.
 Before confirming, verify:
 - [ ] Every stored item has `userId: richard_yaker`
 - [ ] Every `contentType` is one of the four valid values
-- [ ] No item duplicates something already in KMS from earlier this session
+- [ ] Each item was checked via unified_search and no close match was already in KMS
 - [ ] Verbatim quotes were used for any `pattern` from a user correction
 - [ ] Final output is exactly the confirmation line format — no recap
