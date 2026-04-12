@@ -387,7 +387,7 @@ export class UnifiedKMSServer {
         return [
             {
                 name: 'unified_store',
-                description: 'Store knowledge with AI-powered inference. Just provide content - the system intelligently detects type, project, tags, and relationships. Examples: "Fixed OAuth bug with JWKS endpoint", "Realized morning sessions work best", "Always use TypeScript strict mode"',
+                description: 'Store NEW knowledge with AI-powered inference. Just provide content - the system intelligently detects type, project, tags, and relationships. Examples: "Fixed OAuth bug with JWKS endpoint", "Realized morning sessions work best", "Always use TypeScript strict mode". ⚠️ CORRECTING A PREVIOUS FACT? Do NOT call unified_store again — that leaves the wrong entry poisoning context. Use kms_supersede(old_id, new_content, reason) instead. See kms_instructions for the full correction guide.',
                 inputSchema: {
                     type: 'object',
                     properties: {

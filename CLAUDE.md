@@ -94,12 +94,46 @@ When storing rich information, consider multiple aspects:
 
 The more you search and find useful previous knowledge, the more natural it becomes. When stored memories help future conversations, the value becomes clear.
 
+## Correcting Wrong Entries — Use the Corrective Tools, Not Additive Store
+
+**Critical rule**: If you're about to store a fact that contradicts or replaces a previous one, **do not call `unified_store` again**. That additively stores the new one alongside the wrong one, and both leak into context injection on every future session.
+
+KMS has five corrective tools. Pick the right one:
+
+| You want to... | Use | Effect |
+|---|---|---|
+| Correct a fact you previously stored wrong (the common case) | `kms_supersede(old_id, new_content, reason)` | Atomic: stores new entry with `metadata.supersedes=old_id`, flags old with `flag=SUPERSEDED, superseded_by=new_id`. Both preserved for audit; new one shows in search, old one hidden. Rolls back new if flag fails. |
+| Fix a typo / adjust confidence / tweak metadata (same fact, minor edit) | `kms_update(id, content, reason)` | In-place mutation. Bumps timestamp, appends reason to `metadata.update_history`. Not for retraction. |
+| Delete noise (test entry, accidental store, garbage — no replacement) | `kms_delete(id, reason)` | Soft-delete: flags `DELETED`. Reversible for 90 days. |
+| Mark an entry partially wrong without replacing it | `kms_flag(id, 'RETRACTED' \| 'UNVERIFIED', note)` | Hides from default reads; original content preserved for audit. Pass `flag=null` to un-flag. |
+| Clean up old flagged entries past the reversibility window | `kms_reap({olderThanDays: 90, dryRun: true})` | Dry-run by default. Set `dryRun: false` to hard-delete. Admin operation. |
+
+**How this interacts with context injection**: `unified_search` (and the `kms-context-fetch.py` UserPromptSubmit hook that calls it) default-exclude flagged entries. The moment you supersede a wrong fact, it **stops leaking into every future session's context** automatically. Pass `options.includeFlagged: true` to see them (audit/reaper paths only).
+
+**When in doubt, prefer `kms_supersede` over `kms_delete`**. The mistake is data — future you or a future agent might want to trace why a conclusion changed. Supersede preserves the chain; delete is for actual garbage.
+
+**Example correction flow**:
+```json
+// Wrong fact stored earlier (id returned by unified_store)
+// { "id": "abc-123", "content": "Phoenix uses exactly 6 cameras", ... }
+
+// Later discovered to be wrong. Instead of storing a contradicting fact:
+kms_supersede({
+  "old_id": "abc-123",
+  "new_content": "Phoenix camera count is UNKNOWN pending canvas bounds verification. Prior 6-camera claim used wrong zoom config and A-only FOV.",
+  "contentType": "insight",
+  "reason": "Canvas bounds unverified and R_fold used config 0 not config 2"
+})
+// Now unified_search returns only the corrected version by default.
+```
+
 ## Best Practices
 
 ### Search First, Store Smart
 1. Always search before storing to avoid duplicates
 2. Use search results to inform storage decisions
 3. Build on existing knowledge rather than creating isolated memories
+4. **If search returns a fact you're about to contradict, use `kms_supersede`, not `unified_store`**
 
 ### Natural Language Processing
 - Use natural descriptions in storage
