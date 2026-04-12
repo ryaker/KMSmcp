@@ -13,6 +13,7 @@ scripts/
 !package.json
 !package-lock.json
 !tsconfig.json
+!tsconfig.test.json
 *.sh
 !examples/**/*.sh
 *.tf

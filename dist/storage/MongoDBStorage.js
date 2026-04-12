@@ -72,6 +72,11 @@ export class MongoDBStorage {
                     ]);
                 }
             }
+            // Default: hide flagged (retracted/superseded/deleted) entries.
+            // Opt in via options.includeFlagged to see them (e.g. for audit/reaper).
+            if (!query.options?.includeFlagged) {
+                filter.flag = { $in: [null, undefined] };
+            }
             // Apply filters
             if (query.filters?.contentType) {
                 filter.contentType = { $in: query.filters.contentType };
@@ -184,6 +189,57 @@ export class MongoDBStorage {
         catch (error) {
             console.error('❌ MongoDB delete error:', error);
             return false;
+        }
+    }
+    /**
+     * Flag an entry without modifying its content. Soft-delete primitive.
+     * Pass `flag=null` to clear the flag (un-retract).
+     */
+    async flag(id, flag, note, by, superseded_by) {
+        try {
+            const $set = { flag };
+            const $unset = {};
+            if (flag === null) {
+                $unset.flag_note = '';
+                $unset.flag_date = '';
+                $unset.flag_by = '';
+                $unset.superseded_by = '';
+            }
+            else {
+                $set.flag_date = new Date();
+                if (note !== undefined)
+                    $set.flag_note = note;
+                if (by !== undefined)
+                    $set.flag_by = by;
+                if (superseded_by !== undefined)
+                    $set.superseded_by = superseded_by;
+            }
+            const update = { $set };
+            if (Object.keys($unset).length > 0)
+                update.$unset = $unset;
+            const result = await this.collection.updateOne({ id }, update);
+            return result.matchedCount > 0;
+        }
+        catch (error) {
+            console.error('❌ MongoDB flag error:', error);
+            return false;
+        }
+    }
+    /**
+     * List all flagged entries (any flag value, optionally older than a date).
+     * Used by the reaper to find candidates for hard-deletion.
+     */
+    async listFlagged(olderThan) {
+        try {
+            const filter = { flag: { $nin: [null, undefined] } };
+            if (olderThan) {
+                filter.flag_date = { $lt: olderThan };
+            }
+            return await this.collection.find(filter).toArray();
+        }
+        catch (error) {
+            console.error('❌ MongoDB listFlagged error:', error);
+            return [];
         }
     }
     async storeDocument(doc) {

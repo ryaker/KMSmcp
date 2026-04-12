@@ -46,6 +46,8 @@ export interface KMSConfig {
   oauth?: OAuthConfig
 }
 
+export type KnowledgeFlag = 'RETRACTED' | 'SUPERSEDED' | 'DELETED' | 'UNVERIFIED'
+
 export interface UnifiedKnowledge {
   id: string
   content: string
@@ -60,6 +62,14 @@ export interface UnifiedKnowledge {
     type: string
     strength: number
   }>
+  // Soft-delete / correction fields. All optional, all default to undefined.
+  // Read paths default-exclude entries with flag != null. The reaper hard-deletes
+  // entries where flag != null AND flag_date < now - 90 days.
+  flag?: KnowledgeFlag | null
+  flag_note?: string
+  flag_date?: Date
+  flag_by?: string
+  superseded_by?: string  // ID of the entry that replaces this one (set on the OLD entry)
 }
 
 export interface StorageDecision {
@@ -83,6 +93,9 @@ export interface KnowledgeQuery {
     maxResults?: number
     useFACTCache?: boolean
     cacheStrategy?: 'aggressive' | 'conservative' | 'realtime'
+    // When true, search returns flagged (retracted/superseded/deleted) entries.
+    // Default false — flagged entries are hidden from normal reads.
+    includeFlagged?: boolean
   }
 }
 
@@ -149,4 +162,18 @@ export interface GraphStorage extends StorageSystem {
     aliases: string[]
   }>>
   createAboutRelationships(sourceId: string, targetEntityIds: string[]): Promise<void>
+  // Corrective operations — implemented by SparrowDBStorage. Optional on the
+  // interface for backwards compat with Neo4jStorage which is no longer in the
+  // hot path. Callers should check for the method before invoking.
+  delete?(id: string): Promise<boolean>
+  update?(id: string, updates: Partial<UnifiedKnowledge>): Promise<boolean>
+  flag?(
+    id: string,
+    flag: KnowledgeFlag | null,
+    note?: string,
+    by?: string,
+    superseded_by?: string
+  ): Promise<boolean>
+  findById?(id: string): { id: string; flag?: KnowledgeFlag | null; flag_date?: string; [k: string]: any } | null
+  listFlagged?(): Array<{ id: string; flag?: KnowledgeFlag | null; flag_date?: string; [k: string]: any }>
 }

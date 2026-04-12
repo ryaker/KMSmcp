@@ -47,7 +47,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig } from '../types/index.js'
+import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -100,6 +100,12 @@ interface ContentEntry {
   confidence: number
   timestamp: string
   metadata: Record<string, any>
+  // Soft-delete / correction fields (optional). Mirrors UnifiedKnowledge flag fields.
+  flag?: KnowledgeFlag | null
+  flag_note?: string
+  flag_date?: string  // ISO string
+  flag_by?: string
+  superseded_by?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +254,12 @@ export class SparrowDBStorage implements StorageSystem {
       userId: knowledge.userId ?? '',
       confidence: knowledge.confidence,
       timestamp: ts,
-      metadata: knowledge.metadata ?? {}
+      metadata: knowledge.metadata ?? {},
+      flag: knowledge.flag ?? null,
+      flag_note: knowledge.flag_note,
+      flag_date: knowledge.flag_date instanceof Date ? knowledge.flag_date.toISOString() : knowledge.flag_date,
+      flag_by: knowledge.flag_by,
+      superseded_by: knowledge.superseded_by
     }
     this.contentIndex.set(knowledge.id, entry)
     this._saveSidecar()
@@ -270,6 +281,148 @@ export class SparrowDBStorage implements StorageSystem {
   }
 
   // -------------------------------------------------------------------------
+  // Corrective operations: delete / update / flag
+  // -------------------------------------------------------------------------
+
+  /**
+   * Hard delete an entry by ID. Removes the graph node, all incident
+   * relationships (DETACH), and the sidecar entry. Returns true if anything
+   * was actually removed.
+   */
+  async delete(id: string): Promise<boolean> {
+    logger.debug(`🗑️  Deleting from SparrowDB: ${id}`)
+    const hadEntry = this.contentIndex.has(id)
+
+    // Detach + delete graph node. SparrowDB doesn't have DETACH DELETE in all
+    // versions, so we delete relationships first then the node.
+    try {
+      this.db.execute(
+        `MATCH (k:Knowledge {id: ${cypherStr(id)}})-[r]-() DELETE r`
+      )
+    } catch { /* may have no relationships */ }
+    try {
+      this.db.execute(
+        `MATCH (k:Knowledge {id: ${cypherStr(id)}}) DELETE k`
+      )
+    } catch { /* node may not exist */ }
+
+    if (hadEntry) {
+      this.contentIndex.delete(id)
+      this._saveSidecar()
+    }
+
+    return hadEntry
+  }
+
+  /**
+   * Update fields on an existing entry. Merges `updates` into the sidecar
+   * ContentEntry and (for structural fields) refreshes the graph node via
+   * DELETE+CREATE since SparrowDB lacks MERGE+SET.
+   *
+   * Bumps the timestamp to now. Returns true if the entry existed.
+   */
+  async update(id: string, updates: Partial<UnifiedKnowledge>): Promise<boolean> {
+    logger.debug(`✏️  Updating SparrowDB entry: ${id}`)
+    const existing = this.contentIndex.get(id)
+    if (!existing) return false
+
+    // Merge updates into sidecar entry. Timestamp bumps to now.
+    const updated: ContentEntry = {
+      ...existing,
+      content: updates.content ?? existing.content,
+      contentType: updates.contentType ?? existing.contentType,
+      source: updates.source ?? existing.source,
+      userId: updates.userId ?? existing.userId,
+      confidence: updates.confidence ?? existing.confidence,
+      timestamp: new Date().toISOString(),
+      metadata: { ...existing.metadata, ...(updates.metadata ?? {}) },
+      flag: updates.flag !== undefined ? updates.flag : existing.flag,
+      flag_note: updates.flag_note ?? existing.flag_note,
+      flag_date: updates.flag_date instanceof Date
+        ? updates.flag_date.toISOString()
+        : (updates.flag_date ?? existing.flag_date),
+      flag_by: updates.flag_by ?? existing.flag_by,
+      superseded_by: updates.superseded_by ?? existing.superseded_by
+    }
+    this.contentIndex.set(id, updated)
+    this._saveSidecar()
+
+    // Refresh graph node structural properties (id, contentType, source, userId, confidence).
+    // No-op if the structural fields didn't change, but cheap to always do.
+    try {
+      this.db.execute(
+        `MATCH (k:Knowledge {id: ${cypherStr(id)}}) DELETE k`
+      )
+    } catch { /* may not exist */ }
+    try {
+      this.db.execute(
+        `CREATE (k:Knowledge {` +
+        `  id: ${cypherStr(updated.id)},` +
+        `  contentType: ${cypherStr(updated.contentType)},` +
+        `  source: ${cypherStr(updated.source)},` +
+        `  userId: ${cypherStr(updated.userId)},` +
+        `  confidence: ${cypherStr(String(updated.confidence))}` +
+        `})`
+      )
+    } catch (e) {
+      logger.warn(`SparrowDB update: failed to refresh graph node for ${id}: ${e}`)
+    }
+
+    return true
+  }
+
+  /**
+   * Flag an entry without modifying its content. Soft-delete primitive used
+   * by kms_delete (flag='DELETED'), kms_supersede (flag='SUPERSEDED'), and
+   * kms_flag for arbitrary flags (RETRACTED, UNVERIFIED).
+   *
+   * Pass `flag=null` to clear the flag (un-retract). Returns true if the
+   * entry existed.
+   */
+  async flag(
+    id: string,
+    flag: KnowledgeFlag | null,
+    note?: string,
+    by?: string,
+    superseded_by?: string
+  ): Promise<boolean> {
+    logger.debug(`🚩 Flagging SparrowDB entry: ${id} → ${flag ?? 'CLEARED'}`)
+    const existing = this.contentIndex.get(id)
+    if (!existing) return false
+
+    existing.flag = flag
+    existing.flag_note = flag === null ? undefined : note
+    existing.flag_date = flag === null ? undefined : new Date().toISOString()
+    existing.flag_by = flag === null ? undefined : by
+    if (superseded_by !== undefined) existing.superseded_by = superseded_by
+    if (flag === null) existing.superseded_by = undefined
+
+    this.contentIndex.set(id, existing)
+    this._saveSidecar()
+    return true
+  }
+
+  /**
+   * Find an entry by ID. Returns the full ContentEntry or null.
+   * Used by reaper and unified_get_by_id.
+   */
+  findById(id: string): ContentEntry | null {
+    return this.contentIndex.get(id) ?? null
+  }
+
+  /**
+   * List all flagged entries (any flag value). Used by reaper to find
+   * candidates for hard-deletion past the 90-day window.
+   */
+  listFlagged(): ContentEntry[] {
+    const out: ContentEntry[] = []
+    for (const e of this.contentIndex.values()) {
+      if (e.flag) out.push(e)
+    }
+    return out
+  }
+
+  // -------------------------------------------------------------------------
   // StorageSystem.search
   // -------------------------------------------------------------------------
 
@@ -284,6 +437,12 @@ export class SparrowDBStorage implements StorageSystem {
       // The sidecar holds full-length strings; SparrowDB graph holds short
       // structural metadata only.
       let entries = Array.from(this.contentIndex.values())
+
+      // Default: hide flagged (retracted/superseded/deleted) entries.
+      // Opt in via options.includeFlagged to see them (e.g. for audit/reaper paths).
+      if (!query.options?.includeFlagged) {
+        entries = entries.filter(e => !e.flag)
+      }
 
       // Apply KnowledgeQuery filters.
       if (query.filters?.userId) {

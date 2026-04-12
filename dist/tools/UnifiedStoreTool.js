@@ -281,4 +281,304 @@ export class UnifiedStoreTool {
     getRoutingStats() {
         return this.router.getRoutingStats();
     }
+    // ===========================================================================
+    // Corrective operations (kms_update / kms_delete / kms_supersede / kms_flag /
+    // kms_reap). These mutate or hide existing entries — the additive complement
+    // to `store`.
+    //
+    // Soft-delete model: kms_delete and kms_supersede flag entries rather than
+    // physically removing them. The reaper sweeps flagged entries older than 90
+    // days. The read path (unified_search and downstream context-injection) hides
+    // flagged entries by default; pass options.includeFlagged=true to see them.
+    // ===========================================================================
+    /**
+     * Update an existing entry by ID. Mutates content/metadata in place; bumps
+     * timestamp. NOT a flag operation — for "I was wrong" use supersede instead.
+     * Use update for genuine edits (typo fix, metadata correction, confidence
+     * adjustment).
+     *
+     * Calls SparrowDB and MongoDB. Mem0 is skipped — its memories are LLM-managed
+     * and re-extracted on next store, so direct edits don't make sense.
+     */
+    async update(args) {
+        const updates = {};
+        if (args.content !== undefined)
+            updates.content = args.content;
+        if (args.metadata !== undefined)
+            updates.metadata = args.metadata;
+        if (args.confidence !== undefined)
+            updates.confidence = args.confidence;
+        // Append the reason to metadata.update_history for audit trail.
+        if (args.reason) {
+            const history = updates.metadata?.update_history || [];
+            history.push({ at: new Date().toISOString(), reason: args.reason });
+            updates.metadata = { ...(updates.metadata || {}), update_history: history };
+        }
+        const backends = [];
+        if (typeof this.storage.neo4j.update === 'function') {
+            try {
+                const ok = await this.storage.neo4j.update(args.id, updates);
+                if (ok)
+                    backends.push('sparrowdb');
+            }
+            catch (e) {
+                console.warn('⚠️  unified_update SparrowDB error:', e);
+            }
+        }
+        try {
+            const ok = await this.storage.mongodb.update(args.id, updates);
+            if (ok)
+                backends.push('mongodb');
+        }
+        catch (e) {
+            console.warn('⚠️  unified_update MongoDB error:', e);
+        }
+        return {
+            success: backends.length > 0,
+            id: args.id,
+            backends,
+            reason: args.reason
+        };
+    }
+    /**
+     * Soft-delete: flag the entry as DELETED. Reversible until the reaper runs
+     * (90 days by default). Hidden from search by default.
+     *
+     * Use kms_supersede if there's a corrected replacement; use kms_delete only
+     * for noise (test entries, accidental stores, garbage).
+     */
+    async delete(args) {
+        return this.flag({
+            id: args.id,
+            flag: 'DELETED',
+            note: args.reason,
+            by: args.by
+        });
+    }
+    /**
+     * Mark an entry with an arbitrary flag without modifying its content.
+     * Pass `flag=null` to clear (un-retract).
+     *
+     * Used by kms_delete (DELETED), kms_supersede (SUPERSEDED), and direct
+     * flagging for RETRACTED/UNVERIFIED.
+     */
+    async flag(args) {
+        const backends = [];
+        if (typeof this.storage.neo4j.flag === 'function') {
+            try {
+                const ok = await this.storage.neo4j.flag(args.id, args.flag, args.note, args.by, args.superseded_by);
+                if (ok)
+                    backends.push('sparrowdb');
+            }
+            catch (e) {
+                console.warn('⚠️  unified_flag SparrowDB error:', e);
+            }
+        }
+        try {
+            const ok = await this.storage.mongodb.flag(args.id, args.flag, args.note, args.by, args.superseded_by);
+            if (ok)
+                backends.push('mongodb');
+        }
+        catch (e) {
+            console.warn('⚠️  unified_flag MongoDB error:', e);
+        }
+        // Mem0: best-effort delete on flag != null. Mem0 has no flag concept and
+        // its memories get re-extracted on next store; deleting prevents stale
+        // copies from leaking back through Mem0 search.
+        if (args.flag !== null) {
+            try {
+                await this.storage.mem0.deleteMemory(args.id);
+            }
+            catch (e) {
+                // Mem0 IDs don't always match unified IDs; non-fatal.
+                debug(`Mem0 delete on flag failed (non-fatal): ${e}`);
+            }
+        }
+        // Invalidate cache so the next read sees the flag.
+        // Search cache keys are hashed (kms:search:<hash>) and don't contain entry
+        // IDs, so we have to invalidate the whole search namespace. Knowledge cache
+        // entries that mention this ID also get cleared.
+        if (this.cache) {
+            try {
+                await this.cache.invalidate('kms:search:*');
+                await this.cache.invalidate(`*${args.id}*`);
+            }
+            catch { /* non-fatal */ }
+        }
+        return {
+            success: backends.length > 0,
+            id: args.id,
+            backends,
+            flag: args.flag,
+            reason: args.note
+        };
+    }
+    /**
+     * Atomic supersede: store a new entry, then flag the old one as SUPERSEDED
+     * with a back-link to the new entry. The new entry's metadata gets a forward
+     * link (`supersedes`) for bidirectional chain tracing.
+     *
+     * If the flag step fails, rolls back by hard-deleting the new entry to keep
+     * the operation atomic. Returns the new entry's ID on success.
+     */
+    async supersede(args) {
+        // Step 1: store the new entry (with forward-link to the old one)
+        const storeResult = await this.store({
+            content: args.new_content,
+            contentType: args.contentType,
+            source: args.source,
+            userId: args.userId,
+            confidence: args.confidence,
+            metadata: {
+                ...(args.metadata || {}),
+                supersedes: args.old_id,
+                supersede_reason: args.reason
+            }
+        });
+        if (!storeResult.success) {
+            return {
+                success: false,
+                old_id: args.old_id,
+                error: 'Failed to store new entry'
+            };
+        }
+        const new_id = storeResult.id;
+        // Step 2: flag the old entry as SUPERSEDED with back-link to the new one
+        const flagResult = await this.flag({
+            id: args.old_id,
+            flag: 'SUPERSEDED',
+            note: args.reason || `Superseded by ${new_id}`,
+            superseded_by: new_id
+        });
+        if (!flagResult.success) {
+            // Rollback: hard-delete the new entry so we don't leave a dangling replacement
+            console.warn(`⚠️  unified_supersede rollback: flag failed, deleting new entry ${new_id}`);
+            try {
+                if (typeof this.storage.neo4j.delete === 'function') {
+                    await this.storage.neo4j.delete(new_id);
+                }
+                await this.storage.mongodb.delete(new_id);
+                await this.storage.mem0.deleteMemory(new_id).catch(() => { });
+            }
+            catch (e) {
+                console.error('❌ unified_supersede rollback failed:', e);
+            }
+            return {
+                success: false,
+                old_id: args.old_id,
+                error: `Old entry ${args.old_id} not found — cannot supersede. New entry ${new_id} was rolled back.`
+            };
+        }
+        return {
+            success: true,
+            old_id: args.old_id,
+            new_id,
+            backends: flagResult.backends,
+            reason: args.reason
+        };
+    }
+    /**
+     * Reaper — find or hard-delete flagged entries older than `olderThanDays`.
+     * Defaults to 90 days, dry-run by default.
+     *
+     * dryRun=true (default): returns the list of candidates without deleting.
+     * dryRun=false: hard-deletes each candidate from all backends.
+     */
+    async reap(args) {
+        const olderThanDays = args.olderThanDays ?? 90;
+        const dryRun = args.dryRun !== false; // default true
+        const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+        // Collect candidates from each backend, deduplicated by ID
+        const candidatesById = new Map();
+        // SparrowDB candidates
+        if (typeof this.storage.neo4j.listFlagged === 'function') {
+            try {
+                const flagged = this.storage.neo4j.listFlagged();
+                for (const e of flagged) {
+                    if (e.flag_date && new Date(e.flag_date) < cutoff) {
+                        const existing = candidatesById.get(e.id);
+                        if (existing) {
+                            existing.backends_found.push('sparrowdb');
+                        }
+                        else {
+                            candidatesById.set(e.id, {
+                                id: e.id,
+                                flag: e.flag,
+                                flag_date: e.flag_date,
+                                flag_note: e.flag_note,
+                                backends_found: ['sparrowdb']
+                            });
+                        }
+                    }
+                }
+            }
+            catch (e) {
+                console.warn('⚠️  reap: SparrowDB listFlagged error:', e);
+            }
+        }
+        // MongoDB candidates
+        try {
+            const flagged = await this.storage.mongodb.listFlagged(cutoff);
+            for (const e of flagged) {
+                const existing = candidatesById.get(e.id);
+                if (existing) {
+                    existing.backends_found.push('mongodb');
+                }
+                else {
+                    candidatesById.set(e.id, {
+                        id: e.id,
+                        flag: String(e.flag),
+                        flag_date: e.flag_date instanceof Date ? e.flag_date.toISOString() : e.flag_date,
+                        flag_note: e.flag_note,
+                        backends_found: ['mongodb']
+                    });
+                }
+            }
+        }
+        catch (e) {
+            console.warn('⚠️  reap: MongoDB listFlagged error:', e);
+        }
+        const candidates = Array.from(candidatesById.values());
+        if (dryRun) {
+            return {
+                success: true,
+                olderThanDays,
+                dryRun: true,
+                candidates
+            };
+        }
+        // Apply deletions
+        const deleted = [];
+        for (const c of candidates) {
+            const backends = [];
+            if (typeof this.storage.neo4j.delete === 'function') {
+                try {
+                    const ok = await this.storage.neo4j.delete(c.id);
+                    if (ok)
+                        backends.push('sparrowdb');
+                }
+                catch (e) { /* logged below */ }
+            }
+            try {
+                const ok = await this.storage.mongodb.delete(c.id);
+                if (ok)
+                    backends.push('mongodb');
+            }
+            catch (e) { /* logged below */ }
+            try {
+                await this.storage.mem0.deleteMemory(c.id);
+                backends.push('mem0');
+            }
+            catch { /* mem0 IDs may not match — non-fatal */ }
+            deleted.push({ id: c.id, backends });
+            console.log(`🗑️  reap: hard-deleted ${c.id} (flag=${c.flag}, age>${olderThanDays}d) from [${backends.join(',')}]`);
+        }
+        return {
+            success: true,
+            olderThanDays,
+            dryRun: false,
+            candidates,
+            deleted
+        };
+    }
 }

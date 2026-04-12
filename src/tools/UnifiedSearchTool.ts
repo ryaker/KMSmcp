@@ -42,6 +42,7 @@ export class UnifiedSearchTool {
       includeRelationships?: boolean
       maxResults?: number
       cacheStrategy?: 'aggressive' | 'conservative' | 'realtime'
+      includeFlagged?: boolean
     }
   }): Promise<{
     query: string
@@ -89,6 +90,7 @@ export class UnifiedSearchTool {
         includeRelationships: true,
         maxResults: 10,
         cacheStrategy: 'conservative',
+        includeFlagged: false,
         ...args.options
       }
     }

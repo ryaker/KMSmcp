@@ -4,7 +4,7 @@
 
 import { MongoClient, Db, Collection } from 'mongodb'
 import { createHash } from 'node:crypto'
-import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
+import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig, KnowledgeFlag } from '../types/index.js'
 
 export interface StoredDocument {
   id: string
@@ -101,6 +101,12 @@ export class MongoDBStorage implements StorageSystem {
         }
       }
       
+      // Default: hide flagged (retracted/superseded/deleted) entries.
+      // Opt in via options.includeFlagged to see them (e.g. for audit/reaper).
+      if (!query.options?.includeFlagged) {
+        filter.flag = { $in: [null, undefined] }
+      }
+
       // Apply filters
       if (query.filters?.contentType) {
         filter.contentType = { $in: query.filters.contentType }
@@ -226,6 +232,58 @@ export class MongoDBStorage implements StorageSystem {
     } catch (error) {
       console.error('❌ MongoDB delete error:', error)
       return false
+    }
+  }
+
+  /**
+   * Flag an entry without modifying its content. Soft-delete primitive.
+   * Pass `flag=null` to clear the flag (un-retract).
+   */
+  async flag(
+    id: string,
+    flag: KnowledgeFlag | null,
+    note?: string,
+    by?: string,
+    superseded_by?: string
+  ): Promise<boolean> {
+    try {
+      const $set: any = { flag }
+      const $unset: any = {}
+      if (flag === null) {
+        $unset.flag_note = ''
+        $unset.flag_date = ''
+        $unset.flag_by = ''
+        $unset.superseded_by = ''
+      } else {
+        $set.flag_date = new Date()
+        if (note !== undefined) $set.flag_note = note
+        if (by !== undefined) $set.flag_by = by
+        if (superseded_by !== undefined) $set.superseded_by = superseded_by
+      }
+      const update: any = { $set }
+      if (Object.keys($unset).length > 0) update.$unset = $unset
+      const result = await this.collection.updateOne({ id }, update)
+      return result.matchedCount > 0
+    } catch (error) {
+      console.error('❌ MongoDB flag error:', error)
+      return false
+    }
+  }
+
+  /**
+   * List all flagged entries (any flag value, optionally older than a date).
+   * Used by the reaper to find candidates for hard-deletion.
+   */
+  async listFlagged(olderThan?: Date): Promise<UnifiedKnowledge[]> {
+    try {
+      const filter: any = { flag: { $nin: [null, undefined] } }
+      if (olderThan) {
+        filter.flag_date = { $lt: olderThan }
+      }
+      return await this.collection.find(filter).toArray() as UnifiedKnowledge[]
+    } catch (error) {
+      console.error('❌ MongoDB listFlagged error:', error)
+      return []
     }
   }
 
