@@ -107,6 +107,31 @@ describe('UnifiedStoreTool — corrective operations', () => {
       expect(result.success).toBe(false)
       expect(result.backends).toEqual([])
     })
+
+    it('supports reason-only update (no content/metadata/confidence) and records audit history', async () => {
+      const result = await tool.update({
+        id: 'abc-123',
+        reason: 'confidence recalibration pending new evidence'
+      })
+
+      // Should still call both backends
+      expect(graph.update).toHaveBeenCalled()
+      expect(mongo.update).toHaveBeenCalled()
+
+      // The merged updates object should ONLY have metadata.update_history — no
+      // content/confidence/explicit metadata fields. Verify via the call args.
+      const graphCall = graph.update.mock.calls[0]
+      expect(graphCall[0]).toBe('abc-123')
+      const updates = graphCall[1]
+      expect(updates).toHaveProperty('metadata.update_history')
+      expect(updates.metadata.update_history).toHaveLength(1)
+      expect(updates.metadata.update_history[0].reason).toBe('confidence recalibration pending new evidence')
+      expect(updates).not.toHaveProperty('content')
+      expect(updates).not.toHaveProperty('confidence')
+
+      expect(result.success).toBe(true)
+      expect(result.reason).toBe('confidence recalibration pending new evidence')
+    })
   })
 
   // -------------------------------------------------------------------------

@@ -348,7 +348,14 @@ export class SparrowDBStorage implements StorageSystem {
     this._saveSidecar()
 
     // Refresh graph node structural properties (id, contentType, source, userId, confidence).
-    // No-op if the structural fields didn't change, but cheap to always do.
+    // Must detach incident relationships first — SparrowDB's bare `DELETE k`
+    // errors if the node has relationships. Mirrors the detach pattern in
+    // delete() above.
+    try {
+      this.db.execute(
+        `MATCH (k:Knowledge {id: ${cypherStr(id)}})-[r]-() DELETE r`
+      )
+    } catch { /* may have no relationships */ }
     try {
       this.db.execute(
         `MATCH (k:Knowledge {id: ${cypherStr(id)}}) DELETE k`

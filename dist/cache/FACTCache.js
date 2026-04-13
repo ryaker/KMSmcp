@@ -110,14 +110,31 @@ export class FACTCache {
         }
     }
     /**
-     * Invalidate cache entries matching pattern
+     * Invalidate cache entries matching pattern.
+     *
+     * Pattern semantics: substring match with `*` as a wildcard boundary marker.
+     * Leading/trailing `*` are stripped before matching so both L1 (in-memory
+     * includes) and L2 (Redis glob) return the same set of keys. Example:
+     *   invalidate('kms:search:*') → matches keys containing 'kms:search:'
+     *   invalidate('*abc-123*')    → matches keys containing 'abc-123'
+     *   invalidate('kms:knowledge')→ matches keys containing 'kms:knowledge'
+     *
+     * BUG FIX 2026-04-12: previously L1 did `key.includes(pattern)` with the
+     * literal `*` still in the pattern, which never matched actual keys like
+     * `kms:search:<hash>`. L1 entries were silently not invalidated after
+     * flag/supersede/delete operations, so stale entries served from memory
+     * until TTL. Caught in PR #36 review.
      */
     async invalidate(pattern) {
         let invalidated = 0;
+        // Strip leading/trailing `*` so the substring match works consistently.
+        // L2 Redis path wraps in `*...*` anyway (substring match), so this aligns
+        // L1 with L2 behavior.
+        const bare = pattern.replace(/^\*+/, '').replace(/\*+$/, '');
         // Invalidate L1 (memory)
         const keys = Array.from(this.l1Cache.keys());
         keys.forEach(key => {
-            if (key.includes(pattern)) {
+            if (key.includes(bare)) {
                 this.l1Cache.delete(key);
                 invalidated++;
             }
@@ -125,7 +142,7 @@ export class FACTCache {
         // Invalidate L2 (Redis) - skip if unavailable
         if (this.l2Active && this.redis.status === 'ready') {
             try {
-                const redisKeys = await this.redis.keys(`*${pattern}*`);
+                const redisKeys = await this.redis.keys(`*${bare}*`);
                 if (redisKeys.length > 0) {
                     await this.redis.del(...redisKeys);
                     invalidated += redisKeys.length;

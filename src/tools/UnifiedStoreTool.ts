@@ -592,7 +592,10 @@ export class UnifiedStoreTool {
     })
 
     if (!flagResult.success) {
-      // Rollback: hard-delete the new entry so we don't leave a dangling replacement
+      // Rollback: hard-delete the new entry so we don't leave a dangling replacement.
+      // NOTE: flag() returns false for ANY backend failure, not just "not found".
+      // The error message below reflects this so agents can distinguish a
+      // truly missing ID from a transient backend failure and retry if needed.
       console.warn(`⚠️  unified_supersede rollback: flag failed, deleting new entry ${new_id}`)
       try {
         if (typeof (this.storage.neo4j as any).delete === 'function') {
@@ -606,7 +609,7 @@ export class UnifiedStoreTool {
       return {
         success: false,
         old_id: args.old_id,
-        error: `Old entry ${args.old_id} not found — cannot supersede. New entry ${new_id} was rolled back.`
+        error: `Flag step failed for ${args.old_id} (entry not found, or backend write error). New entry ${new_id} was rolled back — retry may succeed if this was transient.`
       }
     }
 
@@ -655,10 +658,14 @@ export class UnifiedStoreTool {
       backends_found: string[]
     }>()
 
-    // SparrowDB candidates
+    // SparrowDB candidates. `await` defensively — the current SparrowDB
+    // implementation is synchronous, but the `neo4j` slot is typed as
+    // GraphStorage and could hold an async listFlagged in the future.
+    // `await` on a non-Promise resolves to the value, so this is safe for
+    // both sync and async implementations.
     if (typeof (this.storage.neo4j as any).listFlagged === 'function') {
       try {
-        const flagged = (this.storage.neo4j as any).listFlagged() as Array<any>
+        const flagged = await (this.storage.neo4j as any).listFlagged() as Array<any>
         for (const e of flagged) {
           if (e.flag_date && new Date(e.flag_date) < cutoff) {
             const existing = candidatesById.get(e.id)
