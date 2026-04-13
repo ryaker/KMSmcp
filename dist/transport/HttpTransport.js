@@ -97,6 +97,32 @@ export class HttpTransport {
                 auth: 'tunnel-delegated'
             });
         });
+        // OAuth discovery stubs. This server does NOT implement MCP-client OAuth —
+        // auth is delegated to the transport layer (Cloudflare tunnel for the public
+        // endpoint, no auth for localhost). But MCP clients probe these well-known
+        // paths whenever a user clicks "Re-authenticate" in the UI (Claude Code does
+        // this unconditionally on reconnect). Without these stubs, Express returns
+        // its default HTML 404 body, which the MCP client tries to parse as JSON and
+        // crashes with "SyntaxError: Unrecognized token '<'". The stubs return a
+        // well-formed JSON 404/501 so the client's OAuth probe completes cleanly
+        // and falls back to unauthenticated connection.
+        const oauthNotSupported = (req, res) => {
+            res.status(404).json({
+                error: 'not_found',
+                error_description: 'This MCP server does not implement OAuth. Auth is delegated to the transport layer (Cloudflare tunnel or localhost). Connect without OAuth.',
+                mcp_auth: 'tunnel-delegated'
+            });
+        };
+        this.app.get('/.well-known/oauth-authorization-server', oauthNotSupported);
+        this.app.get('/.well-known/oauth-protected-resource', oauthNotSupported);
+        this.app.get('/.well-known/openid-configuration', oauthNotSupported);
+        this.app.post('/register', (req, res) => {
+            res.status(501).json({
+                error: 'registration_not_supported',
+                error_description: 'Dynamic client registration is not supported by this MCP server. Auth is tunnel-delegated — connect without OAuth.',
+                mcp_auth: 'tunnel-delegated'
+            });
+        });
         // MCP endpoints - No internal auth, trust the tunnel
         this.app.post('/mcp', this.handleMcpPostRequest.bind(this));
         this.app.get('/mcp', this.handleMcpGetRequest.bind(this));
