@@ -141,6 +141,59 @@ export class HttpTransport {
       })
     })
 
+    // OAuth discovery stubs. This server does NOT implement MCP-client OAuth —
+    // auth is delegated to the transport layer (Cloudflare tunnel for the public
+    // endpoint, no auth for localhost). But MCP clients probe these well-known
+    // paths whenever a user clicks "Re-authenticate" in the UI (Claude Code does
+    // this unconditionally on reconnect). Without these stubs, Express returns
+    // its default HTML 404 body, which the MCP client tries to parse as JSON and
+    // crashes with "SyntaxError: Unrecognized token '<'". The stubs return a
+    // well-formed JSON 404/501 so the client's OAuth probe completes cleanly
+    // and falls back to unauthenticated connection.
+    //
+    // Info-disclosure hardening: the detailed error_description and the
+    // `mcp_auth: "tunnel-delegated"` debug field ONLY ship on localhost
+    // requests. Public-facing responses (served through the kms.yaker.org
+    // Cloudflare tunnel to the internet) get a generic body that tells the
+    // client "no OAuth here" without advertising the auth architecture.
+    // An attacker who bypasses the tunnel shouldn't get a machine-readable
+    // signal that auth is delegated entirely to the transport layer.
+    const isLocalRequest = (req: Request): boolean => {
+      const h = req.hostname
+      return h === 'localhost' || h === '127.0.0.1' || h === '::1'
+    }
+    const oauthNotSupported = (req: Request, res: Response) => {
+      if (isLocalRequest(req)) {
+        res.status(404).json({
+          error: 'oauth_not_supported',
+          error_description: 'This MCP server does not implement OAuth. Auth is delegated to the transport layer (Cloudflare tunnel or localhost). Connect without OAuth.',
+          mcp_auth: 'tunnel-delegated'
+        })
+      } else {
+        res.status(404).json({
+          error: 'oauth_not_supported',
+          error_description: 'OAuth is not available on this endpoint.'
+        })
+      }
+    }
+    this.app.get('/.well-known/oauth-authorization-server', oauthNotSupported)
+    this.app.get('/.well-known/oauth-protected-resource', oauthNotSupported)
+    this.app.get('/.well-known/openid-configuration', oauthNotSupported)
+    this.app.post('/register', (req: Request, res: Response) => {
+      if (isLocalRequest(req)) {
+        res.status(501).json({
+          error: 'registration_not_supported',
+          error_description: 'Dynamic client registration is not supported by this MCP server. Auth is tunnel-delegated — connect without OAuth.',
+          mcp_auth: 'tunnel-delegated'
+        })
+      } else {
+        res.status(501).json({
+          error: 'registration_not_supported',
+          error_description: 'Dynamic client registration is not supported.'
+        })
+      }
+    })
+
     // MCP endpoints - No internal auth, trust the tunnel
     this.app.post('/mcp', this.handleMcpPostRequest.bind(this))
     this.app.get('/mcp', this.handleMcpGetRequest.bind(this))
