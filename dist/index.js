@@ -842,6 +842,21 @@ export class UnifiedKMSServer {
                     case 'document_search':
                         result = this.truncateSearchResult(await this.tools.documentStore.search(args));
                         break;
+                    case 'kms_update':
+                        result = await this.tools.store.update(args);
+                        break;
+                    case 'kms_delete':
+                        result = await this.tools.store.delete(args);
+                        break;
+                    case 'kms_supersede':
+                        result = await this.tools.store.supersede(args);
+                        break;
+                    case 'kms_flag':
+                        result = await this.tools.store.flag(args);
+                        break;
+                    case 'kms_reap':
+                        result = await this.tools.store.reap(args);
+                        break;
                     default:
                         throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
                 }
