@@ -131,6 +131,17 @@ export class MongoDBStorage implements StorageSystem {
           $lte: query.filters.timeRange.end
         }
       }
+      // Subject facet filter (DG-FACET-A). Pure pass-through against
+      // metadata.subject — stored verbatim by unified_store. String → exact;
+      // String[] → any-match via $in.
+      if (query.filters?.subject !== undefined) {
+        const subj = query.filters.subject
+        if (Array.isArray(subj)) {
+          if (subj.length > 0) filter['metadata.subject'] = { $in: subj }
+        } else {
+          filter['metadata.subject'] = subj
+        }
+      }
       
       const results = await this.collection
         .find(filter)

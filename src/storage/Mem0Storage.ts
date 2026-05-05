@@ -230,21 +230,28 @@ export class Mem0Storage implements StorageSystem {
 
   private buildMem0Filters(filters?: KnowledgeQuery['filters']): any {
     if (!filters) return {}
-    
+
     const mem0Filters: any = {}
-    
+
     if (filters.contentType) {
       mem0Filters.content_type = filters.contentType
     }
-    
+
     if (filters.source) {
       mem0Filters.source = filters.source
     }
-    
+
     if (filters.minConfidence) {
       mem0Filters.min_confidence = filters.minConfidence
     }
-    
+
+    // Subject facet (DG-FACET-A). Mem0 stores arbitrary fields under metadata.*
+    // when we pass them via options.metadata at store time (see store()), so
+    // filtering on `subject` here surfaces only entries with the matching facet.
+    if (filters.subject !== undefined) {
+      mem0Filters.subject = filters.subject
+    }
+
     return mem0Filters
   }
 
