@@ -1,6 +1,6 @@
 /**
  * Intelligent Storage Router
- * Graph backend (Neo4j or SparrowDB) + Mem0 always (knowledge graph + semantic layer).
+ * Graph backend (SparrowDB) + Mem0 always (knowledge graph + semantic layer).
  * MongoDB added only for structured/procedural/technical content.
  */
 
@@ -16,7 +16,7 @@ export class IntelligentStorageRouter {
    * Analyze knowledge and determine optimal storage strategy.
    *
    * Architecture:
-   *   primary  = neo4j   (knowledge graph — every fact becomes entities + edges)
+   *   primary  = graph   (knowledge graph — every fact becomes entities + edges)
    *   secondary[0] = mem0  (semantic layer — always present for episodic/semantic recall)
    *   secondary[1] = mongodb  (opt-in — only for procedural/technical/structured content)
    */
@@ -29,15 +29,15 @@ export class IntelligentStorageRouter {
 
     const addMongoDB = this.needsStructuredStorage(content, contentType, source)
 
-    const secondary: ('mem0' | 'neo4j' | 'mongodb')[] = ['mem0']
+    const secondary: ('mem0' | 'graph' | 'mongodb')[] = ['mem0']
     if (addMongoDB) secondary.push('mongodb')
 
     const reasoning = addMongoDB
-      ? 'Neo4j (knowledge graph) + Mem0 (semantic layer) + MongoDB (structured content)'
-      : 'Neo4j (knowledge graph) + Mem0 (semantic layer)'
+      ? 'Graph backend (knowledge graph) + Mem0 (semantic layer) + MongoDB (structured content)'
+      : 'Graph backend (knowledge graph) + Mem0 (semantic layer)'
 
     const decision: StorageDecision = {
-      primary: 'neo4j',
+      primary: 'graph',
       secondary,
       reasoning,
       cacheStrategy: this.determineCacheStrategy(knowledge)
@@ -104,8 +104,8 @@ export class IntelligentStorageRouter {
    */
   getRoutingStats(): Record<string, any> {
     return {
-      architecture: `${process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb' : 'neo4j'}+mem0 always, mongodb additive`,
-      baseline: ['neo4j', 'mem0'],
+      architecture: 'graph(sparrowdb)+mem0 always, mongodb additive',
+      baseline: ['graph', 'mem0'],
       mongodbTriggers: ['contentType=procedure', 'source=technical', 'MONGODB_PATTERN match']
     }
   }

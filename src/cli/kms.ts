@@ -154,7 +154,7 @@ async function getTools() {
   const entityLinker = new EntityLinker(ollama, graphBackend, mongodb)
   enrichmentQueue.setLinker(entityLinker)
 
-  const storage = { mongodb, neo4j: graphBackend, mem0 }
+  const storage = { mongodb, graph: graphBackend, mem0 }
 
   // CLI runs without Redis cache (null = no caching)
   _storeTool = new UnifiedStoreTool(router, storage, null, ollamaRouter, enrichmentQueue)

@@ -73,8 +73,8 @@ export interface UnifiedKnowledge {
 }
 
 export interface StorageDecision {
-  primary: 'mem0' | 'neo4j' | 'mongodb'
-  secondary?: ('mem0' | 'neo4j' | 'mongodb')[]
+  primary: 'mem0' | 'graph' | 'mongodb'
+  secondary?: ('mem0' | 'graph' | 'mongodb')[]
   reasoning: string
   cacheStrategy: 'L1' | 'L2' | 'L3' | 'skip'
 }
@@ -116,12 +116,12 @@ export interface StorageSystem {
 export interface RoutingRule {
   pattern: RegExp
   contentTypes: string[]
-  primary: 'mem0' | 'neo4j' | 'mongodb'
+  primary: 'mem0' | 'graph' | 'mongodb'
   reasoning: string
 }
 
 export type CacheLevel = 'L1' | 'L2' | 'L3' | 'skip'
-export type SystemName = 'mem0' | 'neo4j' | 'mongodb'
+export type SystemName = 'mem0' | 'graph' | 'mongodb'
 
 // Shared interfaces for graph storage backends (Neo4jStorage, SparrowDBStorage)
 export interface KnownPersonEntry {
@@ -140,7 +140,7 @@ export interface KnownPeopleConfig {
   nameIndex: Record<string, string>  // normalized name → canonical node id
 }
 
-// Graph storage backend interface — implemented by Neo4jStorage, SparrowDBStorage, ShadowStorage
+// Graph storage backend interface — implemented by SparrowDBStorage
 export interface GraphStorage extends StorageSystem {
   initialize(): Promise<void>
   close(): Promise<void>
@@ -163,8 +163,8 @@ export interface GraphStorage extends StorageSystem {
   }>>
   createAboutRelationships(sourceId: string, targetEntityIds: string[]): Promise<void>
   // Corrective operations — implemented by SparrowDBStorage. Optional on the
-  // interface for backwards compat with Neo4jStorage which is no longer in the
-  // hot path. Callers should check for the method before invoking.
+  // interface so future graph backends can omit them; callers should check for
+  // the method before invoking.
   delete?(id: string): Promise<boolean>
   update?(id: string, updates: Partial<UnifiedKnowledge>): Promise<boolean>
   flag?(

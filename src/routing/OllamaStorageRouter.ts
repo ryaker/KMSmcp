@@ -3,7 +3,7 @@ import { IntelligentStorageRouter } from './IntelligentStorageRouter.js'
 import { UnifiedKnowledge } from '../types/index.js'
 
 export interface RoutingDecision {
-  targets: Array<'mem0' | 'mongodb' | 'neo4j'>
+  targets: Array<'mem0' | 'mongodb' | 'graph'>
   contentType: string
   source: 'llm' | 'regex'
   confidence: number
@@ -26,8 +26,8 @@ export class OllamaStorageRouter {
 
       if (result !== null && result.confidence >= 0.6) {
         const { targets: rawTargets, contentType, confidence } = result
-        // Enforce baseline: neo4j + mem0 always present
-        const targetSet = new Set<'mem0' | 'mongodb' | 'neo4j'>(['neo4j', 'mem0', ...rawTargets])
+        // Enforce baseline: graph + mem0 always present
+        const targetSet = new Set<'mem0' | 'mongodb' | 'graph'>(['graph', 'mem0', ...rawTargets])
         const targets = Array.from(targetSet)
         console.log(
           `[OllamaStorageRouter] llm(confidence=${confidence.toFixed(2)}) → [${targets.join(', ')}]`
@@ -50,7 +50,7 @@ export class OllamaStorageRouter {
     const decision = this.fallback.determineStorage(knowledge)
 
     // Combine primary + secondary into a deduplicated targets array
-    const targetSet = new Set<'mem0' | 'mongodb' | 'neo4j'>([decision.primary])
+    const targetSet = new Set<'mem0' | 'mongodb' | 'graph'>([decision.primary])
     if (decision.secondary) {
       for (const s of decision.secondary) {
         targetSet.add(s)

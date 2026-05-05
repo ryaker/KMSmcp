@@ -190,8 +190,8 @@ export class UnifiedStoreTool {
             case 'mem0':
                 await this.storage.mem0.store(knowledge);
                 break;
-            case 'neo4j':
-                await this.storage.neo4j.store(knowledge);
+            case 'graph':
+                await this.storage.graph.store(knowledge);
                 break;
             case 'mongodb':
                 await this.storage.mongodb.store(knowledge);
@@ -330,9 +330,9 @@ export class UnifiedStoreTool {
         }
         updates.metadata = mergedMetadata;
         const backends = [];
-        if (typeof this.storage.neo4j.update === 'function') {
+        if (typeof this.storage.graph.update === 'function') {
             try {
-                const ok = await this.storage.neo4j.update(args.id, updates);
+                const ok = await this.storage.graph.update(args.id, updates);
                 if (ok)
                     backends.push('sparrowdb');
             }
@@ -388,9 +388,9 @@ export class UnifiedStoreTool {
      */
     async flag(args) {
         const backends = [];
-        if (typeof this.storage.neo4j.flag === 'function') {
+        if (typeof this.storage.graph.flag === 'function') {
             try {
-                const ok = await this.storage.neo4j.flag(args.id, args.flag, args.note, args.by, args.superseded_by);
+                const ok = await this.storage.graph.flag(args.id, args.flag, args.note, args.by, args.superseded_by);
                 if (ok)
                     backends.push('sparrowdb');
             }
@@ -475,9 +475,9 @@ export class UnifiedStoreTool {
         const flagNote = args.reason || `Superseded by ${new_id}`;
         const flaggedBackends = [];
         const failedBackends = [];
-        if (typeof this.storage.neo4j.flag === 'function') {
+        if (typeof this.storage.graph.flag === 'function') {
             try {
-                const ok = await this.storage.neo4j.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
+                const ok = await this.storage.graph.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
                 if (ok)
                     flaggedBackends.push('sparrowdb');
                 else
@@ -512,15 +512,15 @@ export class UnifiedStoreTool {
             // replacement. Surface the real failure reason for the caller.
             console.warn(`⚠️  unified_supersede rollback: flag failed on [${failedBackends.join(', ')}], deleting new entry ${new_id}`);
             try {
-                if (typeof this.storage.neo4j.delete === 'function') {
-                    await this.storage.neo4j.delete(new_id);
+                if (typeof this.storage.graph.delete === 'function') {
+                    await this.storage.graph.delete(new_id);
                 }
                 await this.storage.mongodb.delete(new_id);
                 await this.storage.mem0.deleteMemory(new_id).catch(() => { });
                 // Undo any flag that did succeed so backends stay in sync.
                 for (const backend of flaggedBackends) {
-                    if (backend === 'sparrowdb' && typeof this.storage.neo4j.flag === 'function') {
-                        await this.storage.neo4j.flag(args.old_id, null).catch(() => { });
+                    if (backend === 'sparrowdb' && typeof this.storage.graph.flag === 'function') {
+                        await this.storage.graph.flag(args.old_id, null).catch(() => { });
                     }
                     else if (backend === 'mongodb') {
                         await this.storage.mongodb.flag(args.old_id, null).catch(() => { });
@@ -562,9 +562,9 @@ export class UnifiedStoreTool {
         // GraphStorage and could hold an async listFlagged in the future.
         // `await` on a non-Promise resolves to the value, so this is safe for
         // both sync and async implementations.
-        if (typeof this.storage.neo4j.listFlagged === 'function') {
+        if (typeof this.storage.graph.listFlagged === 'function') {
             try {
-                const flagged = await this.storage.neo4j.listFlagged();
+                const flagged = await this.storage.graph.listFlagged();
                 for (const e of flagged) {
                     if (e.flag_date && new Date(e.flag_date) < cutoff) {
                         const existing = candidatesById.get(e.id);
@@ -622,9 +622,9 @@ export class UnifiedStoreTool {
         const deleted = [];
         for (const c of candidates) {
             const backends = [];
-            if (typeof this.storage.neo4j.delete === 'function') {
+            if (typeof this.storage.graph.delete === 'function') {
                 try {
-                    const ok = await this.storage.neo4j.delete(c.id);
+                    const ok = await this.storage.graph.delete(c.id);
                     if (ok)
                         backends.push('sparrowdb');
                 }

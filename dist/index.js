@@ -107,14 +107,14 @@ export class UnifiedKMSServer {
                 : 'Neo4j';
         this.storage = {
             mongodb: new MongoDBStorage(this.config.mongodb),
-            neo4j: graphBackend,
+            graph: graphBackend,
             mem0: new Mem0Storage(this.config.mem0)
         };
         // Initialize all storage systems in parallel
         console.log('📊 Initializing Storage Systems...');
         const storageResults = await Promise.allSettled([
             this.storage.mongodb.initialize(),
-            this.storage.neo4j.initialize(),
+            this.storage.graph.initialize(),
             this.storage.mem0.initialize()
         ]);
         // Log initialization results
@@ -136,7 +136,7 @@ export class UnifiedKMSServer {
         const ollamaRouter = new OllamaStorageRouter(ollamaInference, this.router);
         // Enrichment pipeline — linker injected after storage is ready
         const enrichmentQueue = new EnrichmentQueue(null);
-        const entityLinker = new EntityLinker(ollamaInference, this.storage.neo4j, this.storage.mongodb);
+        const entityLinker = new EntityLinker(ollamaInference, this.storage.graph, this.storage.mongodb);
         enrichmentQueue.setLinker(entityLinker);
         // Step 4: Initialize tools
         console.log('🛠️  Initializing Tools...');
@@ -887,12 +887,12 @@ export class UnifiedKMSServer {
         const [cacheStats, mongoStats, graphStats, mem0Stats] = await Promise.allSettled([
             this.factCache ? this.factCache.getStats() : Promise.resolve({ disabled: true }),
             this.storage.mongodb.getStats(),
-            this.storage.neo4j.getStats(),
+            this.storage.graph.getStats(),
             this.storage.mem0.getStats()
         ]);
-        const graphKey = process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb'
-            : process.env.KMS_SHADOW_MODE === 'true' ? 'shadow'
-                : 'neo4j';
+        // Slot label is now `graph`. The actual implementation name (sparrowdb,
+        // neo4j fallback, shadow) is reported via storage.<impl>.name when needed.
+        const graphKey = 'graph';
         const analytics = {
             timestamp: new Date().toISOString(),
             cache: cacheStats.status === 'fulfilled' ? cacheStats.value : { error: cacheStats.reason },
@@ -958,11 +958,9 @@ export class UnifiedKMSServer {
             cache: {}
         };
         // Graph backend: get real node count to prove connectivity
-        const graphKey = process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb'
-            : process.env.KMS_SHADOW_MODE === 'true' ? 'shadow'
-                : 'neo4j';
+        const graphKey = 'graph';
         try {
-            const stats = await this.storage.neo4j.getStats();
+            const stats = await this.storage.graph.getStats();
             if (stats.status === 'error') {
                 result.datastores[graphKey] = stats;
             }
@@ -1136,7 +1134,7 @@ export class UnifiedKMSServer {
         }
         const promises = [
             this.storage.mongodb.close(),
-            this.storage.neo4j.close(),
+            this.storage.graph.close(),
             this.storage.mem0.close(),
             this.redis.quit()
         ];

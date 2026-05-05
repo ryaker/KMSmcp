@@ -8,7 +8,7 @@ import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
 import { EnrichmentQueue } from '../inference/EnrichmentQueue.js'
 import { FACTCache } from '../cache/FACTCache.js'
-import { MongoDBStorage, Neo4jStorage, Mem0Storage } from '../storage/index.js'
+import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
 import type { GraphStorage } from '../types/index.js'
 import { ContentInference } from '../inference/ContentInference.js'
 
@@ -18,7 +18,7 @@ export class UnifiedStoreTool {
   private router: IntelligentStorageRouter
   private storage: {
     mongodb: MongoDBStorage
-    neo4j: GraphStorage
+    graph: GraphStorage
     mem0: Mem0Storage
   }
   private cache: FACTCache
@@ -27,7 +27,7 @@ export class UnifiedStoreTool {
 
   constructor(
     router: IntelligentStorageRouter,
-    storage: { mongodb: MongoDBStorage, neo4j: GraphStorage, mem0: Mem0Storage },
+    storage: { mongodb: MongoDBStorage, graph: GraphStorage, mem0: Mem0Storage },
     cache: FACTCache | null,
     ollamaRouter?: OllamaStorageRouter | null,
     enrichmentQueue?: EnrichmentQueue | null
@@ -197,7 +197,7 @@ export class UnifiedStoreTool {
 
       // Queue enrichment once for the primary system (same content — no need to repeat per secondary)
       if (this.enrichmentQueue) {
-        this.enrichmentQueue.add(knowledge.id, knowledge.content, primarySystem as 'mongodb' | 'mem0' | 'neo4j')
+        this.enrichmentQueue.add(knowledge.id, knowledge.content, primarySystem as 'mongodb' | 'mem0' | 'graph')
       }
       
       const storageTime = Date.now() - storageStartTime
@@ -266,8 +266,8 @@ export class UnifiedStoreTool {
       case 'mem0':
         await this.storage.mem0.store(knowledge)
         break
-      case 'neo4j':
-        await this.storage.neo4j.store(knowledge)
+      case 'graph':
+        await this.storage.graph.store(knowledge)
         break
       case 'mongodb':
         await this.storage.mongodb.store(knowledge)
@@ -437,9 +437,9 @@ export class UnifiedStoreTool {
 
     const backends: string[] = []
 
-    if (typeof (this.storage.neo4j as any).update === 'function') {
+    if (typeof (this.storage.graph as any).update === 'function') {
       try {
-        const ok = await (this.storage.neo4j as any).update(args.id, updates)
+        const ok = await (this.storage.graph as any).update(args.id, updates)
         if (ok) backends.push('sparrowdb')
       } catch (e) {
         console.warn('⚠️  unified_update SparrowDB error:', e)
@@ -506,9 +506,9 @@ export class UnifiedStoreTool {
   }): Promise<{ success: boolean; id: string; backends: string[]; flag: KnowledgeFlag | null; reason?: string }> {
     const backends: string[] = []
 
-    if (typeof (this.storage.neo4j as any).flag === 'function') {
+    if (typeof (this.storage.graph as any).flag === 'function') {
       try {
-        const ok = await (this.storage.neo4j as any).flag(
+        const ok = await (this.storage.graph as any).flag(
           args.id, args.flag, args.note, args.by, args.superseded_by
         )
         if (ok) backends.push('sparrowdb')
@@ -616,9 +616,9 @@ export class UnifiedStoreTool {
     const flaggedBackends: string[] = []
     const failedBackends: string[] = []
 
-    if (typeof (this.storage.neo4j as any).flag === 'function') {
+    if (typeof (this.storage.graph as any).flag === 'function') {
       try {
-        const ok = await (this.storage.neo4j as any).flag(
+        const ok = await (this.storage.graph as any).flag(
           args.old_id, 'SUPERSEDED', flagNote, undefined, new_id
         )
         if (ok) flaggedBackends.push('sparrowdb')
@@ -653,15 +653,15 @@ export class UnifiedStoreTool {
       // replacement. Surface the real failure reason for the caller.
       console.warn(`⚠️  unified_supersede rollback: flag failed on [${failedBackends.join(', ')}], deleting new entry ${new_id}`)
       try {
-        if (typeof (this.storage.neo4j as any).delete === 'function') {
-          await (this.storage.neo4j as any).delete(new_id)
+        if (typeof (this.storage.graph as any).delete === 'function') {
+          await (this.storage.graph as any).delete(new_id)
         }
         await this.storage.mongodb.delete(new_id)
         await this.storage.mem0.deleteMemory(new_id).catch(() => {})
         // Undo any flag that did succeed so backends stay in sync.
         for (const backend of flaggedBackends) {
-          if (backend === 'sparrowdb' && typeof (this.storage.neo4j as any).flag === 'function') {
-            await (this.storage.neo4j as any).flag(args.old_id, null).catch(() => {})
+          if (backend === 'sparrowdb' && typeof (this.storage.graph as any).flag === 'function') {
+            await (this.storage.graph as any).flag(args.old_id, null).catch(() => {})
           } else if (backend === 'mongodb') {
             await this.storage.mongodb.flag(args.old_id, null).catch(() => {})
           }
@@ -726,9 +726,9 @@ export class UnifiedStoreTool {
     // GraphStorage and could hold an async listFlagged in the future.
     // `await` on a non-Promise resolves to the value, so this is safe for
     // both sync and async implementations.
-    if (typeof (this.storage.neo4j as any).listFlagged === 'function') {
+    if (typeof (this.storage.graph as any).listFlagged === 'function') {
       try {
-        const flagged = await (this.storage.neo4j as any).listFlagged() as Array<any>
+        const flagged = await (this.storage.graph as any).listFlagged() as Array<any>
         for (const e of flagged) {
           if (e.flag_date && new Date(e.flag_date) < cutoff) {
             const existing = candidatesById.get(e.id)
@@ -786,9 +786,9 @@ export class UnifiedStoreTool {
     const deleted: Array<{ id: string; backends: string[] }> = []
     for (const c of candidates) {
       const backends: string[] = []
-      if (typeof (this.storage.neo4j as any).delete === 'function') {
+      if (typeof (this.storage.graph as any).delete === 'function') {
         try {
-          const ok = await (this.storage.neo4j as any).delete(c.id)
+          const ok = await (this.storage.graph as any).delete(c.id)
           if (ok) backends.push('sparrowdb')
         } catch (e) { /* logged below */ }
       }
