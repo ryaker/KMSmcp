@@ -531,10 +531,20 @@ export class SparrowDBStorage implements StorageSystem {
       )
       const totalNodes = Number(nodeResult.rows[0]?.['count(n)'] ?? 0)
 
-      const relResult = this.db.execute(
-        `MATCH ()-[r]->() RETURN count(r) AS cnt`
-      )
-      const totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0)
+      // SparrowDB 0.1.22 binding regression: MATCH ()-[r]->() RETURN count(r)
+      // throws "not found" / GenericFailure even when relationships exist. Until the
+      // upstream fix lands, default to 0 and don't propagate the error — node count
+      // is the more important figure and rel count can be reconstructed from the
+      // sidecar if needed.
+      let totalRelationships = 0
+      try {
+        const relResult = this.db.execute(
+          `MATCH ()-[r]->() RETURN count(r) AS cnt`
+        )
+        totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0)
+      } catch (relErr) {
+        logger.warn('⚠️ SparrowDB rel-count query failed (binding regression — defaulting to 0):', relErr)
+      }
 
       // Content type distribution from sidecar (authoritative — SparrowDB strings truncated).
       const contentTypes: Record<string, number> = {}

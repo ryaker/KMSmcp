@@ -83,19 +83,19 @@ export class Mem0Storage {
             const userId = this.generateUserIdFromQuery(query);
             console.log(`🧠 [Mem0Storage.search] Using user ID: ${userId}`);
             const searchQuery = query.query;
-            // v3: user_id MUST live inside filters (top-level entity params now rejected by SDK).
+            // Mem0 v1 endpoint expects user_id at TOP LEVEL of payload, not nested under filters.
+            // (Earlier comment claimed v3 SDK rejected top-level entity params — that was wrong;
+            // the SDK has no such throw, and v1 search rejects the request unless one of
+            // {user_id, agent_id, app_id, run_id} is present at body root.)
             const searchOptions = {
+                user_id: userId,
                 topK: query.options?.maxResults || 10,
-                filters: {
-                    user_id: userId,
-                    ...this.buildMem0Filters(query.filters)
-                }
+                filters: this.buildMem0Filters(query.filters)
             };
             console.log(`🧠 [Mem0Storage.search] Search query: "${searchQuery}"`);
             console.log(`🧠 [Mem0Storage.search] Search options:`, JSON.stringify(searchOptions, null, 2));
-            // v3 search returns { results: Memory[] } (wrapped) instead of Memory[].
             const response = await this.client.search(searchQuery, searchOptions);
-            const results = response?.results ?? [];
+            const results = Array.isArray(response) ? response : (response?.results ?? []);
             const processedResults = results.map((r) => ({
                 id: r.id || r.metadata?.kms_id,
                 content: r.memory || '',
@@ -105,7 +105,7 @@ export class Mem0Storage {
                 timestamp: r.metadata?.timestamp ? new Date(r.metadata.timestamp) : new Date(),
                 contentType: r.metadata?.content_type,
                 source: r.metadata?.source,
-                userId: r.userId
+                userId: r.userId ?? r.user_id
             }));
             console.log(`🧠 Mem0 found ${processedResults.length} results`);
             return processedResults;
@@ -122,11 +122,13 @@ export class Mem0Storage {
             const userId = this.config.defaultUserId || 'personal';
             const page = await this.client.getAll({
                 page: 1,
-                pageSize: 1,
-                filters: { user_id: userId }
+                page_size: 1,
+                user_id: userId
             });
+            // Paginated response: { count, next, previous, results }. Bare array fallback for non-paginated.
+            const totalMemories = (Array.isArray(page) ? page.length : page?.count) ?? 'unknown';
             return {
-                totalMemories: page?.count ?? 'unknown',
+                totalMemories,
                 userId,
                 status: 'connected',
                 apiEndpoint: 'Mem0 Cloud (v3)'
@@ -143,20 +145,25 @@ export class Mem0Storage {
     }
     async getMemoriesForUser(userId, limit = 50) {
         try {
-            // v3: the 1.x `get({ user_id, limit })` overload moved to `getAll(options)`.
-            // user_id must go inside filters; limit becomes pageSize.
             const page = await this.client.getAll({
-                pageSize: limit,
-                filters: { user_id: userId }
+                page: 1,
+                page_size: limit,
+                user_id: userId
             });
-            const memories = page?.results ?? [];
-            return memories.map((m) => ({
-                id: m.id,
-                content: m.memory,
-                metadata: m.metadata,
-                createdAt: m.createdAt ? new Date(m.createdAt) : undefined,
-                updatedAt: m.updatedAt ? new Date(m.updatedAt) : undefined
-            }));
+            // getAll runtime shape varies (bare array vs { results: [...], count }).
+            const memList = Array.isArray(page) ? page : (page?.results ?? []);
+            return memList.map((m) => {
+                const created = m.createdAt ?? m.created_at;
+                const updated = m.updatedAt ?? m.updated_at;
+                return {
+                    id: m.id,
+                    content: m.memory,
+                    metadata: m.metadata,
+                    userId: m.userId ?? m.user_id,
+                    createdAt: created ? new Date(created) : undefined,
+                    updatedAt: updated ? new Date(updated) : undefined
+                };
+            });
         }
         catch (error) {
             console.error('❌ Mem0 getMemoriesForUser error:', error);
@@ -245,15 +252,15 @@ export class Mem0Storage {
         try {
             console.log(`🧪 [Mem0Storage.testDirectSearch] Testing direct search for: "${query}" with user: ${userId}`);
             const searchQuery = query;
-            // v3: user_id must live in filters (top-level entity params now rejected).
+            // Mem0 v1 search expects user_id at top level of payload (see Mem0Storage.search above).
             const searchOptions = {
-                topK: 10,
-                filters: { user_id: userId }
+                user_id: userId,
+                topK: 10
             };
             console.log(`🧪 [Mem0Storage.testDirectSearch] Search query: "${searchQuery}"`);
             console.log(`🧪 [Mem0Storage.testDirectSearch] Search options:`, JSON.stringify(searchOptions, null, 2));
             const response = await this.client.search(searchQuery, searchOptions);
-            const results = response?.results ?? [];
+            const results = Array.isArray(response) ? response : (response?.results ?? []);
             console.log(`🧪 [Mem0Storage.testDirectSearch] Raw results:`, JSON.stringify(results, null, 2));
             return {
                 success: true,
