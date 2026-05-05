@@ -44,6 +44,13 @@ echo "🦀 Building sparrowdb-node (cargo + .d.ts) from: $SPARROW_DIR"
     --cargo-cwd ../../crates/sparrowdb-node \
     --cargo-name sparrowdb_node)
 
+# napi-rs 2.18.4 PascalCase-converts struct `SparrowDB` to `SparrowDb` in factory
+# return types. The class declaration is correct (`SparrowDB`), but
+# `static open(...): SparrowDb` references an undefined symbol → TS compile
+# fails for consumers. Repair on every regen until upstream napi-rs lands a fix.
+# perl (not BSD sed) for portable \b word boundary.
+perl -i -pe 's/\bSparrowDb\b/SparrowDB/g' "$SPARROW_DIR/npm/sparrowdb/index.d.ts"
+
 # napi emits index.<platform>.node — find it and normalize to sparrowdb.node.
 NATIVE_OUT=$(ls "$SPARROW_DIR/npm/sparrowdb/"index.*.node 2>/dev/null | head -1)
 if [[ -z "$NATIVE_OUT" ]]; then
