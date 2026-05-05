@@ -113,7 +113,7 @@ export class Mem0Storage implements StorageSystem {
 
       const processedResults = results.map((r: Memory) => ({
         id: r.id || r.metadata?.kms_id,
-        content: r.memory,
+        content: r.memory || '',
         confidence: r.score || r.metadata?.confidence || 0.5,
         metadata: r.metadata || {},
         sourceSystem: 'mem0',
@@ -171,8 +171,8 @@ export class Mem0Storage implements StorageSystem {
         id: m.id,
         content: m.memory,
         metadata: m.metadata,
-        createdAt: m.createdAt,
-        updatedAt: m.updatedAt
+        createdAt: m.createdAt ? new Date(m.createdAt) : undefined,
+        updatedAt: m.updatedAt ? new Date(m.updatedAt) : undefined
       }))
     } catch (error) {
       console.error('❌ Mem0 getMemoriesForUser error:', error)

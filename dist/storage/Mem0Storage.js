@@ -98,7 +98,7 @@ export class Mem0Storage {
             const results = response?.results ?? [];
             const processedResults = results.map((r) => ({
                 id: r.id || r.metadata?.kms_id,
-                content: r.memory,
+                content: r.memory || '',
                 confidence: r.score || r.metadata?.confidence || 0.5,
                 metadata: r.metadata || {},
                 sourceSystem: 'mem0',
@@ -154,8 +154,8 @@ export class Mem0Storage {
                 id: m.id,
                 content: m.memory,
                 metadata: m.metadata,
-                createdAt: m.createdAt,
-                updatedAt: m.updatedAt
+                createdAt: m.createdAt ? new Date(m.createdAt) : undefined,
+                updatedAt: m.updatedAt ? new Date(m.updatedAt) : undefined
             }));
         }
         catch (error) {
