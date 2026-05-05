@@ -212,6 +212,12 @@ export class Mem0Storage {
         if (filters.minConfidence) {
             mem0Filters.min_confidence = filters.minConfidence;
         }
+        // Subject facet (DG-FACET-A). Mem0 stores arbitrary fields under metadata.*
+        // when we pass them via options.metadata at store time (see store()), so
+        // filtering on `subject` here surfaces only entries with the matching facet.
+        if (filters.subject !== undefined) {
+            mem0Filters.subject = filters.subject;
+        }
         return mem0Filters;
     }
     getKnownUserIds() {
