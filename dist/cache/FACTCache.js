@@ -139,13 +139,23 @@ export class FACTCache {
                 invalidated++;
             }
         });
-        // Invalidate L2 (Redis) - skip if unavailable
+        // Invalidate L2 (Redis) - skip if unavailable.
+        // Uses SCAN iteration (non-blocking, O(N) spread across many small calls)
+        // instead of KEYS (blocking O(N)). Deletes with UNLINK (async, non-blocking).
         if (this.l2Active && this.redis.status === 'ready') {
             try {
-                const redisKeys = await this.redis.keys(`*${bare}*`);
-                if (redisKeys.length > 0) {
-                    await this.redis.del(...redisKeys);
-                    invalidated += redisKeys.length;
+                const matchPattern = `*${bare}*`;
+                const toDelete = [];
+                let cursor = '0';
+                do {
+                    const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', matchPattern, 'COUNT', 100);
+                    cursor = nextCursor;
+                    if (keys.length > 0)
+                        toDelete.push(...keys);
+                } while (cursor !== '0');
+                if (toDelete.length > 0) {
+                    await this.redis.unlink(...toDelete);
+                    invalidated += toDelete.length;
                 }
             }
             catch (error) {
