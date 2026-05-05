@@ -130,15 +130,12 @@ async function getTools() {
   const mongodb = new MongoDBStorage(cfg.mongodb)
   const mem0 = new Mem0Storage(cfg.mem0)
 
-  // Honour KMS_STORAGE_BACKEND=sparrowdb — same logic as index.ts
-  let graphBackend: GraphStorage
-  if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
-    const sparrowPath = process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'
-    console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
-    graphBackend = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
-  } else {
-    graphBackend = new Neo4jStorage(cfg.neo4j)
-  }
+  // Graph backend: SparrowDB (default — embedded, no Aura latency).
+  // KMS_STORAGE_BACKEND env var is now a no-op kept for backwards compat;
+  // SparrowDB is the only graph backend after the cutover.
+  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
+  const graphBackend: GraphStorage = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
 
   await Promise.allSettled([
     mongodb.initialize(),
