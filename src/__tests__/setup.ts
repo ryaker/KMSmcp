@@ -7,9 +7,6 @@ process.env.NODE_ENV = 'test'
 process.env.MEM0_API_KEY = 'test-mem0-key'
 process.env.MONGODB_URI = 'mongodb://localhost:27017'
 process.env.MONGODB_DATABASE = 'test_unified_kms'
-process.env.NEO4J_URI = 'bolt://localhost:7687'
-process.env.NEO4J_USERNAME = 'neo4j'
-process.env.NEO4J_PASSWORD = 'test-password'
 process.env.REDIS_URI = 'redis://localhost:6379'
 
 // Increase timeout for integration tests
@@ -56,11 +53,6 @@ global.testUtils = {
     mongodb: {
       uri: process.env.MONGODB_URI!,
       database: process.env.MONGODB_DATABASE!
-    },
-    neo4j: {
-      uri: process.env.NEO4J_URI!,
-      username: process.env.NEO4J_USERNAME!,
-      password: process.env.NEO4J_PASSWORD!
     },
     mem0: {
       apiKey: process.env.MEM0_API_KEY!,

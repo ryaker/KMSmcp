@@ -29,7 +29,6 @@ import { join } from 'node:path'
 
 const require = createRequire(import.meta.url)
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
-import { Neo4jStorage } from '../storage/Neo4jStorage.js'
 import type { GraphStorage } from '../types/index.js'
 import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
@@ -96,12 +95,6 @@ function buildConfig() {
       uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
       database: process.env.MONGODB_DATABASE || 'kms'
     },
-    neo4j: {
-      uri: process.env.NEO4J_URI || 'bolt://localhost:7687',
-      username: process.env.NEO4J_USERNAME || 'neo4j',
-      password: process.env.NEO4J_PASSWORD || '',
-      database: process.env.NEO4J_DATABASE
-    },
     mem0: {
       apiKey: process.env.MEM0_API_KEY || '',
       orgId: process.env.MEM0_ORG_ID,
@@ -161,9 +154,9 @@ async function getTools() {
 }
 
 async function teardown() {
-  // Neo4j driver needs explicit close
+  // SparrowDB closes on process exit; nothing to do here.
   if (_storeTool) {
-    // Access via internal storage reference if needed — driver closes on GC in most cases
+    // Access via internal storage reference if needed.
   }
 }
 
@@ -246,6 +239,8 @@ async function cmdSearch(args: string[]) {
 async function cmdPing() {
   const cfg = buildConfig()
 
+  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+
   const checks = await Promise.allSettled([
     (async () => {
       const m = new MongoDBStorage(cfg.mongodb)
@@ -254,10 +249,10 @@ async function cmdPing() {
       return { system: 'mongodb', ok: true, stats }
     })(),
     (async () => {
-      const n = new Neo4jStorage(cfg.neo4j)
-      await n.initialize()
-      const stats = await n.getStats()
-      return { system: 'neo4j', ok: true, stats }
+      const g = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
+      await g.initialize()
+      const stats = await g.getStats()
+      return { system: 'graph', ok: true, stats }
     })(),
     (async () => {
       const me = new Mem0Storage(cfg.mem0)

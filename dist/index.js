@@ -1139,12 +1139,6 @@ async function main() {
             uri: process.env.MONGODB_ATLAS_URI || process.env.MONGODB_URI || 'mongodb://localhost:27017',
             database: process.env.MONGODB_DATABASE || 'unified_kms'
         },
-        neo4j: {
-            uri: process.env.NEO4J_AURA_URI || process.env.NEO4J_URI || 'bolt://localhost:7687',
-            username: process.env.NEO4J_AURA_USERNAME || process.env.NEO4J_USERNAME || 'neo4j',
-            password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || (() => { throw new Error('NEO4J_AURA_PASSWORD or NEO4J_PASSWORD must be set'); })(),
-            database: process.env.NEO4J_AURA_DATABASE || process.env.NEO4J_DATABASE
-        },
         mem0: {
             apiKey: process.env.MEM0_API_KEY,
             orgId: process.env.MEM0_ORG_ID,

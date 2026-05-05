@@ -8,7 +8,7 @@ import { KMSConfig } from '../types/index.js'
 // Mock all external dependencies
 jest.mock('ioredis')
 jest.mock('../storage/MongoDBStorage.js')
-jest.mock('../storage/Neo4jStorage.js')
+jest.mock('../storage/SparrowDBStorage.js')
 jest.mock('../storage/Mem0Storage.js')
 jest.mock('../transport/HttpTransport.js')
 
@@ -21,11 +21,6 @@ describe('UnifiedKMSServer Integration', () => {
       mongodb: {
         uri: 'mongodb://localhost:27017',
         database: 'test_kms'
-      },
-      neo4j: {
-        uri: 'bolt://localhost:7687',
-        username: 'neo4j',
-        password: 'password'
       },
       mem0: {
         apiKey: 'test-mem0-key',
@@ -65,7 +60,7 @@ describe('UnifiedKMSServer Integration', () => {
 
     // Apply mocks
     require('../storage/MongoDBStorage.js').MongoDBStorage.mockImplementation(() => mockStorage)
-    require('../storage/Neo4jStorage.js').Neo4jStorage.mockImplementation(() => mockStorage)
+    require('../storage/SparrowDBStorage.js').SparrowDBStorage.mockImplementation(() => mockStorage)
     require('../storage/Mem0Storage.js').Mem0Storage.mockImplementation(() => mockStorage)
     require('ioredis').default.mockImplementation(() => mockRedis)
   })

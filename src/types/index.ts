@@ -9,12 +9,6 @@ export interface KMSConfig {
     uri: string
     database: string
   }
-  neo4j: {
-    uri: string
-    username: string
-    password: string
-    database?: string
-  }
   mem0: {
     apiKey: string
     orgId?: string
@@ -123,7 +117,7 @@ export interface RoutingRule {
 export type CacheLevel = 'L1' | 'L2' | 'L3' | 'skip'
 export type SystemName = 'mem0' | 'graph' | 'mongodb'
 
-// Shared interfaces for graph storage backends (Neo4jStorage, SparrowDBStorage)
+// Shared interfaces for graph storage backends (SparrowDBStorage)
 export interface KnownPersonEntry {
   canonical: string
   allNames: string[]
