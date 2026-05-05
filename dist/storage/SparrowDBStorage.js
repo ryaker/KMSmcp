@@ -347,6 +347,19 @@ export class SparrowDBStorage {
                 const min = query.filters.minConfidence;
                 entries = entries.filter(e => e.confidence >= min);
             }
+            // Subject facet filter (DG-FACET-A). Pure pass-through against
+            // metadata.subject. String → exact; String[] → any-match.
+            if (query.filters?.subject !== undefined) {
+                const wanted = Array.isArray(query.filters.subject)
+                    ? query.filters.subject
+                    : [query.filters.subject];
+                if (wanted.length > 0) {
+                    entries = entries.filter(e => {
+                        const s = e.metadata?.subject;
+                        return typeof s === 'string' && wanted.includes(s);
+                    });
+                }
+            }
             // Score by term hits in content.
             const scored = entries
                 .map(e => {

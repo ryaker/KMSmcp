@@ -37,6 +37,9 @@ export class UnifiedSearchTool {
       source?: string[]
       userId?: string
       minConfidence?: number
+      // Subject facet (DG-FACET-A). Pure pass-through against metadata.subject.
+      // String → exact match. String[] → match any. See KnowledgeQuery type.
+      subject?: string | string[]
     }
     options?: {
       includeRelationships?: boolean

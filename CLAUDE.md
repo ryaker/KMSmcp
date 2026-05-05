@@ -127,6 +127,26 @@ kms_supersede({
 // Now unified_search returns only the corrected version by default.
 ```
 
+### Tag high-traffic entries with `metadata.subject` (DG-FACET-A)
+
+For long-running projects (Phoenix, L16, Rich's preferences, etc.), include an explicit `metadata.subject` facet on every `unified_store` call. The subject is a dotted path that names the *specific* fact, not the broad topic — `Phoenix.camera_count`, `L16.distribution_model`, `Rich.preferences.communication_style`. Stored verbatim, no transformation.
+
+Why it matters: subject is a first-class search filter (`unified_search({filters: {subject: "Phoenix.camera_count"}})`) so you can pull the chain of supersedes/updates for one specific fact without scrolling through every entry that mentions Phoenix. The upcoming dedup gate (DG-T1-B) uses subject to scope its similarity check, so subject-tagged entries get cleaner dedup behavior than entries that share only a broad topic.
+
+Naming convention: `Project.fact_name` or `Person.preferences.facet`. Reuse the same subject every time you write about that fact — that's how supersede chains stay queryable.
+
+```json
+{
+  "content": "Phoenix camera count is 6 per the Mar-2026 calibration session",
+  "contentType": "fact",
+  "metadata": { "subject": "Phoenix.camera_count" }
+}
+// Later, search just this fact's chain:
+// unified_search({ query: "phoenix cameras", filters: { subject: "Phoenix.camera_count" } })
+```
+
+When in doubt, omit subject — pure pass-through, no validation. But for any fact you expect to update or supersede later, set it.
+
 ## Best Practices
 
 ### Search First, Store Smart

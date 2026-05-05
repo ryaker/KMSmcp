@@ -394,7 +394,7 @@ export class UnifiedKMSServer {
                         },
                         metadata: {
                             type: 'object',
-                            description: 'OPTIONAL - Additional context. Auto-enhanced with detected project, language, frameworks, and temporal context'
+                            description: 'OPTIONAL - Additional context. Auto-enhanced with detected project, language, frameworks, and temporal context. RECOMMENDED for high-traffic projects: include `subject` as a dotted facet path (e.g. "Phoenix.camera_count", "L16.distribution_model", "Rich.preferences.communication_style"). The subject facet narrows future dedup/search and lets the upcoming dedup gate (DG-T1-B) match candidates O(1) instead of fanning across all entries on the same broad topic.'
                         },
                         confidence: {
                             type: 'number',
@@ -451,6 +451,13 @@ export class UnifiedKMSServer {
                                     minimum: 0,
                                     maximum: 1,
                                     description: 'Minimum confidence threshold'
+                                },
+                                subject: {
+                                    oneOf: [
+                                        { type: 'string' },
+                                        { type: 'array', items: { type: 'string' } }
+                                    ],
+                                    description: 'OPTIONAL — filter by metadata.subject facet (e.g. "Phoenix.camera_count"). String → exact match. Array → match any. Pure pass-through; matches the value the caller stored verbatim. Useful for narrowing to a specific topic before scanning broad content (e.g. all entries about Phoenix camera count, not all entries mentioning Phoenix).'
                                 }
                             },
                             description: 'Search filters'

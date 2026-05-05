@@ -81,6 +81,14 @@ export interface KnowledgeQuery {
     userId?: string
     timeRange?: { start: Date, end: Date }
     minConfidence?: number
+    // First-class facet filter (DG-FACET-A). Matches against metadata.subject,
+    // typically a dotted path like "Phoenix.camera_count" or
+    // "Rich.preferences.communication_style". Used by the upcoming dedup gate
+    // (DG-T1-B) to narrow candidate search before vector similarity, and by
+    // callers who want O(1) filtering on a known facet without LLM extraction.
+    // String → exact match. String[] → match any. Subject is a pure
+    // pass-through field: stored verbatim, no normalization.
+    subject?: string | string[]
   }
   options?: {
     includeRelationships?: boolean
