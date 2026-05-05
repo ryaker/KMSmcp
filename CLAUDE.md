@@ -2,7 +2,7 @@
 
 ## Overview
 
-This unified KMS MCP provides intelligent multi-dimensional memory storage and retrieval across Mem0, Neo4j, and MongoDB. Unlike siloed tools, this unified interface allows Claude to naturally store and retrieve knowledge that spans multiple datastores simultaneously.
+This unified KMS MCP provides intelligent multi-dimensional memory storage and retrieval across Mem0, SparrowDB (graph), and MongoDB. Unlike siloed tools, this unified interface allows Claude to naturally store and retrieve knowledge that spans multiple datastores simultaneously.
 
 ## Core Principle: Multi-Dimensional Memory
 
@@ -10,7 +10,7 @@ Memory is multi-dimensional and multi-modal. Rich information naturally has mult
 
 **Example: "Client responds really well to morning sessions and visualization techniques"**
 - **Memory/Preference** (Mem0): Client behavior patterns, personal responses
-- **Effectiveness Relationships** (Neo4j): Morning sessions ↔ Client engagement, Visualization ↔ Technique effectiveness  
+- **Effectiveness Relationships** (SparrowDB / graph): Morning sessions ↔ Client engagement, Visualization ↔ Technique effectiveness
 - **Structured Data** (MongoDB): Session scheduling data, technique metadata, outcome tracking
 
 ## Tools Available
@@ -82,12 +82,12 @@ When storing rich information, consider multiple aspects:
 
 **Technical breakthrough:** "Finally solved OAuth issue by updating JWKS endpoint"
 - **Mem0**: Personal breakthrough experience, problem-solving journey
-- **Neo4j**: OAuth → JWKS → Authentication → Problem solving relationships
+- **SparrowDB (graph)**: OAuth → JWKS → Authentication → Problem solving relationships
 - **MongoDB**: Technical solution details, configuration updates, troubleshooting steps
 
 **Client insight:** "Morning meditation helps client focus during difficult conversations"
 - **Mem0**: Client behavior pattern, personal response
-- **Neo4j**: Meditation → Focus → Difficult conversations → Coping strategies  
+- **SparrowDB (graph)**: Meditation → Focus → Difficult conversations → Coping strategies
 - **MongoDB**: Session notes, timing data, technique effectiveness metrics
 
 ### 5. Positive Reinforcement Loop
@@ -175,7 +175,7 @@ kms_supersede({
 ## Datastore Strengths
 
 **Mem0**: Personal experiences, preferences, episodic memories, user behavior patterns
-**Neo4j**: Concept relationships, technique effectiveness, causal connections, knowledge graphs  
+**SparrowDB (graph)**: Concept relationships, technique effectiveness, causal connections, knowledge graphs (embedded; replaced Neo4j Aura in the SparrowDB cutover — `storage.graph` slot, `storageDecision.primary: "graph"`)
 **MongoDB**: Structured data, configurations, session notes, quantitative tracking
 
 ## Implementation Goals
