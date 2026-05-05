@@ -3,7 +3,7 @@
  */
 
 import crypto from 'crypto'
-import { UnifiedKnowledge, StorageDecision, SystemName } from '../types/index.js'
+import { UnifiedKnowledge, StorageDecision, SystemName, KnowledgeFlag } from '../types/index.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
 import { EnrichmentQueue } from '../inference/EnrichmentQueue.js'
@@ -379,5 +379,437 @@ export class UnifiedStoreTool {
    */
   getRoutingStats(): Record<string, any> {
     return this.router.getRoutingStats()
+  }
+
+  // ===========================================================================
+  // Corrective operations (kms_update / kms_delete / kms_supersede / kms_flag /
+  // kms_reap). These mutate or hide existing entries — the additive complement
+  // to `store`.
+  //
+  // Soft-delete model: kms_delete and kms_supersede flag entries rather than
+  // physically removing them. The reaper sweeps flagged entries older than 90
+  // days. The read path (unified_search and downstream context-injection) hides
+  // flagged entries by default; pass options.includeFlagged=true to see them.
+  // ===========================================================================
+
+  /**
+   * Update an existing entry by ID. Mutates content/metadata in place; bumps
+   * timestamp. NOT a flag operation — for "I was wrong" use supersede instead.
+   * Use update for genuine edits (typo fix, metadata correction, confidence
+   * adjustment).
+   *
+   * Calls SparrowDB and MongoDB. Mem0 is skipped — its memories are LLM-managed
+   * and re-extracted on next store, so direct edits don't make sense.
+   */
+  async update(args: {
+    id: string
+    content?: string
+    metadata?: Record<string, any>
+    confidence?: number
+    reason?: string
+  }): Promise<{ success: boolean; id: string; backends: string[]; reason?: string }> {
+    const updates: Partial<UnifiedKnowledge> = {}
+    if (args.content !== undefined) updates.content = args.content
+    if (args.confidence !== undefined) updates.confidence = args.confidence
+
+    // Fetch existing record so we can merge metadata instead of overwriting it.
+    // This prevents $set from dropping existing metadata keys and prior
+    // update_history entries that the caller did not include in args.metadata.
+    let existingMetadata: Record<string, any> = {}
+    try {
+      const existing = await this.storage.mongodb.findById(args.id)
+      if (existing?.metadata) existingMetadata = existing.metadata as Record<string, any>
+    } catch (e) {
+      console.warn('⚠️  unified_update: could not fetch existing metadata for merge (non-fatal):', e)
+    }
+
+    // Merge: existing metadata base, then caller-supplied overrides, then
+    // append the new audit entry to update_history (preserving prior entries).
+    const mergedMetadata: Record<string, any> = {
+      ...existingMetadata,
+      ...(args.metadata || {})
+    }
+    if (args.reason) {
+      const prior = Array.isArray(mergedMetadata.update_history) ? mergedMetadata.update_history : []
+      mergedMetadata.update_history = [...prior, { at: new Date().toISOString(), reason: args.reason }]
+    }
+    updates.metadata = mergedMetadata
+
+    const backends: string[] = []
+
+    if (typeof (this.storage.neo4j as any).update === 'function') {
+      try {
+        const ok = await (this.storage.neo4j as any).update(args.id, updates)
+        if (ok) backends.push('sparrowdb')
+      } catch (e) {
+        console.warn('⚠️  unified_update SparrowDB error:', e)
+      }
+    }
+
+    try {
+      const ok = await this.storage.mongodb.update(args.id, updates)
+      if (ok) backends.push('mongodb')
+    } catch (e) {
+      console.warn('⚠️  unified_update MongoDB error:', e)
+    }
+
+    // Invalidate cache after any successful backend update so stale search
+    // results and knowledge cache entries don't serve pre-update content.
+    if (backends.length > 0 && this.cache) {
+      try {
+        await this.cache.invalidate('kms:search:*')
+        await this.cache.invalidate(`*${args.id}*`)
+      } catch { /* non-fatal */ }
+    }
+
+    return {
+      success: backends.length > 0,
+      id: args.id,
+      backends,
+      reason: args.reason
+    }
+  }
+
+  /**
+   * Soft-delete: flag the entry as DELETED. Reversible until the reaper runs
+   * (90 days by default). Hidden from search by default.
+   *
+   * Use kms_supersede if there's a corrected replacement; use kms_delete only
+   * for noise (test entries, accidental stores, garbage).
+   */
+  async delete(args: {
+    id: string
+    reason?: string
+    by?: string
+  }): Promise<{ success: boolean; id: string; backends: string[]; flag: KnowledgeFlag | null; reason?: string }> {
+    return this.flag({
+      id: args.id,
+      flag: 'DELETED',
+      note: args.reason,
+      by: args.by
+    })
+  }
+
+  /**
+   * Mark an entry with an arbitrary flag without modifying its content.
+   * Pass `flag=null` to clear (un-retract).
+   *
+   * Used by kms_delete (DELETED), kms_supersede (SUPERSEDED), and direct
+   * flagging for RETRACTED/UNVERIFIED.
+   */
+  async flag(args: {
+    id: string
+    flag: KnowledgeFlag | null
+    note?: string
+    by?: string
+    superseded_by?: string
+  }): Promise<{ success: boolean; id: string; backends: string[]; flag: KnowledgeFlag | null; reason?: string }> {
+    const backends: string[] = []
+
+    if (typeof (this.storage.neo4j as any).flag === 'function') {
+      try {
+        const ok = await (this.storage.neo4j as any).flag(
+          args.id, args.flag, args.note, args.by, args.superseded_by
+        )
+        if (ok) backends.push('sparrowdb')
+      } catch (e) {
+        console.warn('⚠️  unified_flag SparrowDB error:', e)
+      }
+    }
+
+    try {
+      const ok = await this.storage.mongodb.flag(
+        args.id, args.flag, args.note, args.by, args.superseded_by
+      )
+      if (ok) backends.push('mongodb')
+    } catch (e) {
+      console.warn('⚠️  unified_flag MongoDB error:', e)
+    }
+
+    // Mem0: best-effort delete on flag != null. Mem0 has no flag concept and
+    // its memories get re-extracted on next store; deleting prevents stale
+    // copies from leaking back through Mem0 search.
+    if (args.flag !== null) {
+      try {
+        await this.storage.mem0.deleteMemory(args.id)
+      } catch (e) {
+        // Mem0 IDs don't always match unified IDs; non-fatal.
+        debug(`Mem0 delete on flag failed (non-fatal): ${e}`)
+      }
+    }
+
+    // Invalidate cache so the next read sees the flag.
+    // Search cache keys are hashed (kms:search:<hash>) and don't contain entry
+    // IDs, so we have to invalidate the whole search namespace. Knowledge cache
+    // entries that mention this ID also get cleared.
+    if (this.cache) {
+      try {
+        await this.cache.invalidate('kms:search:*')
+        await this.cache.invalidate(`*${args.id}*`)
+      } catch { /* non-fatal */ }
+    }
+
+    return {
+      success: backends.length > 0,
+      id: args.id,
+      backends,
+      flag: args.flag,
+      reason: args.note
+    }
+  }
+
+  /**
+   * Atomic supersede: store a new entry, then flag the old one as SUPERSEDED
+   * with a back-link to the new entry. The new entry's metadata gets a forward
+   * link (`supersedes`) for bidirectional chain tracing.
+   *
+   * If the flag step fails, rolls back by hard-deleting the new entry to keep
+   * the operation atomic. Returns the new entry's ID on success.
+   */
+  async supersede(args: {
+    old_id: string
+    new_content: string
+    contentType?: 'memory' | 'insight' | 'pattern' | 'relationship' | 'fact' | 'procedure'
+    source?: 'personal' | 'technical' | 'cross_domain'
+    userId?: string
+    metadata?: Record<string, any>
+    confidence?: number
+    reason?: string
+  }): Promise<{
+    success: boolean
+    old_id: string
+    new_id?: string
+    backends?: string[]
+    reason?: string
+    error?: string
+  }> {
+    // Step 1: store the new entry (with forward-link to the old one)
+    const storeResult = await this.store({
+      content: args.new_content,
+      contentType: args.contentType,
+      source: args.source,
+      userId: args.userId,
+      confidence: args.confidence,
+      metadata: {
+        ...(args.metadata || {}),
+        supersedes: args.old_id,
+        supersede_reason: args.reason
+      }
+    })
+
+    if (!storeResult.success) {
+      return {
+        success: false,
+        old_id: args.old_id,
+        error: 'Failed to store new entry'
+      }
+    }
+
+    const new_id = storeResult.id
+
+    // Step 2: flag the old entry as SUPERSEDED with back-link to the new one.
+    // Each required backend is called individually so we can detect partial
+    // failures — flag() returns success=true if ANY backend succeeded, which
+    // would leave the old entry live in the graph if SparrowDB succeeded but
+    // MongoDB failed (or vice-versa). We require ALL present backends to succeed.
+    const flagNote = args.reason || `Superseded by ${new_id}`
+    const flaggedBackends: string[] = []
+    const failedBackends: string[] = []
+
+    if (typeof (this.storage.neo4j as any).flag === 'function') {
+      try {
+        const ok = await (this.storage.neo4j as any).flag(
+          args.old_id, 'SUPERSEDED', flagNote, undefined, new_id
+        )
+        if (ok) flaggedBackends.push('sparrowdb')
+        else failedBackends.push('sparrowdb')
+      } catch (e) {
+        failedBackends.push('sparrowdb')
+        console.warn(`⚠️  unified_supersede SparrowDB flag error:`, e)
+      }
+    }
+
+    try {
+      const ok = await this.storage.mongodb.flag(
+        args.old_id, 'SUPERSEDED', flagNote, undefined, new_id
+      )
+      if (ok) flaggedBackends.push('mongodb')
+      else failedBackends.push('mongodb')
+    } catch (e) {
+      failedBackends.push('mongodb')
+      console.warn(`⚠️  unified_supersede MongoDB flag error:`, e)
+    }
+
+    // Invalidate cache after flagging (mirrors flag() behavior).
+    if (this.cache) {
+      try {
+        await this.cache.invalidate('kms:search:*')
+        await this.cache.invalidate(`*${args.old_id}*`)
+      } catch { /* non-fatal */ }
+    }
+
+    if (failedBackends.length > 0) {
+      // Rollback: hard-delete the new entry so we don't leave a dangling
+      // replacement. Surface the real failure reason for the caller.
+      console.warn(`⚠️  unified_supersede rollback: flag failed on [${failedBackends.join(', ')}], deleting new entry ${new_id}`)
+      try {
+        if (typeof (this.storage.neo4j as any).delete === 'function') {
+          await (this.storage.neo4j as any).delete(new_id)
+        }
+        await this.storage.mongodb.delete(new_id)
+        await this.storage.mem0.deleteMemory(new_id).catch(() => {})
+        // Undo any flag that did succeed so backends stay in sync.
+        for (const backend of flaggedBackends) {
+          if (backend === 'sparrowdb' && typeof (this.storage.neo4j as any).flag === 'function') {
+            await (this.storage.neo4j as any).flag(args.old_id, null).catch(() => {})
+          } else if (backend === 'mongodb') {
+            await this.storage.mongodb.flag(args.old_id, null).catch(() => {})
+          }
+        }
+      } catch (e) {
+        console.error('❌ unified_supersede rollback failed:', e)
+      }
+      return {
+        success: false,
+        old_id: args.old_id,
+        error: `Flag step failed on backend(s): [${failedBackends.join(', ')}] for entry ${args.old_id} (entry not found or backend write error). New entry ${new_id} was rolled back — retry may succeed if this was transient.`
+      }
+    }
+
+    return {
+      success: true,
+      old_id: args.old_id,
+      new_id,
+      backends: flaggedBackends,
+      reason: args.reason
+    }
+  }
+
+  /**
+   * Reaper — find or hard-delete flagged entries older than `olderThanDays`.
+   * Defaults to 90 days, dry-run by default.
+   *
+   * dryRun=true (default): returns the list of candidates without deleting.
+   * dryRun=false: hard-deletes each candidate from all backends.
+   */
+  async reap(args: {
+    olderThanDays?: number
+    dryRun?: boolean
+  }): Promise<{
+    success: boolean
+    olderThanDays: number
+    dryRun: boolean
+    candidates: Array<{
+      id: string
+      flag: string
+      flag_date?: string
+      flag_note?: string
+      backends_found: string[]
+    }>
+    deleted?: Array<{ id: string; backends: string[] }>
+  }> {
+    const olderThanDays = args.olderThanDays ?? 90
+    const dryRun = args.dryRun !== false  // default true
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
+
+    // Collect candidates from each backend, deduplicated by ID
+    const candidatesById = new Map<string, {
+      id: string
+      flag: string
+      flag_date?: string
+      flag_note?: string
+      backends_found: string[]
+    }>()
+
+    // SparrowDB candidates. `await` defensively — the current SparrowDB
+    // implementation is synchronous, but the `neo4j` slot is typed as
+    // GraphStorage and could hold an async listFlagged in the future.
+    // `await` on a non-Promise resolves to the value, so this is safe for
+    // both sync and async implementations.
+    if (typeof (this.storage.neo4j as any).listFlagged === 'function') {
+      try {
+        const flagged = await (this.storage.neo4j as any).listFlagged() as Array<any>
+        for (const e of flagged) {
+          if (e.flag_date && new Date(e.flag_date) < cutoff) {
+            const existing = candidatesById.get(e.id)
+            if (existing) {
+              existing.backends_found.push('sparrowdb')
+            } else {
+              candidatesById.set(e.id, {
+                id: e.id,
+                flag: e.flag,
+                flag_date: e.flag_date,
+                flag_note: e.flag_note,
+                backends_found: ['sparrowdb']
+              })
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️  reap: SparrowDB listFlagged error:', e)
+      }
+    }
+
+    // MongoDB candidates
+    try {
+      const flagged = await this.storage.mongodb.listFlagged(cutoff)
+      for (const e of flagged) {
+        const existing = candidatesById.get(e.id)
+        if (existing) {
+          existing.backends_found.push('mongodb')
+        } else {
+          candidatesById.set(e.id, {
+            id: e.id,
+            flag: String(e.flag),
+            flag_date: e.flag_date instanceof Date ? e.flag_date.toISOString() : (e.flag_date as any),
+            flag_note: e.flag_note,
+            backends_found: ['mongodb']
+          })
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️  reap: MongoDB listFlagged error:', e)
+    }
+
+    const candidates = Array.from(candidatesById.values())
+
+    if (dryRun) {
+      return {
+        success: true,
+        olderThanDays,
+        dryRun: true,
+        candidates
+      }
+    }
+
+    // Apply deletions
+    const deleted: Array<{ id: string; backends: string[] }> = []
+    for (const c of candidates) {
+      const backends: string[] = []
+      if (typeof (this.storage.neo4j as any).delete === 'function') {
+        try {
+          const ok = await (this.storage.neo4j as any).delete(c.id)
+          if (ok) backends.push('sparrowdb')
+        } catch (e) { /* logged below */ }
+      }
+      try {
+        const ok = await this.storage.mongodb.delete(c.id)
+        if (ok) backends.push('mongodb')
+      } catch (e) { /* logged below */ }
+      try {
+        await this.storage.mem0.deleteMemory(c.id)
+        backends.push('mem0')
+      } catch { /* mem0 IDs may not match — non-fatal */ }
+      deleted.push({ id: c.id, backends })
+      console.log(`🗑️  reap: hard-deleted ${c.id} (flag=${c.flag}, age>${olderThanDays}d) from [${backends.join(',')}]`)
+    }
+
+    return {
+      success: true,
+      olderThanDays,
+      dryRun: false,
+      candidates,
+      deleted
+    }
   }
 }

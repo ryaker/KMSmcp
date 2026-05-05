@@ -422,6 +422,29 @@ export class UnifiedKMSServer {
         result = this.truncateSearchResult(await this.tools.documentStore.search(args as any))
         break
 
+      case 'kms_update':
+        result = await this.tools.store.update(args)
+        break
+
+      case 'kms_delete':
+        result = await this.tools.store.delete(args)
+        break
+
+      case 'kms_supersede':
+        if (authContext.user?.id && !args.userId) {
+          args.userId = authContext.user.id
+        }
+        result = await this.tools.store.supersede(args)
+        break
+
+      case 'kms_flag':
+        result = await this.tools.store.flag(args)
+        break
+
+      case 'kms_reap':
+        result = await this.tools.store.reap(args)
+        break
+
       default:
         throw new Error(`Tool ${name} not found`)
     }
@@ -445,7 +468,7 @@ export class UnifiedKMSServer {
     return [
       {
         name: 'unified_store',
-        description: 'Store knowledge with AI-powered inference. Just provide content - the system intelligently detects type, project, tags, and relationships. Examples: "Fixed OAuth bug with JWKS endpoint", "Realized morning sessions work best", "Always use TypeScript strict mode"',
+        description: 'Store NEW knowledge with AI-powered inference. Just provide content - the system intelligently detects type, project, tags, and relationships. Examples: "Fixed OAuth bug with JWKS endpoint", "Realized morning sessions work best", "Always use TypeScript strict mode". ⚠️ CORRECTING A PREVIOUS FACT? Do NOT call unified_store again — that leaves the wrong entry poisoning context. Use kms_supersede(old_id, new_content, reason) instead. See kms_instructions for the full correction guide.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -544,11 +567,16 @@ export class UnifiedKMSServer {
                   maximum: 100,
                   description: 'Maximum number of results'
                 },
-                cacheStrategy: { 
-                  type: 'string', 
+                cacheStrategy: {
+                  type: 'string',
                   enum: ['aggressive', 'conservative', 'realtime'],
                   default: 'conservative',
                   description: 'Caching strategy for results'
+                },
+                includeFlagged: {
+                  type: 'boolean',
+                  default: false,
+                  description: 'OPTIONAL — when true, also returns entries that have been flagged (retracted/superseded/deleted). Defaults to false so default search hides corrections.'
                 }
               },
               description: 'Search options'
@@ -759,6 +787,89 @@ export class UnifiedKMSServer {
           },
           required: ['query']
         }
+      },
+      {
+        name: 'kms_update',
+        description: 'Update an existing KMS entry by ID — mutate content, metadata, or confidence in place. Use for genuine edits (typo fix, metadata correction, confidence adjustment). NOT for retraction — use kms_supersede when correcting a wrong fact with a new one. Bumps the timestamp and appends the reason to metadata.update_history for audit.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Entry ID to update' },
+            content: { type: 'string', description: 'OPTIONAL — new content' },
+            metadata: { type: 'object', description: 'OPTIONAL — fields to merge into existing metadata' },
+            confidence: { type: 'number', minimum: 0, maximum: 1, description: 'OPTIONAL — new confidence score' },
+            reason: { type: 'string', description: 'Why this update is being made (recorded in audit history)' }
+          },
+          required: ['id', 'reason']
+        }
+      },
+      {
+        name: 'kms_delete',
+        description: 'Soft-delete a KMS entry by ID — flags it as DELETED and hides it from search. Reversible for 90 days via kms_flag(id, null). After 90 days the reaper hard-deletes. Use only for noise (test entries, accidental stores, garbage). For wrong facts that have a corrected replacement, use kms_supersede instead.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Entry ID to delete' },
+            reason: { type: 'string', description: 'Why this entry is being deleted (audit trail)' },
+            by: { type: 'string', description: 'OPTIONAL — who/what initiated the delete' }
+          },
+          required: ['id', 'reason']
+        }
+      },
+      {
+        name: 'kms_supersede',
+        description: 'Atomic replace: store a new entry and flag the old one as SUPERSEDED with a back-link. The new entry gets a forward-link in metadata.supersedes for chain tracing. Use this whenever correcting a wrong stored fact — preserves the audit trail (the mistake is data too) while preventing the wrong entry from leaking into search. Atomic: if the flag step fails, the new entry is rolled back.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            old_id: { type: 'string', description: 'ID of the entry being superseded (corrected)' },
+            new_content: { type: 'string', description: 'The corrected/replacement content' },
+            contentType: {
+              type: 'string',
+              enum: ['memory', 'insight', 'pattern', 'relationship', 'fact', 'procedure'],
+              description: 'OPTIONAL — auto-detected if not provided'
+            },
+            source: {
+              type: 'string',
+              enum: ['personal', 'technical', 'cross_domain'],
+              description: 'OPTIONAL — auto-detected if not provided'
+            },
+            userId: { type: 'string', description: 'OPTIONAL — defaults to current user context' },
+            metadata: { type: 'object', description: 'OPTIONAL — extra metadata for the new entry' },
+            confidence: { type: 'number', minimum: 0, maximum: 1, description: 'OPTIONAL — confidence of the new content' },
+            reason: { type: 'string', description: 'Why the old entry was wrong (recorded on both entries)' }
+          },
+          required: ['old_id', 'new_content', 'reason']
+        }
+      },
+      {
+        name: 'kms_flag',
+        description: 'Mark an entry with a flag without modifying its content. Use for partial corrections (RETRACTED, UNVERIFIED) where the original text should remain visible in audit but should be hidden from default reads. Pass flag=null to clear and restore visibility.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Entry ID to flag' },
+            flag: {
+              type: ['string', 'null'],
+              enum: ['RETRACTED', 'SUPERSEDED', 'DELETED', 'UNVERIFIED', null],
+              description: 'Flag value, or null to clear'
+            },
+            note: { type: 'string', description: 'OPTIONAL — explanation' },
+            by: { type: 'string', description: 'OPTIONAL — who/what set the flag' }
+          },
+          required: ['id', 'flag']
+        }
+      },
+      {
+        name: 'kms_reap',
+        description: 'Find or hard-delete flagged entries older than the threshold (default 90 days). DRY-RUN BY DEFAULT — pass dryRun=false to actually delete. Use to clean up the soft-deleted graveyard once entries are past the reversibility window. Returns the list of candidates and (when applied) the per-backend deletion results.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            olderThanDays: { type: 'integer', minimum: 1, default: 90, description: 'Reap flagged entries older than N days (default 90)' },
+            dryRun: { type: 'boolean', default: true, description: 'When true (default), returns candidates without deleting. Set false to apply.' }
+          }
+        }
       }
     ]
   }
@@ -826,6 +937,26 @@ export class UnifiedKMSServer {
 
           case 'document_search':
             result = this.truncateSearchResult(await this.tools.documentStore.search(args as any))
+            break
+
+          case 'kms_update':
+            result = await this.tools.store.update(args as any)
+            break
+
+          case 'kms_delete':
+            result = await this.tools.store.delete(args as any)
+            break
+
+          case 'kms_supersede':
+            result = await this.tools.store.supersede(args as any)
+            break
+
+          case 'kms_flag':
+            result = await this.tools.store.flag(args as any)
+            break
+
+          case 'kms_reap':
+            result = await this.tools.store.reap(args as any)
             break
 
           default:
