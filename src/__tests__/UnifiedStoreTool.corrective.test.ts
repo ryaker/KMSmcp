@@ -100,6 +100,56 @@ describe('UnifiedStoreTool — corrective operations', () => {
       expect(mem0.deleteMemory).not.toHaveBeenCalled()
     })
 
+    it('merges existing metadata so prior keys are not overwritten by $set', async () => {
+      // Simulate an existing document with metadata that the caller does not
+      // include in args.metadata — these keys must survive the update.
+      mongo.findById = jest.fn().mockResolvedValue({
+        id: 'abc-123',
+        metadata: {
+          tags: ['existing-tag'],
+          update_history: [{ at: '2026-01-01T00:00:00.000Z', reason: 'initial store' }]
+        }
+      })
+
+      const result = await tool.update({
+        id: 'abc-123',
+        metadata: { priority: 'high' },
+        reason: 'add priority tag'
+      })
+
+      expect(result.success).toBe(true)
+
+      // The merged metadata passed to both backends must include:
+      // - existing key: tags
+      // - new caller key: priority
+      // - update_history with BOTH the prior entry and the new one
+      const graphCall = graph.update.mock.calls[0]
+      const mergedMeta = graphCall[1].metadata
+      expect(mergedMeta.tags).toEqual(['existing-tag'])
+      expect(mergedMeta.priority).toBe('high')
+      expect(mergedMeta.update_history).toHaveLength(2)
+      expect(mergedMeta.update_history[0].reason).toBe('initial store')
+      expect(mergedMeta.update_history[1].reason).toBe('add priority tag')
+
+      const mongoCall = mongo.update.mock.calls[0]
+      const mongoMeta = mongoCall[1].metadata
+      expect(mongoMeta.tags).toEqual(['existing-tag'])
+      expect(mongoMeta.priority).toBe('high')
+    })
+
+    it('invalidates cache after successful backend update', async () => {
+      await tool.update({ id: 'abc-123', content: 'updated', reason: 'test' })
+      expect(cache.invalidate).toHaveBeenCalledWith('kms:search:*')
+      expect(cache.invalidate).toHaveBeenCalledWith('*abc-123*')
+    })
+
+    it('does not invalidate cache if all backends fail', async () => {
+      graph.update = jest.fn().mockResolvedValue(false)
+      mongo.update = jest.fn().mockResolvedValue(false)
+      await tool.update({ id: 'abc-123', content: 'x' })
+      expect(cache.invalidate).not.toHaveBeenCalled()
+    })
+
     it('returns success=false if both backends fail', async () => {
       graph.update = jest.fn().mockResolvedValue(false)
       mongo.update = jest.fn().mockResolvedValue(false)
@@ -233,6 +283,29 @@ describe('UnifiedStoreTool — corrective operations', () => {
       expect(graph.delete).toHaveBeenCalled()
       expect(mongo.delete).toHaveBeenCalled()
       expect(mem0.deleteMemory).toHaveBeenCalled()
+    })
+
+    it('fails and rolls back if only one backend flags successfully (partial failure)', async () => {
+      // SparrowDB flags OK but MongoDB flag fails — the old entry would still
+      // be served from MongoDB. supersede must treat this as failure and roll back.
+      graph.flag = jest.fn().mockResolvedValue(true)
+      mongo.flag = jest.fn().mockResolvedValue(false)
+
+      const result = await tool.supersede({
+        old_id: 'old-id',
+        new_content: 'replacement',
+        reason: 'test partial failure'
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('mongodb')
+
+      // Rollback: new entry deleted from all backends
+      expect(graph.delete).toHaveBeenCalled()
+      expect(mongo.delete).toHaveBeenCalled()
+
+      // SparrowDB flag that succeeded should be reversed (un-flagged)
+      expect(graph.flag).toHaveBeenCalledWith('old-id', null)
     })
   })
 

@@ -304,16 +304,31 @@ export class UnifiedStoreTool {
         const updates = {};
         if (args.content !== undefined)
             updates.content = args.content;
-        if (args.metadata !== undefined)
-            updates.metadata = args.metadata;
         if (args.confidence !== undefined)
             updates.confidence = args.confidence;
-        // Append the reason to metadata.update_history for audit trail.
-        if (args.reason) {
-            const history = updates.metadata?.update_history || [];
-            history.push({ at: new Date().toISOString(), reason: args.reason });
-            updates.metadata = { ...(updates.metadata || {}), update_history: history };
+        // Fetch existing record so we can merge metadata instead of overwriting it.
+        // This prevents $set from dropping existing metadata keys and prior
+        // update_history entries that the caller did not include in args.metadata.
+        let existingMetadata = {};
+        try {
+            const existing = await this.storage.mongodb.findById(args.id);
+            if (existing?.metadata)
+                existingMetadata = existing.metadata;
         }
+        catch (e) {
+            console.warn('⚠️  unified_update: could not fetch existing metadata for merge (non-fatal):', e);
+        }
+        // Merge: existing metadata base, then caller-supplied overrides, then
+        // append the new audit entry to update_history (preserving prior entries).
+        const mergedMetadata = {
+            ...existingMetadata,
+            ...(args.metadata || {})
+        };
+        if (args.reason) {
+            const prior = Array.isArray(mergedMetadata.update_history) ? mergedMetadata.update_history : [];
+            mergedMetadata.update_history = [...prior, { at: new Date().toISOString(), reason: args.reason }];
+        }
+        updates.metadata = mergedMetadata;
         const backends = [];
         if (typeof this.storage.neo4j.update === 'function') {
             try {
@@ -332,6 +347,15 @@ export class UnifiedStoreTool {
         }
         catch (e) {
             console.warn('⚠️  unified_update MongoDB error:', e);
+        }
+        // Invalidate cache after any successful backend update so stale search
+        // results and knowledge cache entries don't serve pre-update content.
+        if (backends.length > 0 && this.cache) {
+            try {
+                await this.cache.invalidate('kms:search:*');
+                await this.cache.invalidate(`*${args.id}*`);
+            }
+            catch { /* non-fatal */ }
         }
         return {
             success: backends.length > 0,
@@ -443,25 +467,65 @@ export class UnifiedStoreTool {
             };
         }
         const new_id = storeResult.id;
-        // Step 2: flag the old entry as SUPERSEDED with back-link to the new one
-        const flagResult = await this.flag({
-            id: args.old_id,
-            flag: 'SUPERSEDED',
-            note: args.reason || `Superseded by ${new_id}`,
-            superseded_by: new_id
-        });
-        if (!flagResult.success) {
-            // Rollback: hard-delete the new entry so we don't leave a dangling replacement.
-            // NOTE: flag() returns false for ANY backend failure, not just "not found".
-            // The error message below reflects this so agents can distinguish a
-            // truly missing ID from a transient backend failure and retry if needed.
-            console.warn(`⚠️  unified_supersede rollback: flag failed, deleting new entry ${new_id}`);
+        // Step 2: flag the old entry as SUPERSEDED with back-link to the new one.
+        // Each required backend is called individually so we can detect partial
+        // failures — flag() returns success=true if ANY backend succeeded, which
+        // would leave the old entry live in the graph if SparrowDB succeeded but
+        // MongoDB failed (or vice-versa). We require ALL present backends to succeed.
+        const flagNote = args.reason || `Superseded by ${new_id}`;
+        const flaggedBackends = [];
+        const failedBackends = [];
+        if (typeof this.storage.neo4j.flag === 'function') {
+            try {
+                const ok = await this.storage.neo4j.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
+                if (ok)
+                    flaggedBackends.push('sparrowdb');
+                else
+                    failedBackends.push('sparrowdb');
+            }
+            catch (e) {
+                failedBackends.push('sparrowdb');
+                console.warn(`⚠️  unified_supersede SparrowDB flag error:`, e);
+            }
+        }
+        try {
+            const ok = await this.storage.mongodb.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
+            if (ok)
+                flaggedBackends.push('mongodb');
+            else
+                failedBackends.push('mongodb');
+        }
+        catch (e) {
+            failedBackends.push('mongodb');
+            console.warn(`⚠️  unified_supersede MongoDB flag error:`, e);
+        }
+        // Invalidate cache after flagging (mirrors flag() behavior).
+        if (this.cache) {
+            try {
+                await this.cache.invalidate('kms:search:*');
+                await this.cache.invalidate(`*${args.old_id}*`);
+            }
+            catch { /* non-fatal */ }
+        }
+        if (failedBackends.length > 0) {
+            // Rollback: hard-delete the new entry so we don't leave a dangling
+            // replacement. Surface the real failure reason for the caller.
+            console.warn(`⚠️  unified_supersede rollback: flag failed on [${failedBackends.join(', ')}], deleting new entry ${new_id}`);
             try {
                 if (typeof this.storage.neo4j.delete === 'function') {
                     await this.storage.neo4j.delete(new_id);
                 }
                 await this.storage.mongodb.delete(new_id);
                 await this.storage.mem0.deleteMemory(new_id).catch(() => { });
+                // Undo any flag that did succeed so backends stay in sync.
+                for (const backend of flaggedBackends) {
+                    if (backend === 'sparrowdb' && typeof this.storage.neo4j.flag === 'function') {
+                        await this.storage.neo4j.flag(args.old_id, null).catch(() => { });
+                    }
+                    else if (backend === 'mongodb') {
+                        await this.storage.mongodb.flag(args.old_id, null).catch(() => { });
+                    }
+                }
             }
             catch (e) {
                 console.error('❌ unified_supersede rollback failed:', e);
@@ -469,14 +533,14 @@ export class UnifiedStoreTool {
             return {
                 success: false,
                 old_id: args.old_id,
-                error: `Flag step failed for ${args.old_id} (entry not found, or backend write error). New entry ${new_id} was rolled back — retry may succeed if this was transient.`
+                error: `Flag step failed on backend(s): [${failedBackends.join(', ')}] for entry ${args.old_id} (entry not found or backend write error). New entry ${new_id} was rolled back — retry may succeed if this was transient.`
             };
         }
         return {
             success: true,
             old_id: args.old_id,
             new_id,
-            backends: flagResult.backends,
+            backends: flaggedBackends,
             reason: args.reason
         };
     }
