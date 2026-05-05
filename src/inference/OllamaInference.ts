@@ -1,5 +1,5 @@
 export interface ClassifyResult {
-  targets: Array<'mem0' | 'mongodb' | 'neo4j'>
+  targets: Array<'mem0' | 'mongodb' | 'graph'>
   contentType: 'episodic' | 'procedural' | 'relational' | 'factual' | 'insight'
   confidence: number
 }
@@ -46,13 +46,13 @@ export class OllamaInference {
 
   async classifyStorageTargets(content: string): Promise<ClassifyResult | null> {
     const prompt = `Return JSON only. No explanation. No markdown.
-{"targets":["neo4j","mem0"],"contentType":"episodic|procedural|relational|factual|insight","confidence":0.0}
+{"targets":["graph","mem0"],"contentType":"episodic|procedural|relational|factual|insight","confidence":0.0}
 
 Rules:
-- neo4j: ALWAYS include — every fact, memory, or insight creates entities and typed edges in the knowledge graph
+- graph: ALWAYS include — every fact, memory, or insight creates entities and typed edges in the graph backend (SparrowDB)
 - mem0: ALWAYS include — every piece of knowledge needs semantic recall and episodic memory
 - mongodb: ADD ONLY when content is procedural (step-by-step), config/schema, debug notes, or technical documentation
-- Baseline for ALL content: ["neo4j","mem0"]
+- Baseline for ALL content: ["graph","mem0"]
 - Add mongodb for: procedures, configs, debug logs, technical specs, deployment steps
 - confidence: how sure you are (0.0-1.0)
 
@@ -71,10 +71,10 @@ Text: "${content.slice(0, 500)}"`
         return null
       }
 
-      const validTargets: Array<'mem0' | 'mongodb' | 'neo4j'> = ['mem0', 'mongodb', 'neo4j']
+      const validTargets: Array<'mem0' | 'mongodb' | 'graph'> = ['mem0', 'mongodb', 'graph']
       const targets = Array.from(new Set(
-        parsed.targets.filter((t): t is 'mem0' | 'mongodb' | 'neo4j' =>
-          validTargets.includes(t as 'mem0' | 'mongodb' | 'neo4j')
+        parsed.targets.filter((t): t is 'mem0' | 'mongodb' | 'graph' =>
+          validTargets.includes(t as 'mem0' | 'mongodb' | 'graph')
         )
       ))
       if (targets.length === 0) {

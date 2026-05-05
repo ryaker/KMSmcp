@@ -29,7 +29,6 @@ import { join } from 'node:path'
 
 const require = createRequire(import.meta.url)
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
-import { Neo4jStorage } from '../storage/Neo4jStorage.js'
 import type { GraphStorage } from '../types/index.js'
 import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
@@ -96,12 +95,6 @@ function buildConfig() {
       uri: process.env.MONGODB_URI || 'mongodb://localhost:27017',
       database: process.env.MONGODB_DATABASE || 'kms'
     },
-    neo4j: {
-      uri: process.env.NEO4J_URI || 'bolt://localhost:7687',
-      username: process.env.NEO4J_USERNAME || 'neo4j',
-      password: process.env.NEO4J_PASSWORD || '',
-      database: process.env.NEO4J_DATABASE
-    },
     mem0: {
       apiKey: process.env.MEM0_API_KEY || '',
       orgId: process.env.MEM0_ORG_ID,
@@ -130,15 +123,12 @@ async function getTools() {
   const mongodb = new MongoDBStorage(cfg.mongodb)
   const mem0 = new Mem0Storage(cfg.mem0)
 
-  // Honour KMS_STORAGE_BACKEND=sparrowdb — same logic as index.ts
-  let graphBackend: GraphStorage
-  if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
-    const sparrowPath = process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'
-    console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
-    graphBackend = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
-  } else {
-    graphBackend = new Neo4jStorage(cfg.neo4j)
-  }
+  // Graph backend: SparrowDB (default — embedded, no Aura latency).
+  // KMS_STORAGE_BACKEND env var is now a no-op kept for backwards compat;
+  // SparrowDB is the only graph backend after the cutover.
+  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
+  const graphBackend: GraphStorage = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
 
   await Promise.allSettled([
     mongodb.initialize(),
@@ -154,7 +144,7 @@ async function getTools() {
   const entityLinker = new EntityLinker(ollama, graphBackend, mongodb)
   enrichmentQueue.setLinker(entityLinker)
 
-  const storage = { mongodb, neo4j: graphBackend, mem0 }
+  const storage = { mongodb, graph: graphBackend, mem0 }
 
   // CLI runs without Redis cache (null = no caching)
   _storeTool = new UnifiedStoreTool(router, storage, null, ollamaRouter, enrichmentQueue)
@@ -164,9 +154,9 @@ async function getTools() {
 }
 
 async function teardown() {
-  // Neo4j driver needs explicit close
+  // SparrowDB closes on process exit; nothing to do here.
   if (_storeTool) {
-    // Access via internal storage reference if needed — driver closes on GC in most cases
+    // Access via internal storage reference if needed.
   }
 }
 
@@ -249,6 +239,8 @@ async function cmdSearch(args: string[]) {
 async function cmdPing() {
   const cfg = buildConfig()
 
+  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+
   const checks = await Promise.allSettled([
     (async () => {
       const m = new MongoDBStorage(cfg.mongodb)
@@ -257,10 +249,10 @@ async function cmdPing() {
       return { system: 'mongodb', ok: true, stats }
     })(),
     (async () => {
-      const n = new Neo4jStorage(cfg.neo4j)
-      await n.initialize()
-      const stats = await n.getStats()
-      return { system: 'neo4j', ok: true, stats }
+      const g = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
+      await g.initialize()
+      const stats = await g.getStats()
+      return { system: 'graph', ok: true, stats }
     })(),
     (async () => {
       const me = new Mem0Storage(cfg.mem0)

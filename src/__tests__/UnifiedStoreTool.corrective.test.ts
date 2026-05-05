@@ -51,7 +51,7 @@ describe('UnifiedStoreTool — corrective operations', () => {
 
     router = {
       determineStorage: jest.fn().mockReturnValue({
-        primary: 'neo4j',
+        primary: 'graph',
         secondary: ['mongodb', 'mem0'],
         cacheStrategy: 'L3',
         reasoning: 'test'
@@ -61,7 +61,7 @@ describe('UnifiedStoreTool — corrective operations', () => {
 
     tool = new UnifiedStoreTool(
       router,
-      { mongodb: mongo, neo4j: graph, mem0 },
+      { mongodb: mongo, graph, mem0 },
       cache,
       null,
       null

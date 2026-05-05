@@ -14,11 +14,11 @@ export class EntityLinker {
 
   constructor(
     private ollama: OllamaInference,
-    private neo4j: GraphStorage,
+    private graph: GraphStorage,
     private mongodb: MongoDBStorage
   ) {}
 
-  async enrich(id: string, content: string, sourceSystem: 'mongodb' | 'mem0' | 'neo4j'): Promise<void> {
+  async enrich(id: string, content: string, sourceSystem: 'mongodb' | 'mem0' | 'graph'): Promise<void> {
     const candidates = await this.getCandidates()
 
     if (candidates.length === 0) {
@@ -40,12 +40,12 @@ export class EntityLinker {
 
     // Persist entityRefs back to the source document when the backend supports updates.
     // Mem0 does not expose a metadata-update API, so refs for mem0 records are only
-    // written as ABOUT relationships in Neo4j and not reflected in Mem0 metadata.
+    // written as ABOUT relationships in the graph backend and not reflected in Mem0 metadata.
     if (sourceSystem === 'mongodb') {
       await this.mongodb.update(id, { metadata: { entityRefs: foundIds } })
     }
 
-    await this.neo4j.createAboutRelationships(id, foundIds)
+    await this.graph.createAboutRelationships(id, foundIds)
 
     logger.debug(`[EntityLinker] ${id}: linked ${foundIds.length} entities via ${method}: [${foundIds.join(', ')}]`)
   }
@@ -56,7 +56,7 @@ export class EntityLinker {
       return this.candidateCache.candidates
     }
 
-    const raw = await this.neo4j.getEntityCandidates()
+    const raw = await this.graph.getEntityCandidates()
     const candidates: EntityMention[] = raw.map(r => ({
       id: r.id,
       name: r.name,
@@ -97,10 +97,10 @@ export class EntityLinker {
   }
 
   /**
-   * Check if a person name resolves to an existing Neo4j node.
+   * Check if a person name resolves to an existing graph node.
    * Use this before creating any new Person node to prevent duplicates.
    */
   async resolvePersonName(name: string): Promise<string | null> {
-    return this.neo4j.resolvePersonId(name)
+    return this.graph.resolvePersonId(name)
   }
 }

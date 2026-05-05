@@ -52,7 +52,7 @@ export class UnifiedSearchTool {
                 totalFound: cached.totalFound || 0,
                 searchTime: Date.now() - startTime,
                 fromCache: true,
-                sources: cached.sources || { mem0: 0, neo4j: 0, mongodb: 0 },
+                sources: cached.sources || { mem0: 0, graph: 0, mongodb: 0 },
                 performance: {
                     cacheCheckTime,
                     searchTime: 0,
@@ -64,9 +64,9 @@ export class UnifiedSearchTool {
         debug(`💾 Cache miss - Searching all systems...`);
         // Step 2: Search across all systems in parallel
         const searchStart = Date.now();
-        const [mem0Results, neo4jResults, mongoResults] = await Promise.allSettled([
+        const [mem0Results, graphResults, mongoResults] = await Promise.allSettled([
             this.searchMem0(query),
-            this.searchNeo4j(query),
+            this.searchGraph(query),
             this.searchMongoDB(query)
         ]);
         const searchTime = Date.now() - searchStart;
@@ -74,17 +74,17 @@ export class UnifiedSearchTool {
         const mergingStart = Date.now();
         const processedResults = {
             mem0: mem0Results.status === 'fulfilled' ? mem0Results.value : [],
-            neo4j: neo4jResults.status === 'fulfilled' ? neo4jResults.value : [],
+            graph: graphResults.status === 'fulfilled' ? graphResults.value : [],
             mongodb: mongoResults.status === 'fulfilled' ? mongoResults.value : []
         };
         debug(`📊 Results found:`);
         debug(`   Mem0: ${processedResults.mem0.length}`);
-        debug(`   Neo4j: ${processedResults.neo4j.length}`);
+        debug(`   Graph: ${processedResults.graph.length}`);
         debug(`   MongoDB: ${processedResults.mongodb.length}`);
         // Merge all results
         const allResults = [
             ...processedResults.mem0.map(r => ({ ...r, sourceSystem: 'mem0' })),
-            ...processedResults.neo4j.map(r => ({ ...r, sourceSystem: 'neo4j' })),
+            ...processedResults.graph.map(r => ({ ...r, sourceSystem: 'graph' })),
             ...processedResults.mongodb.map(r => ({ ...r, sourceSystem: 'mongodb' }))
         ];
         // Remove duplicates (same ID from different systems)
@@ -120,7 +120,7 @@ export class UnifiedSearchTool {
             fromCache: false,
             sources: {
                 mem0: processedResults.mem0.length,
-                neo4j: processedResults.neo4j.length,
+                graph: processedResults.graph.length,
                 mongodb: processedResults.mongodb.length
             },
             performance: {
@@ -159,9 +159,9 @@ export class UnifiedSearchTool {
         // Node types that warrant an entity card — operational/system nodes are returned as triggers instead
         const ENTITY_LABELS = new Set(['Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event']);
         const OPERATIONAL_LABELS = new Set(['ContextTrigger', 'ToolRoute', 'ResourceMap', 'QueryType', 'System', 'MemoryTier']);
-        // Collect entity IDs from Neo4j results
+        // Collect entity IDs from graph results
         const entityIds = new Set();
-        for (const r of results.neo4j) {
+        for (const r of results.graph) {
             const labels = r.nodeLabels || [];
             const hasEntityLabel = labels.some(l => ENTITY_LABELS.has(l));
             const hasOperationalLabel = labels.some(l => OPERATIONAL_LABELS.has(l));
@@ -185,7 +185,7 @@ export class UnifiedSearchTool {
         const idsToFetch = Array.from(entityIds).slice(0, 6);
         const entity_context = {};
         if (idsToFetch.length > 0) {
-            const summaries = await Promise.allSettled(idsToFetch.map(id => this.storage.neo4j.getEntitySummary(id)));
+            const summaries = await Promise.allSettled(idsToFetch.map(id => this.storage.graph.getEntitySummary(id)));
             for (let i = 0; i < idsToFetch.length; i++) {
                 const s = summaries[i];
                 if (s.status === 'fulfilled' && s.value) {
@@ -194,7 +194,7 @@ export class UnifiedSearchTool {
             }
         }
         // Annotate each result with which entity IDs it links to (for agent consumption)
-        for (const r of [...results.neo4j, ...results.mongodb, ...results.mem0]) {
+        for (const r of [...results.graph, ...results.mongodb, ...results.mem0]) {
             const linkedIds = [];
             if (r.id && entity_context[r.id])
                 linkedIds.push(r.id);
@@ -209,7 +209,7 @@ export class UnifiedSearchTool {
         // Match ContextTrigger/ToolRoute nodes against query keywords
         const triggered_actions = [];
         try {
-            const operationalNodes = await this.storage.neo4j.getOperationalNodes();
+            const operationalNodes = await this.storage.graph.getOperationalNodes();
             const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
             for (const node of operationalNodes) {
                 const haystack = `${node.name} ${node.description} ${node.taskPattern || ''}`.toLowerCase();
@@ -237,8 +237,8 @@ export class UnifiedSearchTool {
         switch (system) {
             case 'mem0':
                 return this.searchMem0(query);
-            case 'neo4j':
-                return this.searchNeo4j(query);
+            case 'graph':
+                return this.searchGraph(query);
             case 'mongodb':
                 return this.searchMongoDB(query);
             default:
@@ -250,7 +250,7 @@ export class UnifiedSearchTool {
      */
     getSearchRecommendations(query) {
         const recommendations = {
-            recommendedSystems: ['mem0', 'neo4j', 'mongodb'],
+            recommendedSystems: ['mem0', 'graph', 'mongodb'],
             suggestedFilters: {},
             reasoning: 'Search all systems for comprehensive results'
         };
@@ -262,9 +262,9 @@ export class UnifiedSearchTool {
             recommendations.reasoning = 'Memory and client-related queries work best with Mem0 and MongoDB';
         }
         else if (lowerQuery.includes('technique') || lowerQuery.includes('relationship') || lowerQuery.includes('effective')) {
-            recommendations.recommendedSystems = ['neo4j', 'mem0'];
+            recommendations.recommendedSystems = ['graph', 'mem0'];
             recommendations.suggestedFilters.contentType = ['insight', 'relationship'];
-            recommendations.reasoning = 'Technique and relationship queries leverage Neo4j graph capabilities';
+            recommendations.reasoning = 'Technique and relationship queries leverage the graph backend';
         }
         else if (lowerQuery.includes('config') || lowerQuery.includes('session') || lowerQuery.includes('setting')) {
             recommendations.recommendedSystems = ['mongodb', 'mem0'];
@@ -283,12 +283,12 @@ export class UnifiedSearchTool {
             return [];
         }
     }
-    async searchNeo4j(query) {
+    async searchGraph(query) {
         try {
-            return await this.storage.neo4j.search(query);
+            return await this.storage.graph.search(query);
         }
         catch (error) {
-            console.warn('⚠️ Neo4j search failed:', error instanceof Error ? error.message : String(error));
+            console.warn('⚠️ Graph backend search failed:', error instanceof Error ? error.message : String(error));
             return [];
         }
     }

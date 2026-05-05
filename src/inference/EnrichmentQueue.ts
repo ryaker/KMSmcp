@@ -3,7 +3,7 @@ import { logger } from '../logger.js'
 export interface EnrichmentJob {
   id: string
   content: string
-  sourceSystem: 'mongodb' | 'mem0' | 'neo4j'
+  sourceSystem: 'mongodb' | 'mem0' | 'graph'
   queuedAt: Date
 }
 

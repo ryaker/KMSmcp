@@ -3,6 +3,8 @@
  * Orchestrates all components into a single, powerful MCP server
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import {
   CallToolRequestSchema,
@@ -24,8 +26,7 @@ import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js'
 import { OllamaInference } from './inference/OllamaInference.js'
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js'
 import { EntityLinker } from './inference/EntityLinker.js'
-import { MongoDBStorage, Neo4jStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js'
-import { ShadowStorage } from './storage/ShadowStorage.js'
+import { MongoDBStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js'
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js'
 
 export class UnifiedKMSServer {
@@ -37,13 +38,10 @@ export class UnifiedKMSServer {
   private router!: IntelligentStorageRouter
   private storage!: {
     mongodb: MongoDBStorage
-    // neo4j slot holds Neo4jStorage | SparrowDBStorage | ShadowStorage depending on env.
-    //   KMS_STORAGE_BACKEND=sparrowdb  → SparrowDBStorage (direct)
-    //   KMS_SHADOW_MODE=true           → ShadowStorage (Neo4j primary, SparrowDB shadow)
-    //   (default)                      → Neo4jStorage
-    // Callers that accept Neo4jStorage concretely receive an `as Neo4jStorage` cast —
-    // safe because all three implementations expose the same runtime API.
-    neo4j: GraphStorage
+    // graph slot holds the active graph backend (SparrowDB by default, optional
+    // Neo4j or Shadow legacy fallbacks resolved at startup). All implementations
+    // satisfy GraphStorage so callers can ignore the concrete type.
+    graph: GraphStorage
     mem0: Mem0Storage
   }
   private tools!: {
@@ -115,40 +113,24 @@ export class UnifiedKMSServer {
     
     // Step 2: Initialize storage systems
     console.log('📊 Initializing Storage Systems...')
-    // Graph backend selection (in priority order):
-    //   KMS_SHADOW_MODE=true          → ShadowStorage (Neo4j primary + SparrowDB shadow)
-    //   KMS_STORAGE_BACKEND=sparrowdb → SparrowDBStorage (direct, eliminates ~50-200ms Aura latency)
-    //   (default)                     → Neo4jStorage (Aura)
-    // All three implement the same runtime API as Neo4jStorage; the cast is safe.
-    let graphBackend: GraphStorage
-    if (process.env.KMS_SHADOW_MODE === 'true') {
-      console.log('🔀 Graph backend: Shadow mode (Neo4j primary + SparrowDB shadow)')
-      console.log(`   SparrowDB path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'}`)
-      const neo4jPrimary = new Neo4jStorage(this.config.neo4j)
-      const sparrowShadow = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH })
-      graphBackend = new ShadowStorage(neo4jPrimary, sparrowShadow) as GraphStorage
-    } else if (process.env.KMS_STORAGE_BACKEND === 'sparrowdb') {
-      console.log(`⚡ Graph backend: SparrowDB (path: ${process.env.SPARROWDB_PATH || '~/.kms-sparrowdb'})`)
-      graphBackend = new SparrowDBStorage({ dbPath: process.env.SPARROWDB_PATH }) as GraphStorage
-    } else {
-      graphBackend = new Neo4jStorage(this.config.neo4j)
-    }
-    const graphBackendName = process.env.KMS_SHADOW_MODE === 'true'
-      ? 'Shadow (Neo4j+SparrowDB)'
-      : process.env.KMS_STORAGE_BACKEND === 'sparrowdb'
-      ? 'SparrowDB'
-      : 'Neo4j'
+    // Graph backend: SparrowDB (default — embedded, ~5ms read latency).
+    // Legacy Neo4j and Shadow modes were removed in the SparrowDB cutover;
+    // the env vars KMS_STORAGE_BACKEND / KMS_SHADOW_MODE are now no-ops.
+    const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+    console.log(`⚡ Graph backend: SparrowDB (path: ${sparrowPath})`)
+    const graphBackend: GraphStorage = new SparrowDBStorage({ dbPath: sparrowPath })
+    const graphBackendName = 'SparrowDB'
     this.storage = {
       mongodb: new MongoDBStorage(this.config.mongodb),
-      neo4j: graphBackend,
+      graph: graphBackend,
       mem0: new Mem0Storage(this.config.mem0)
     }
-    
+
     // Initialize all storage systems in parallel
     console.log('📊 Initializing Storage Systems...')
     const storageResults = await Promise.allSettled([
       this.storage.mongodb.initialize(),
-      this.storage.neo4j.initialize(),
+      this.storage.graph.initialize(),
       this.storage.mem0.initialize()
     ])
 
@@ -178,7 +160,7 @@ export class UnifiedKMSServer {
     const enrichmentQueue = new EnrichmentQueue(null)
     const entityLinker = new EntityLinker(
       ollamaInference,
-      this.storage.neo4j,
+      this.storage.graph,
       this.storage.mongodb
     )
     enrichmentQueue.setLinker(entityLinker)
@@ -996,13 +978,13 @@ export class UnifiedKMSServer {
     const [cacheStats, mongoStats, graphStats, mem0Stats] = await Promise.allSettled([
       this.factCache ? this.factCache.getStats() : Promise.resolve({ disabled: true }),
       this.storage.mongodb.getStats(),
-      this.storage.neo4j.getStats(),
+      this.storage.graph.getStats(),
       this.storage.mem0.getStats()
     ])
 
-    const graphKey = process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb'
-      : process.env.KMS_SHADOW_MODE === 'true' ? 'shadow'
-      : 'neo4j'
+    // Slot label is now `graph`. The actual implementation name (sparrowdb,
+    // neo4j fallback, shadow) is reported via storage.<impl>.name when needed.
+    const graphKey = 'graph'
 
     const analytics = {
       timestamp: new Date().toISOString(),
@@ -1077,11 +1059,9 @@ export class UnifiedKMSServer {
     }
 
     // Graph backend: get real node count to prove connectivity
-    const graphKey = process.env.KMS_STORAGE_BACKEND === 'sparrowdb' ? 'sparrowdb'
-      : process.env.KMS_SHADOW_MODE === 'true' ? 'shadow'
-      : 'neo4j'
+    const graphKey = 'graph'
     try {
-      const stats = await this.storage.neo4j.getStats()
+      const stats = await this.storage.graph.getStats()
       if (stats.status === 'error') {
         result.datastores[graphKey] = stats
       } else {
@@ -1270,7 +1250,7 @@ export class UnifiedKMSServer {
     
     const promises = [
       this.storage.mongodb.close(),
-      this.storage.neo4j.close(),
+      this.storage.graph.close(),
       this.storage.mem0.close(),
       this.redis.quit()
     ]
@@ -1295,12 +1275,6 @@ async function main() {
     mongodb: {
       uri: process.env.MONGODB_ATLAS_URI || process.env.MONGODB_URI || 'mongodb://localhost:27017',
       database: process.env.MONGODB_DATABASE || 'unified_kms'
-    },
-    neo4j: {
-      uri: process.env.NEO4J_AURA_URI || process.env.NEO4J_URI || 'bolt://localhost:7687',
-      username: process.env.NEO4J_AURA_USERNAME || process.env.NEO4J_USERNAME || 'neo4j',
-      password: process.env.NEO4J_AURA_PASSWORD || process.env.NEO4J_PASSWORD || (() => { throw new Error('NEO4J_AURA_PASSWORD or NEO4J_PASSWORD must be set') })(),
-      database: process.env.NEO4J_AURA_DATABASE || process.env.NEO4J_DATABASE
     },
     mem0: {
       apiKey: process.env.MEM0_API_KEY!,
