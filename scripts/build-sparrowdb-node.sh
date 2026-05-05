@@ -38,7 +38,7 @@ if [[ ! -x "$NAPI_BIN" ]]; then
 fi
 
 echo "🦀 Building sparrowdb-node (cargo + .d.ts) from: $SPARROW_DIR"
-(cd "$SPARROW_DIR/npm/sparrowdb" && \
+(cd "$SPARROW_DIR/npm/sparrowdb" && rm -f index.*.node && \
   ./node_modules/.bin/napi build --release --platform \
     --dts index.d.ts --js false \
     --cargo-cwd ../../crates/sparrowdb-node \
@@ -58,7 +58,7 @@ cp "$SPARROW_DIR/npm/sparrowdb/index.d.ts"     "$KMSMCP_NODE_MODULES/index.d.ts"
 
 SIZE=$(ls -lh "$SPARROW_DIR/npm/sparrowdb/sparrowdb.node" | awk '{print $5}')
 DTS_LINES=$(wc -l < "$SPARROW_DIR/npm/sparrowdb/index.d.ts" | tr -d ' ')
-NEW_API_REFS=$(grep -c 'hybridSearch\|vectorSearch\|fulltextSearch' "$KMSMCP_NODE_MODULES/index.d.ts")
+NEW_API_REFS=$(grep -c 'hybridSearch\|vectorSearch\|fulltextSearch' "$KMSMCP_NODE_MODULES/index.d.ts" || true)
 echo "✅ Done."
 echo "   sparrowdb.node: $SIZE  (also copied to KMSmcp)"
 echo "   index.d.ts: $DTS_LINES lines  (also copied to KMSmcp)"
