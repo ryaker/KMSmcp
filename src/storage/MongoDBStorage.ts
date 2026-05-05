@@ -103,8 +103,13 @@ export class MongoDBStorage implements StorageSystem {
       
       // Default: hide flagged (retracted/superseded/deleted) entries.
       // Opt in via options.includeFlagged to see them (e.g. for audit/reaper).
+      // Use $or to reliably match both null and missing field — $in with
+      // undefined is not reliable in MongoDB drivers.
       if (!query.options?.includeFlagged) {
-        filter.flag = { $in: [null, undefined] }
+        filter.$and = [
+          ...(filter.$and || []),
+          { $or: [{ flag: null }, { flag: { $exists: false } }] }
+        ]
       }
 
       // Apply filters
@@ -258,7 +263,13 @@ export class MongoDBStorage implements StorageSystem {
         $set.flag_date = new Date()
         if (note !== undefined) $set.flag_note = note
         if (by !== undefined) $set.flag_by = by
-        if (superseded_by !== undefined) $set.superseded_by = superseded_by
+        // Clear superseded_by whenever transitioning AWAY from SUPERSEDED so
+        // stale successor IDs don't linger (e.g. SUPERSEDED → DELETED keeps old id).
+        if (flag === 'SUPERSEDED') {
+          if (superseded_by !== undefined) $set.superseded_by = superseded_by
+        } else {
+          $unset.superseded_by = ''
+        }
       }
       const update: any = { $set }
       if (Object.keys($unset).length > 0) update.$unset = $unset
@@ -276,7 +287,7 @@ export class MongoDBStorage implements StorageSystem {
    */
   async listFlagged(olderThan?: Date): Promise<UnifiedKnowledge[]> {
     try {
-      const filter: any = { flag: { $nin: [null, undefined] } }
+      const filter: any = { flag: { $ne: null, $exists: true } }
       if (olderThan) {
         filter.flag_date = { $lt: olderThan }
       }
