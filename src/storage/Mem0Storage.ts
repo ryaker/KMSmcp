@@ -1,32 +1,35 @@
 /**
  * Mem0 Storage System Implementation
+ *
+ * Targets mem0ai SDK v3.x. Key v1 → v3 deltas applied:
+ *  - `add`: `user_id` (snake) → `userId` (camel) at top level. Wire still snake — SDK converts.
+ *  - `search` / `getAll`: top-level entity params (`user_id`, `userId`, etc.) are REJECTED.
+ *    Must pass `filters: { user_id: '...' }` instead. SDK throws if you don't.
+ *  - `search`: `limit` → `topK`, `api_version` removed (SDK now hits /v3/memories/search/ unconditionally),
+ *    return shape is `{ results: Memory[] }` (wrapped) — was `Memory[]` (unwrapped).
+ *  - `get(memoryId)` only takes a string. The 1.x `get({ user_id, limit })` overload
+ *    moved to `getAll(options)` returning `PaginatedMemories { count, next, previous, results }`.
+ *  - Response keys are converted snake → camel by the SDK (`createdAt`, `updatedAt`, `userId`).
+ *  - `enable_graph` is no longer a recognized option (none in this codebase, but flagged).
  */
 
-// Real Mem0 client interface
-interface Mem0Client {
-  add(messages: any, options?: any): Promise<any>
-  search(query: string, options?: any): Promise<any[]>
-  get(data: any): Promise<any[]>
-  getById?(id: string): Promise<any>
-  delete(id: string): Promise<any>
-}
-
+import { MemoryClient, Memory } from 'mem0ai'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
 
 export class Mem0Storage implements StorageSystem {
   public name = 'mem0'
-  private client!: Mem0Client
+  private client!: MemoryClient
 
   constructor(private config: KMSConfig['mem0']) {}
 
   async initialize(): Promise<void> {
     console.log('🧠 Connecting to Mem0...')
-    
+
     // Initialize Mem0 client with telemetry disabled for Node.js environment
     try {
       // Disable Mem0 telemetry in Node.js environment
       process.env.MEM0_TELEMETRY = 'false'
-      
+
       // Mock window object for Mem0 SDK telemetry
       if (typeof (global as any).window === 'undefined') {
         (global as any).window = {
@@ -40,12 +43,12 @@ export class Mem0Storage implements StorageSystem {
           }
         }
       }
-      
+
       const { MemoryClient } = await import('mem0ai')
       this.client = new MemoryClient({
         apiKey: this.config.apiKey
-      }) as any
-      
+      })
+
       console.log('✅ Mem0 connected successfully')
     } catch (error) {
       console.error('❌ Mem0 connection error:', error)
@@ -56,16 +59,16 @@ export class Mem0Storage implements StorageSystem {
   async store(knowledge: UnifiedKnowledge): Promise<void> {
     try {
       console.log(`🧠 Storing in Mem0: ${knowledge.id}`)
-      
+
       const userId = this.generateUserId(knowledge)
-      
-      // Store in Mem0 with rich metadata
+
+      // Store in Mem0 with rich metadata. v3: top-level entity is `userId` (camelCase).
       const messages = [{
-        role: 'user',
+        role: 'user' as const,
         content: knowledge.content
       }]
       const options = {
-        user_id: userId,
+        userId,
         metadata: {
           kms_id: knowledge.id,
           content_type: knowledge.contentType,
@@ -87,26 +90,30 @@ export class Mem0Storage implements StorageSystem {
   async search(query: KnowledgeQuery): Promise<any[]> {
     try {
       console.log(`🔍 Searching Mem0: "${query.query}"`)
-      
+
       const userId = this.generateUserIdFromQuery(query)
       console.log(`🧠 [Mem0Storage.search] Using user ID: ${userId}`)
-      
+
       const searchQuery = query.query
+      // v3: user_id MUST live inside filters (top-level entity params now rejected by SDK).
       const searchOptions = {
-        user_id: userId, // Use user_id as expected by Mem0 SDK
-        limit: query.options?.maxResults || 10,
-        filters: this.buildMem0Filters(query.filters),
-        api_version: 'v1'
+        topK: query.options?.maxResults || 10,
+        filters: {
+          user_id: userId,
+          ...this.buildMem0Filters(query.filters)
+        }
       }
-      
+
       console.log(`🧠 [Mem0Storage.search] Search query: "${searchQuery}"`)
       console.log(`🧠 [Mem0Storage.search] Search options:`, JSON.stringify(searchOptions, null, 2))
-      
-      const results = await this.client.search(searchQuery, searchOptions)
-      
-      const processedResults = results.map(r => ({
+
+      // v3 search returns { results: Memory[] } (wrapped) instead of Memory[].
+      const response = await this.client.search(searchQuery, searchOptions)
+      const results = response?.results ?? []
+
+      const processedResults = results.map((r: Memory) => ({
         id: r.id || r.metadata?.kms_id,
-        content: r.memory || r.text,
+        content: r.memory || '',
         confidence: r.score || r.metadata?.confidence || 0.5,
         metadata: r.metadata || {},
         sourceSystem: 'mem0',
@@ -115,7 +122,7 @@ export class Mem0Storage implements StorageSystem {
         source: r.metadata?.source,
         userId: r.userId
       }))
-      
+
       console.log(`🧠 Mem0 found ${processedResults.length} results`)
       return processedResults
     } catch (error) {
@@ -126,19 +133,19 @@ export class Mem0Storage implements StorageSystem {
 
   async getStats(): Promise<Record<string, any>> {
     try {
-      // v1 API returns { count, next, previous, results } — use page_size=1 for efficiency
+      // v3 SDK: use getAll() with filters.user_id and pageSize=1 to get the count.
+      // Avoids the brittle raw fetch to /v1/memories/ that was used in the 1.x days.
       const userId = this.config.defaultUserId || 'personal'
-      const url = `https://api.mem0.ai/v1/memories/?user_id=${encodeURIComponent(userId)}&page=1&page_size=1`
-      const resp = await fetch(url, {
-        headers: { Authorization: `Token ${this.config.apiKey}` }
+      const page = await this.client.getAll({
+        page: 1,
+        pageSize: 1,
+        filters: { user_id: userId }
       })
-      if (!resp.ok) throw new Error(`Mem0 count HTTP ${resp.status}`)
-      const data = await resp.json() as { count?: number }
       return {
-        totalMemories: data.count ?? 'unknown',
+        totalMemories: page?.count ?? 'unknown',
         userId,
         status: 'connected',
-        apiEndpoint: 'Mem0 Cloud (v1)'
+        apiEndpoint: 'Mem0 Cloud (v3)'
       }
     } catch (error) {
       console.error('❌ Mem0 stats error:', error)
@@ -152,17 +159,20 @@ export class Mem0Storage implements StorageSystem {
 
   async getMemoriesForUser(userId: string, limit = 50): Promise<any[]> {
     try {
-      const memories = await this.client.get({
-        userId,
-        limit
+      // v3: the 1.x `get({ user_id, limit })` overload moved to `getAll(options)`.
+      // user_id must go inside filters; limit becomes pageSize.
+      const page = await this.client.getAll({
+        pageSize: limit,
+        filters: { user_id: userId }
       })
-      
-      return memories.map(m => ({
+
+      const memories = page?.results ?? []
+      return memories.map((m: Memory) => ({
         id: m.id,
         content: m.memory,
         metadata: m.metadata,
-        createdAt: m.created_at,
-        updatedAt: m.updated_at
+        createdAt: m.createdAt ? new Date(m.createdAt) : undefined,
+        updatedAt: m.updatedAt ? new Date(m.updatedAt) : undefined
       }))
     } catch (error) {
       console.error('❌ Mem0 getMemoriesForUser error:', error)
@@ -175,12 +185,12 @@ export class Mem0Storage implements StorageSystem {
       console.log(`🧠 [Mem0Storage.getById] Starting retrieval for memory ID: ${memoryId}`)
       console.log(`🧠 [Mem0Storage.getById] Memory ID type: ${typeof memoryId}`)
       console.log(`🧠 [Mem0Storage.getById] Memory ID length: ${memoryId?.length}`)
-      
-      // Use the correct TypeScript SDK method - pass memoryId directly as string
+
+      // v3: client.get(memoryId: string) returns a single Memory object (or throws on 404).
       console.log(`🧠 [Mem0Storage.getById] Calling this.client.get(${memoryId})...`)
       const memory = await this.client.get(memoryId)
       console.log(`🧠 [Mem0Storage.getById] SDK response:`, memory)
-      
+
       if (memory) {
         console.log(`✅ [Mem0Storage.getById] Found memory ${memoryId}`)
         return memory
@@ -263,20 +273,21 @@ export class Mem0Storage implements StorageSystem {
   async testDirectSearch(query: string, userId: string = this.config.defaultUserId || 'personal'): Promise<any> {
     try {
       console.log(`🧪 [Mem0Storage.testDirectSearch] Testing direct search for: "${query}" with user: ${userId}`)
-      
+
       const searchQuery = query
+      // v3: user_id must live in filters (top-level entity params now rejected).
       const searchOptions = {
-        user_id: userId,
-        limit: 10,
-        api_version: 'v1'
+        topK: 10,
+        filters: { user_id: userId }
       }
-      
+
       console.log(`🧪 [Mem0Storage.testDirectSearch] Search query: "${searchQuery}"`)
       console.log(`🧪 [Mem0Storage.testDirectSearch] Search options:`, JSON.stringify(searchOptions, null, 2))
-      
-      const results = await this.client.search(searchQuery, searchOptions)
+
+      const response = await this.client.search(searchQuery, searchOptions)
+      const results = response?.results ?? []
       console.log(`🧪 [Mem0Storage.testDirectSearch] Raw results:`, JSON.stringify(results, null, 2))
-      
+
       return {
         success: true,
         query,
