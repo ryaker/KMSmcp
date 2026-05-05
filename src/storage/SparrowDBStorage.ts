@@ -344,35 +344,29 @@ export class SparrowDBStorage implements StorageSystem {
       flag_by: updates.flag_by ?? existing.flag_by,
       superseded_by: updates.superseded_by ?? existing.superseded_by
     }
-    this.contentIndex.set(id, updated)
-    this._saveSidecar()
-
-    // Refresh graph node structural properties (id, contentType, source, userId, confidence).
-    // Must detach incident relationships first — SparrowDB's bare `DELETE k`
-    // errors if the node has relationships. Mirrors the detach pattern in
-    // delete() above.
+    // Refresh graph node structural properties without destroying relationships.
+    // Use SET on the existing node instead of DELETE+CREATE so that all
+    // RELATED_TO / ABOUT edges are preserved.
+    let graphOk = false
     try {
       this.db.execute(
-        `MATCH (k:Knowledge {id: ${cypherStr(id)}})-[r]-() DELETE r`
+        `MATCH (k:Knowledge {id: ${cypherStr(id)}})` +
+        ` SET k.contentType = ${cypherStr(updated.contentType)},` +
+        `     k.source = ${cypherStr(updated.source)},` +
+        `     k.userId = ${cypherStr(updated.userId)},` +
+        `     k.confidence = ${cypherStr(String(updated.confidence))}`
       )
-    } catch { /* may have no relationships */ }
-    try {
-      this.db.execute(
-        `MATCH (k:Knowledge {id: ${cypherStr(id)}}) DELETE k`
-      )
-    } catch { /* may not exist */ }
-    try {
-      this.db.execute(
-        `CREATE (k:Knowledge {` +
-        `  id: ${cypherStr(updated.id)},` +
-        `  contentType: ${cypherStr(updated.contentType)},` +
-        `  source: ${cypherStr(updated.source)},` +
-        `  userId: ${cypherStr(updated.userId)},` +
-        `  confidence: ${cypherStr(String(updated.confidence))}` +
-        `})`
-      )
+      graphOk = true
     } catch (e) {
       logger.warn(`SparrowDB update: failed to refresh graph node for ${id}: ${e}`)
+      return false
+    }
+
+    // Only persist sidecar after the graph update succeeds, so the two stores
+    // stay in sync (sidecar is the source of truth for full content).
+    if (graphOk) {
+      this.contentIndex.set(id, updated)
+      this._saveSidecar()
     }
 
     return true
@@ -401,8 +395,9 @@ export class SparrowDBStorage implements StorageSystem {
     existing.flag_note = flag === null ? undefined : note
     existing.flag_date = flag === null ? undefined : new Date().toISOString()
     existing.flag_by = flag === null ? undefined : by
-    if (superseded_by !== undefined) existing.superseded_by = superseded_by
-    if (flag === null) existing.superseded_by = undefined
+    // Clear superseded_by whenever the entry transitions AWAY from SUPERSEDED
+    // (including to null/DELETED/RETRACTED) so stale successor IDs don't linger.
+    existing.superseded_by = flag === 'SUPERSEDED' ? superseded_by : undefined
 
     this.contentIndex.set(id, existing)
     this._saveSidecar()
