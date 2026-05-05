@@ -94,8 +94,6 @@ export class Mem0Storage {
             };
             console.log(`🧠 [Mem0Storage.search] Search query: "${searchQuery}"`);
             console.log(`🧠 [Mem0Storage.search] Search options:`, JSON.stringify(searchOptions, null, 2));
-            // SDK type declares `Memory[]` but runtime can be either bare array or
-            // `{ results: Memory[] }` depending on endpoint version — handle both.
             const response = await this.client.search(searchQuery, searchOptions);
             const results = Array.isArray(response) ? response : (response?.results ?? []);
             const processedResults = results.map((r) => ({
@@ -122,17 +120,13 @@ export class Mem0Storage {
             // v3 SDK: use getAll() with filters.user_id and pageSize=1 to get the count.
             // Avoids the brittle raw fetch to /v1/memories/ that was used in the 1.x days.
             const userId = this.config.defaultUserId || 'personal';
-            // SDK destructures `page_size` (snake) — `pageSize` (camel) goes ignored, leaving
-            // pagination off. Also pass user_id at top level: getAll v1 serializes options via
-            // URLSearchParams which can't nest objects, so filters: { user_id } becomes the
-            // literal "[object Object]" on the wire.
             const page = await this.client.getAll({
                 page: 1,
                 page_size: 1,
                 user_id: userId
             });
             // Paginated response: { count, next, previous, results }. Bare array fallback for non-paginated.
-            const totalMemories = page?.count ?? (Array.isArray(page) ? page.length : 'unknown');
+            const totalMemories = (Array.isArray(page) ? page.length : page?.count) ?? 'unknown';
             return {
                 totalMemories,
                 userId,
@@ -151,8 +145,6 @@ export class Mem0Storage {
     }
     async getMemoriesForUser(userId, limit = 50) {
         try {
-            // SDK destructures snake_case `page_size`; user_id must be top-level since
-            // getAll v1 URL-encodes options and can't nest objects.
             const page = await this.client.getAll({
                 page: 1,
                 page_size: limit,
@@ -167,6 +159,7 @@ export class Mem0Storage {
                     id: m.id,
                     content: m.memory,
                     metadata: m.metadata,
+                    userId: m.userId ?? m.user_id,
                     createdAt: created ? new Date(created) : undefined,
                     updatedAt: updated ? new Date(updated) : undefined
                 };

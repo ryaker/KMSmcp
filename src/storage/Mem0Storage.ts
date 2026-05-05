@@ -110,8 +110,9 @@ export class Mem0Storage implements StorageSystem {
 
       // SDK type declares `Memory[]` but runtime can be either bare array or
       // `{ results: Memory[] }` depending on endpoint version — handle both.
-      const response = await this.client.search(searchQuery, searchOptions) as any
-      const results = Array.isArray(response) ? response : (response?.results ?? [])
+      type Mem0SearchResponse = any[] | { results?: any[] }
+      const response = await this.client.search(searchQuery, searchOptions) as unknown as Mem0SearchResponse
+      const results: any[] = Array.isArray(response) ? response : (response?.results ?? [])
 
       const processedResults = results.map((r: any) => ({
         id: r.id || r.metadata?.kms_id,
@@ -142,13 +143,14 @@ export class Mem0Storage implements StorageSystem {
       // pagination off. Also pass user_id at top level: getAll v1 serializes options via
       // URLSearchParams which can't nest objects, so filters: { user_id } becomes the
       // literal "[object Object]" on the wire.
+      type Mem0GetAllResponse = any[] | { count?: number; results?: any[]; next?: string | null; previous?: string | null }
       const page = await this.client.getAll({
         page: 1,
         page_size: 1,
         user_id: userId
-      } as any) as any
+      } as any) as unknown as Mem0GetAllResponse
       // Paginated response: { count, next, previous, results }. Bare array fallback for non-paginated.
-      const totalMemories = page?.count ?? (Array.isArray(page) ? page.length : 'unknown')
+      const totalMemories = (Array.isArray(page) ? page.length : page?.count) ?? 'unknown'
       return {
         totalMemories,
         userId,
@@ -169,14 +171,15 @@ export class Mem0Storage implements StorageSystem {
     try {
       // SDK destructures snake_case `page_size`; user_id must be top-level since
       // getAll v1 URL-encodes options and can't nest objects.
+      type Mem0GetAllResponse = any[] | { count?: number; results?: any[] }
       const page = await this.client.getAll({
         page: 1,
         page_size: limit,
         user_id: userId
-      } as any)
+      } as any) as unknown as Mem0GetAllResponse
 
       // getAll runtime shape varies (bare array vs { results: [...], count }).
-      const memList = Array.isArray(page) ? page : ((page as any)?.results ?? [])
+      const memList: any[] = Array.isArray(page) ? page : (page?.results ?? [])
       return memList.map((m: any) => {
         const created = m.createdAt ?? m.created_at
         const updated = m.updatedAt ?? m.updated_at
@@ -184,6 +187,7 @@ export class Mem0Storage implements StorageSystem {
           id: m.id,
           content: m.memory,
           metadata: m.metadata,
+          userId: m.userId ?? m.user_id,
           createdAt: created ? new Date(created) : undefined,
           updatedAt: updated ? new Date(updated) : undefined
         }
