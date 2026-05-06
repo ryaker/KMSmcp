@@ -37,6 +37,17 @@ if [[ ! -x "$NAPI_BIN" ]]; then
   (cd "$SPARROW_DIR/npm/sparrowdb" && npm install)
 fi
 
+# Fail fast if cargo is missing BEFORE we delete the existing .node binary.
+# Without this guard, `rm -f index.*.node` succeeds, the napi build then fails on
+# missing cargo, and the caller (e.g. a fresh worktree clone) is left with no
+# binary and no recovery path. See KMS memory 9a601fc9 (gotcha #2) and PR #61.
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "❌ cargo not found in PATH — refusing to delete existing .node binary."
+  echo "   Install Rust toolchain (https://rustup.rs) or ensure ~/.cargo/bin is on PATH."
+  echo "   Existing index.*.node and sparrowdb.node left untouched."
+  exit 1
+fi
+
 echo "🦀 Building sparrowdb-node (cargo + .d.ts) from: $SPARROW_DIR"
 (cd "$SPARROW_DIR/npm/sparrowdb" && rm -f index.*.node && \
   ./node_modules/.bin/napi build --release --platform \
