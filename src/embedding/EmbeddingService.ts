@@ -200,8 +200,8 @@ export class OllamaEmbeddingService implements EmbeddingService {
       const out = new Float32Array(this.dimensions)
       for (let i = 0; i < this.dimensions; i++) {
         const v = body.embedding[i]
-        if (typeof v !== 'number' || Number.isNaN(v)) {
-          throw new Error(`OllamaEmbeddingService: non-numeric value at embedding[${i}]`)
+        if (typeof v !== 'number' || !Number.isFinite(v)) {
+          throw new Error(`OllamaEmbeddingService: non-finite value at embedding[${i}]`)
         }
         out[i] = v
       }

@@ -85,12 +85,17 @@ describe('OllamaEmbeddingService', () => {
 
   it('explicit baseUrl beats env var', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ embedding: fakeEmbedding(768) }))
+    const prevEnv = process.env.OLLAMA_BASE_URL
     process.env.OLLAMA_BASE_URL = 'http://env.test:1111'
-    const svc = new OllamaEmbeddingService({ baseUrl: 'http://explicit.test:2222' })
-    await svc.embed('x')
-    const url = fetchMock.mock.calls[0][0]
-    expect(String(url)).toBe('http://explicit.test:2222/api/embeddings')
-    delete process.env.OLLAMA_BASE_URL
+    try {
+      const svc = new OllamaEmbeddingService({ baseUrl: 'http://explicit.test:2222' })
+      await svc.embed('x')
+      const url = fetchMock.mock.calls[0][0]
+      expect(String(url)).toBe('http://explicit.test:2222/api/embeddings')
+    } finally {
+      if (prevEnv === undefined) delete process.env.OLLAMA_BASE_URL
+      else process.env.OLLAMA_BASE_URL = prevEnv
+    }
   })
 
   it('sends model + prompt in the request body', async () => {
@@ -124,7 +129,7 @@ describe('OllamaEmbeddingService', () => {
     bad[5] = 'not-a-number' as any
     fetchMock.mockResolvedValueOnce(jsonResponse({ embedding: bad }))
     const svc = new OllamaEmbeddingService()
-    await expect(svc.embed('x')).rejects.toThrow(/non-numeric/i)
+    await expect(svc.embed('x')).rejects.toThrow(/non-finite/i)
   })
 
   it('throws on non-200 HTTP status', async () => {
