@@ -13,6 +13,8 @@ export class UnifiedStoreTool {
     ollamaRouter;
     enrichmentQueue;
     embeddingService;
+    /** Tracks last known availability to detect transitions and log them. */
+    _lastEmbedderAvailable = null;
     constructor(router, storage, cache, ollamaRouter, enrichmentQueue, embeddingService) {
         this.router = router;
         this.storage = storage;
@@ -97,22 +99,39 @@ export class UnifiedStoreTool {
         let pendingEmbedding = null;
         let pendingEmbedderId = null;
         if (this.embeddingService) {
-            try {
-                const vec = await this.embeddingService.embed(knowledge.content);
-                pendingEmbedding = vec;
-                pendingEmbedderId = this.embeddingService.embedderId;
-                knowledge.metadata = {
-                    ...knowledge.metadata,
-                    embedder_id: this.embeddingService.embedderId,
-                    embedded_at: new Date().toISOString()
-                };
-                debug(`🧬 Embedded content (${vec.length}d) — embedderId=${this.embeddingService.embedderId}`);
+            // Check liveness before attempting embed. isAvailable() uses a 500 ms
+            // probe cached for 30 s, so on the cold-unavailable path this costs
+            // ~500 ms instead of the full 5 s embed timeout. The first transition
+            // (available → unavailable or vice-versa) is logged so ops can see when
+            // Ollama comes back up.
+            const embedderAvailable = await this.embeddingService.isAvailable();
+            if (this._lastEmbedderAvailable !== embedderAvailable) {
+                if (embedderAvailable) {
+                    console.info('[unified_store] Embedding service is now AVAILABLE');
+                }
+                else {
+                    console.warn('[unified_store] Embedding service is now UNAVAILABLE — skipping embed (backfill will re-embed later)');
+                }
+                this._lastEmbedderAvailable = embedderAvailable;
             }
-            catch (e) {
-                // Ollama unreachable / dim mismatch / etc. Log and continue —
-                // the store path must succeed even when the embedder is down.
-                console.warn(`⚠️  unified_store: embedding failed (continuing without embed): ` +
-                    `${e instanceof Error ? e.message : String(e)}`);
+            if (embedderAvailable) {
+                try {
+                    const vec = await this.embeddingService.embed(knowledge.content);
+                    pendingEmbedding = vec;
+                    pendingEmbedderId = this.embeddingService.embedderId;
+                    knowledge.metadata = {
+                        ...knowledge.metadata,
+                        embedder_id: this.embeddingService.embedderId,
+                        embedded_at: new Date().toISOString()
+                    };
+                    debug(`🧬 Embedded content (${vec.length}d) — embedderId=${this.embeddingService.embedderId}`);
+                }
+                catch (e) {
+                    // Ollama unreachable / dim mismatch / etc. Log and continue —
+                    // the store path must succeed even when the embedder is down.
+                    console.warn(`⚠️  unified_store: embedding failed (continuing without embed): ` +
+                        `${e instanceof Error ? e.message : String(e)}`);
+                }
             }
         }
         // Step 1: Get intelligent storage decision

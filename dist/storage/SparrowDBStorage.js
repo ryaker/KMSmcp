@@ -258,20 +258,15 @@ export class SparrowDBStorage {
         //
         // Float formatting note: use Number.prototype.toString() defaults, NOT
         // toFixed/toPrecision — we want full f32 precision in the literal.
-        let listLit = '[';
-        for (let i = 0; i < embedding.length; i++) {
-            if (i > 0)
-                listLit += ',';
-            // Handle ±Infinity / NaN defensively (shouldn't happen for nomic, but
-            // would crash the Cypher parser).
-            const v = embedding[i];
-            if (!Number.isFinite(v)) {
-                logger.warn(`⚠️ storeEmbedding rejected — non-finite value at [${i}]`);
-                return false;
-            }
-            listLit += v.toString();
+        //
+        // Defensive check: reject if any value is ±Infinity / NaN — would crash
+        // the Cypher parser. Use .some() for early-exit over the whole array, then
+        // build the literal idiomatically.
+        if (Array.from(embedding).some(v => !Number.isFinite(v))) {
+            logger.warn(`⚠️ storeEmbedding rejected — embedding contains non-finite value(s)`);
+            return false;
         }
-        listLit += ']';
+        const listLit = `[${Array.from(embedding).join(',')}]`;
         try {
             this.db.execute(`MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(id)}}) ` +
                 `SET k.${SparrowDBStorage.VECTOR_PROPERTY} = ${listLit}, ` +
@@ -285,14 +280,20 @@ export class SparrowDBStorage {
                 `${e instanceof Error ? e.message : String(e)}`);
             return false;
         }
-        // Mirror the bookkeeping into the sidecar so consumers can check
+        // Mirror the bookkeeping into the in-memory sidecar so consumers can check
         // "has-embedding?" without round-tripping to SparrowDB.
+        //
+        // _saveSidecar() is intentionally NOT called here. On the hot path,
+        // store() already set embedder_id + embedded_at on knowledge.metadata
+        // before persisting the sidecar, so flushing again would be a redundant
+        // full-write of the ~1200-entry JSON file. The in-memory contentIndex is
+        // updated above to stay consistent; the next organic _saveSidecar() call
+        // (e.g. a subsequent delete/flag) will flush these values to disk.
         const entry = this.contentIndex.get(id);
         if (entry) {
             entry.embedder_id = embedderId;
             entry.embedded_at = new Date().toISOString();
             this.contentIndex.set(id, entry);
-            this._saveSidecar();
         }
         return true;
     }

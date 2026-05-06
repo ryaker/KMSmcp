@@ -66,6 +66,36 @@ export interface OllamaEmbeddingServiceConfig {
 }
 
 /**
+ * Determines whether an error from a fetch/embed call is worth retrying.
+ *
+ * Checks structured error codes first (portable across Node.js versions and
+ * fetch implementations). Falls back to message-string matching only as a last
+ * resort for environments where `code` isn't surfaced (e.g. browser fetch or
+ * third-party polyfills).
+ */
+function isRetryableEmbedError(err: unknown): boolean {
+  if (err instanceof Error) {
+    // AbortError = our own timeout signal fired
+    if (err.name === 'AbortError') return true
+
+    // Structured network error codes — check both the top-level error and the
+    // wrapped cause (Node 18+ wraps the original network error in err.cause).
+    const code = (err as NodeJS.ErrnoException).code
+      ?? ((err as any).cause as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'ECONNRESET') {
+      return true
+    }
+
+    // Fallback: message-string heuristics for environments that don't surface
+    // err.code (e.g. undici's "fetch failed" wrapper, older Node versions).
+    if (/fetch failed|ECONNREFUSED|timeout|ETIMEDOUT|ECONNRESET/i.test(err.message)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * Ollama-backed implementation. Calls POST /api/embeddings and returns the
  * resulting vector. Single retry on transient failure (timeout / network
  * error); throws thereafter.
@@ -126,11 +156,7 @@ export class OllamaEmbeddingService implements EmbeddingService {
         lastError = err
         // Only retry on timeout / network errors. Not on dimension mismatch
         // or other shape-level failures — those won't fix themselves.
-        const retryable = err instanceof Error && (
-          err.name === 'AbortError'
-          || /fetch failed|network|ECONNREFUSED|ECONNRESET/i.test(err.message)
-        )
-        if (!retryable) break
+        if (!isRetryableEmbedError(err)) break
         if (attempt === 0) {
           logger.warn(`[OllamaEmbeddingService] embed retry after error: ${err instanceof Error ? err.message : String(err)}`)
         }
