@@ -42,9 +42,9 @@ fi
 # missing cargo, and the caller (e.g. a fresh worktree clone) is left with no
 # binary and no recovery path. See KMS memory 9a601fc9 (gotcha #2) and PR #61.
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "❌ cargo not found in PATH — refusing to delete existing .node binary."
-  echo "   Install Rust toolchain (https://rustup.rs) or ensure ~/.cargo/bin is on PATH."
-  echo "   Existing index.*.node and sparrowdb.node left untouched."
+  echo "❌ cargo not found in PATH — refusing to delete existing .node binary." >&2
+  echo "   Install Rust toolchain (https://rustup.rs) or ensure ~/.cargo/bin is on PATH." >&2
+  echo "   Existing index.*.node and sparrowdb.node left untouched." >&2
   exit 1
 fi
 
