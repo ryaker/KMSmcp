@@ -12,12 +12,16 @@ export class UnifiedStoreTool {
     cache;
     ollamaRouter;
     enrichmentQueue;
-    constructor(router, storage, cache, ollamaRouter, enrichmentQueue) {
+    embeddingService;
+    /** Tracks last known availability to detect transitions and log them. */
+    _lastEmbedderAvailable = null;
+    constructor(router, storage, cache, ollamaRouter, enrichmentQueue, embeddingService) {
         this.router = router;
         this.storage = storage;
         this.cache = cache; // Now using real cache
         this.ollamaRouter = ollamaRouter ?? null;
         this.enrichmentQueue = enrichmentQueue ?? null;
+        this.embeddingService = embeddingService ?? null;
     }
     /**
      * Store knowledge with intelligent routing
@@ -79,6 +83,57 @@ export class UnifiedStoreTool {
             confidence: enrichedArgs.confidence || 0.8,
             relationships: enrichedArgs.relationships || []
         };
+        // ---------------------------------------------------------------------
+        // Pre-store: generate embedding (DG-T1-A)
+        //
+        // We compute the vector BEFORE the storage fan-out so that metadata
+        // bookkeeping (embedder_id, embedded_at) ships with the initial record
+        // — no second write to patch metadata. The vector bytes themselves are
+        // attached to the SparrowDB node in a SET call AFTER the graph store
+        // (the node has to exist first).
+        //
+        // Failures are non-fatal: a backfill job can re-embed later. The dedup
+        // gate retrieval path (DG-T1-B) treats "no embedder_id" as "skip dedup
+        // check" so we degrade gracefully when Ollama is down.
+        // ---------------------------------------------------------------------
+        let pendingEmbedding = null;
+        let pendingEmbedderId = null;
+        if (this.embeddingService) {
+            // Check liveness before attempting embed. isAvailable() uses a 500 ms
+            // probe cached for 30 s, so on the cold-unavailable path this costs
+            // ~500 ms instead of the full 5 s embed timeout. The first transition
+            // (available → unavailable or vice-versa) is logged so ops can see when
+            // Ollama comes back up.
+            const embedderAvailable = await this.embeddingService.isAvailable();
+            if (this._lastEmbedderAvailable !== embedderAvailable) {
+                if (embedderAvailable) {
+                    console.info('[unified_store] Embedding service is now AVAILABLE');
+                }
+                else {
+                    console.warn('[unified_store] Embedding service is now UNAVAILABLE — skipping embed (backfill will re-embed later)');
+                }
+                this._lastEmbedderAvailable = embedderAvailable;
+            }
+            if (embedderAvailable) {
+                try {
+                    const vec = await this.embeddingService.embed(knowledge.content);
+                    pendingEmbedding = vec;
+                    pendingEmbedderId = this.embeddingService.embedderId;
+                    knowledge.metadata = {
+                        ...knowledge.metadata,
+                        embedder_id: this.embeddingService.embedderId,
+                        embedded_at: new Date().toISOString()
+                    };
+                    debug(`🧬 Embedded content (${vec.length}d) — embedderId=${this.embeddingService.embedderId}`);
+                }
+                catch (e) {
+                    // Ollama unreachable / dim mismatch / etc. Log and continue —
+                    // the store path must succeed even when the embedder is down.
+                    console.warn(`⚠️  unified_store: embedding failed (continuing without embed): ` +
+                        `${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+        }
         // Step 1: Get intelligent storage decision
         const routingStartTime = Date.now();
         let primarySystem;
@@ -136,6 +191,28 @@ export class UnifiedStoreTool {
             // Queue enrichment once for the primary system (same content — no need to repeat per secondary)
             if (this.enrichmentQueue) {
                 this.enrichmentQueue.add(knowledge.id, knowledge.content, primarySystem);
+            }
+            // -----------------------------------------------------------------
+            // Persist embedding into SparrowDB HNSW vector index (DG-T1-A).
+            // The graph node was just created by storeInSystem('graph', ...);
+            // this SET attaches the 768-dim vector for the dedup gate's later
+            // retrieval (DG-T1-B). Non-fatal on failure — the metadata flag
+            // already on the record tells consumers an embedding was attempted.
+            // -----------------------------------------------------------------
+            if (pendingEmbedding && pendingEmbedderId) {
+                const graphAny = this.storage.graph;
+                if (typeof graphAny.storeEmbedding === 'function') {
+                    try {
+                        const ok = await graphAny.storeEmbedding(knowledge.id, pendingEmbedding, pendingEmbedderId);
+                        if (!ok) {
+                            debug(`⚠️ storeEmbedding returned false for ${knowledge.id} (likely no graph node — sidecar-orphan or vector index unavailable)`);
+                        }
+                    }
+                    catch (e) {
+                        console.warn(`⚠️  unified_store: storeEmbedding failed (non-fatal): ` +
+                            `${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
             }
             const storageTime = Date.now() - storageStartTime;
             // Step 3: Cache based on strategy
