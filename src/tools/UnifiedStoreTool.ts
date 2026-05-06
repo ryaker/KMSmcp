@@ -15,6 +15,94 @@ import type { EmbeddingService } from '../embedding/EmbeddingService.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
+// -------------------------------------------------------------------------
+// Dedup gate (DG-T1-B) — threshold constants and per-contentType overrides
+//
+// Calibrated empirically against ~1200-entry KMS corpus by DG-INV-2 (PR #60):
+//   - 0.88 refuse / 0.78 confirm = balanced precision/recall on real data
+//   - Spec's original 0.90/0.75 was too strict (lost 78% of dups) and
+//     too loose (17% false-positive on cross-topic distincts).
+//
+// Per-contentType overrides:
+//   - procedure: refuse=0.85 — refutation rewrites cluster lower
+//   - pattern:   refuse=0.92 — duplicates extremely tight on this type
+// -------------------------------------------------------------------------
+
+const DEDUP_DEFAULT_REFUSE = 0.88
+const DEDUP_DEFAULT_CONFIRM = 0.78
+
+const DEDUP_PER_TYPE_REFUSE: Record<string, number> = {
+  procedure: 0.85,
+  pattern: 0.92
+}
+
+function resolveDedupThresholds(
+  contentType: string | undefined,
+  override?: { refuse?: number; confirm?: number }
+): { refuse: number; confirm: number; usedOverride: boolean } {
+  // Override path: only honored when BOTH refuse and confirm are provided
+  // (asymmetric overrides are rejected to prevent the confirm-band collapsing
+  // or inverting). This is the documented escape-hatch contract.
+  if (override) {
+    const hasBoth = typeof override.refuse === 'number' && typeof override.confirm === 'number'
+    if (hasBoth) {
+      const r = override.refuse as number
+      const c = override.confirm as number
+      // Sanity: refuse must be ≥ confirm. If a caller passes them inverted,
+      // ignore the override and fall through to defaults.
+      if (r >= c) {
+        return { refuse: r, confirm: c, usedOverride: true }
+      }
+    }
+  }
+
+  const refuse = (contentType && DEDUP_PER_TYPE_REFUSE[contentType] !== undefined)
+    ? DEDUP_PER_TYPE_REFUSE[contentType]
+    : DEDUP_DEFAULT_REFUSE
+  return { refuse, confirm: DEDUP_DEFAULT_CONFIRM, usedOverride: false }
+}
+
+export interface DedupCandidate {
+  id: string
+  similarity: number
+  content_preview: string
+  contentType: string
+  source: string
+  subject?: string
+  created: string
+  flag?: string | null
+  /** Populated by Tier 2 LLM judge (DG-T2-A). null until that ticket lands. */
+  llm_relation: string | null
+}
+
+export interface DedupRequiredResponse {
+  status: 'dedup_required'
+  candidates: DedupCandidate[]
+  message: string
+  retry_with: string[]
+  /** Threshold band for the highest-similarity candidate ('refuse' | 'confirm'). */
+  band: 'refuse' | 'confirm'
+  /** Echo of the thresholds applied to this call (for caller diagnostics). */
+  thresholds: { refuse: number; confirm: number }
+}
+
+export type UnifiedStoreResult =
+  | {
+      success: true
+      id: string
+      storageDecision: StorageDecision
+      cached: boolean
+      performance: { routingTime: number; storageTime: number; totalTime: number }
+    }
+  | {
+      success: false
+      id: string
+      storageDecision: StorageDecision
+      cached: false
+      performance: { routingTime: number; storageTime: number; totalTime: number }
+    }
+  | DedupRequiredResponse
+
 export class UnifiedStoreTool {
   private router: IntelligentStorageRouter
   private storage: {
@@ -61,17 +149,31 @@ export class UnifiedStoreTool {
       type: string
       strength: number
     }>
-  }): Promise<{
-    success: boolean
-    id: string
-    storageDecision: StorageDecision
-    cached: boolean
-    performance: {
-      routingTime: number
-      storageTime: number
-      totalTime: number
+    /**
+     * DG-T1-C placeholder. When the dedup gate returns `dedup_required`, the
+     * caller may retry with `action` + `old_id` + `reason` to dispatch the
+     * appropriate corrective tool. The action dispatch path is NOT yet wired
+     * (tracked in DG-T1-C / issue #46). For now, the presence of `action` is
+     * logged and treated as an "explicit-retry" signal that bypasses the gate
+     * and proceeds to a normal store. This makes the gate end-to-end testable
+     * before the dispatch logic lands.
+     */
+    action?: 'supersede' | 'update' | 'complement' | 'force-new'
+    old_id?: string
+    reason?: string
+    related_to?: string
+    /**
+     * Admin-only escape hatch for batch imports, the reaper, and the
+     * calibration script. NOT advertised in the MCP tool schema; only honored
+     * when the call comes from a non-Claude-facing code path. Defaults to
+     * false (gate enforced).
+     */
+    options?: {
+      skip_dedup?: boolean
+      /** Per-call threshold tuning. Both refuse + confirm required (asymmetric rejected). */
+      dedup_threshold_override?: { refuse?: number; confirm?: number }
     }
-  }> {
+  }): Promise<UnifiedStoreResult> {
     const startTime = Date.now()
 
     debug(`\n🚀 UNIFIED STORE Starting...`)
@@ -186,6 +288,117 @@ export class UnifiedStoreTool {
             `${e instanceof Error ? e.message : String(e)}`
           )
         }
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Dedup gate (DG-T1-B) — Tier 1 vector similarity check
+    //
+    // Runs BEFORE the storage fan-out. If a near-duplicate exists for the
+    // same userId+contentType+(optional subject), we refuse the additive
+    // write and return `dedup_required` so the caller is forced to choose
+    // an explicit action (supersede/update/complement/force-new).
+    //
+    // Skipped when:
+    //   - options.skip_dedup === true (admin escape hatch)
+    //   - args.action is set (caller is explicitly retrying after a refusal —
+    //     dispatch is DG-T1-C / issue #46; for now we log and let it through)
+    //   - no embedding was generated (Ollama down, dim mismatch, etc.)
+    //   - the graph backend doesn't expose findSimilar (older binding)
+    //
+    // Latency: typical p50 ~5-15 ms (HNSW search 1-3 ms + JS post-filter).
+    // ---------------------------------------------------------------------
+    const skipDedup = args.options?.skip_dedup === true
+    if (args.action) {
+      console.info(
+        `[unified_store] action="${args.action}" received — action dispatch ` +
+        `not yet wired (DG-T1-C pending). Proceeding to normal store; caller ` +
+        `should manually invoke kms_supersede/kms_update for corrective writes.`
+      )
+    }
+    if (
+      pendingEmbedding &&
+      !skipDedup &&
+      !args.action &&
+      typeof (this.storage.graph as any).findSimilar === 'function'
+    ) {
+      const subjectFacet = typeof knowledge.metadata?.subject === 'string'
+        ? knowledge.metadata.subject
+        : undefined
+
+      const { refuse: refuseThreshold, confirm: confirmThreshold } = resolveDedupThresholds(
+        knowledge.contentType,
+        args.options?.dedup_threshold_override
+      )
+
+      try {
+        const candidates = await (this.storage.graph as any).findSimilar(
+          pendingEmbedding,
+          {
+            userId: knowledge.userId,
+            contentType: knowledge.contentType,
+            subject: subjectFacet,
+            topK: 5
+          }
+        ) as Array<{
+          id: string
+          similarity: number
+          contentType: string
+          source: string
+          subject?: string
+          created: string
+          flag?: string | null
+          content_preview: string
+        }>
+
+        if (candidates && candidates.length > 0) {
+          const top = candidates[0]
+          const inRefuse = top.similarity >= refuseThreshold
+          const inConfirm = !inRefuse && top.similarity >= confirmThreshold
+
+          if (inRefuse || inConfirm) {
+            const band: 'refuse' | 'confirm' = inRefuse ? 'refuse' : 'confirm'
+            const msg = inRefuse
+              ? `Likely duplicate found (cos=${top.similarity.toFixed(3)} ≥ ${refuseThreshold}). Retry with action.`
+              : `Borderline match found (cos=${top.similarity.toFixed(3)} in [${confirmThreshold}, ${refuseThreshold})). Retry with action to confirm intent.`
+
+            const oldIdHint = top.id
+            const response: DedupRequiredResponse = {
+              status: 'dedup_required',
+              candidates: candidates.map(c => ({
+                id: c.id,
+                similarity: c.similarity,
+                content_preview: c.content_preview,
+                contentType: c.contentType,
+                source: c.source,
+                subject: c.subject,
+                created: c.created,
+                flag: c.flag ?? null,
+                llm_relation: null  // Tier 2 (DG-T2-A) will populate this
+              })),
+              message: msg,
+              retry_with: [
+                `action=supersede&old_id=${oldIdHint}&reason=<...>`,
+                `action=update&old_id=${oldIdHint}&reason=<...>`,
+                `action=complement&related_to=${oldIdHint}`,
+                `action=force-new&reason=<justification>`
+              ],
+              band,
+              thresholds: { refuse: refuseThreshold, confirm: confirmThreshold }
+            }
+            debug(
+              `🛑 DEDUP GATE refused write (${band}): top sim=${top.similarity.toFixed(3)} ` +
+              `against id=${top.id}; ${candidates.length} candidate(s)`
+            )
+            return response
+          }
+        }
+      } catch (e) {
+        // Non-fatal: degrade to "no dedup check" rather than blocking the write.
+        console.warn(
+          `⚠️ unified_store: findSimilar failed (continuing without dedup): ` +
+          `${e instanceof Error ? e.message : String(e)}`
+        )
       }
     }
 
@@ -668,7 +881,11 @@ export class UnifiedStoreTool {
     reason?: string
     error?: string
   }> {
-    // Step 1: store the new entry (with forward-link to the old one)
+    // Step 1: store the new entry (with forward-link to the old one).
+    // skip_dedup: true — supersede is itself the corrective action that the
+    // dedup gate would suggest; running it through the gate would either
+    // self-refer (the new content is similar to the entry being superseded)
+    // or block valid corrections.
     const storeResult = await this.store({
       content: args.new_content,
       contentType: args.contentType,
@@ -679,10 +896,13 @@ export class UnifiedStoreTool {
         ...(args.metadata || {}),
         supersedes: args.old_id,
         supersede_reason: args.reason
-      }
+      },
+      options: { skip_dedup: true }
     })
 
-    if (!storeResult.success) {
+    // Discriminate the result. supersede() calls store() with skip_dedup:true,
+    // so dedup_required cannot be returned here — but TS still needs the guard.
+    if (!('success' in storeResult) || !storeResult.success) {
       return {
         success: false,
         old_id: args.old_id,

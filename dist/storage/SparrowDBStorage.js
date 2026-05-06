@@ -295,7 +295,167 @@ export class SparrowDBStorage {
             entry.embedded_at = new Date().toISOString();
             this.contentIndex.set(id, entry);
         }
+        // Incrementally maintain the internalId → UUID map so newly-embedded
+        // entries are findable via findSimilar without waiting for a full reload.
+        // Best-effort: a failure here just means findSimilar will rebuild on next
+        // call. Cheap query (single MATCH by id), runs on every embed write.
+        if (this.internalIdMapLoaded) {
+            try {
+                const res = this.db.execute(`MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(id)}}) RETURN id(k) AS nid`);
+                const nid = res.rows[0]?.['nid'];
+                if (nid !== null && nid !== undefined) {
+                    this.internalIdToUuid.set(String(nid), id);
+                }
+            }
+            catch {
+                // Non-fatal: just invalidate so next findSimilar reloads the full map.
+                this.internalIdMapLoaded = false;
+            }
+        }
         return true;
+    }
+    // -------------------------------------------------------------------------
+    // Vector retrieval (DG-T1-B)
+    //
+    // Top-K nearest-neighbour search over the HNSW vector index. Used by the
+    // dedup gate to find candidate near-duplicates BEFORE persisting a new
+    // unified_store call.
+    //
+    // The native vectorSearch returns NodeResult.id as the SparrowDB internal
+    // node u64 (decimal string), NOT the Knowledge.id UUID. We translate via
+    // an in-memory map populated lazily on first call, then kept fresh by
+    // storeEmbedding inserts.
+    //
+    // The native binding's vector index doesn't support property filters in
+    // 0.1.22, so we over-fetch (k * 5) candidates from HNSW and post-filter
+    // by userId / contentType / subject in JS. This is the documented pattern
+    // for SparrowDB until issue #406 (combined property + vector queries) lands.
+    //
+    // Score interpretation: cosine index → score IS cosine similarity directly
+    // (range -1..1, identical = 1.0). NO L2-distance conversion is applied;
+    // the spec assumption that conversion was needed was wrong (verified
+    // against sparrowdb-storage/vector_index.rs to_score() — for cosine the
+    // returned score is already the similarity).
+    // -------------------------------------------------------------------------
+    /** Reverse-lookup table: SparrowDB internal node id (u64 string) → Knowledge.id UUID. */
+    internalIdToUuid = new Map();
+    /** True once the internalIdToUuid map has been bulk-loaded from the graph. */
+    internalIdMapLoaded = false;
+    /**
+     * Build (or refresh) the internal-id → UUID lookup table by scanning all
+     * Knowledge nodes in the graph. Called lazily on first findSimilar() and
+     * incrementally maintained by storeEmbedding(). Idempotent.
+     */
+    _ensureInternalIdMap() {
+        if (this.internalIdMapLoaded)
+            return;
+        try {
+            const res = this.db.execute(`MATCH (k:Knowledge) RETURN id(k) AS nid, k.id AS short_id`);
+            for (const row of res.rows) {
+                const nid = row['nid'];
+                const shortId = row['short_id'];
+                if (nid === null || nid === undefined)
+                    continue;
+                const internalId = String(nid);
+                const prefix = String(shortId ?? '');
+                // Resolve possibly-truncated short_id to the full UUID via sidecar prefix lookup.
+                // SparrowDB 0.1.22 truncates string properties to 7 chars on read; the sidecar
+                // is the authoritative source for full UUIDs.
+                const entry = this._findEntryByPrefix(prefix);
+                if (entry) {
+                    this.internalIdToUuid.set(internalId, entry.id);
+                }
+            }
+            this.internalIdMapLoaded = true;
+            logger.debug(`✅ SparrowDB internalId→UUID map loaded: ${this.internalIdToUuid.size} entries`);
+        }
+        catch (e) {
+            logger.warn(`⚠️ SparrowDB internalId→UUID map load failed (vector results may be unresolvable): ${e instanceof Error ? e.message : String(e)}`);
+            // Mark loaded to avoid retry storm; degraded mode just returns fewer results.
+            this.internalIdMapLoaded = true;
+        }
+    }
+    /**
+     * Find top-K nearest-neighbour Knowledge nodes by embedding similarity.
+     *
+     * Filters applied (post-vector-search):
+     *   - userId           — required (scope is always within-user)
+     *   - contentType      — optional; matches exact contentType
+     *   - subject          — optional; matches metadata.subject exact string
+     *   - flag             — default: hide flagged entries (matches search() behavior)
+     *
+     * Returns up to topK candidates (default 5) sorted by descending similarity.
+     * Returns [] if the vector index is unavailable or no candidates match filters.
+     */
+    async findSimilar(embedding, options) {
+        if (!this.vectorIndexAvailable || typeof this.db.vectorSearch !== 'function') {
+            return [];
+        }
+        if (embedding.length !== SparrowDBStorage.VECTOR_DIMENSIONS) {
+            logger.warn(`⚠️ findSimilar rejected — dim mismatch: got ${embedding.length}, expected ${SparrowDBStorage.VECTOR_DIMENSIONS}`);
+            return [];
+        }
+        const topK = Math.max(1, Math.floor(options.topK ?? 5));
+        // Over-fetch by 5x to compensate for post-filter discards. SparrowDB's
+        // vector_search has no native property filter in 0.1.22.
+        const overFetch = Math.min(500, topK * 5);
+        let raw;
+        try {
+            raw = this.db.vectorSearch(SparrowDBStorage.VECTOR_LABEL, SparrowDBStorage.VECTOR_PROPERTY, embedding, overFetch);
+        }
+        catch (e) {
+            logger.warn(`⚠️ SparrowDB vectorSearch failed: ${e instanceof Error ? e.message : String(e)}`);
+            return [];
+        }
+        if (!raw || raw.length === 0)
+            return [];
+        this._ensureInternalIdMap();
+        const out = [];
+        for (const r of raw) {
+            // Translate internal node id → Knowledge UUID. Skip if unmapped (shouldn't
+            // happen for nodes created post-embedding-rollout, but guard just in case).
+            const uuid = this.internalIdToUuid.get(String(r.id));
+            if (!uuid)
+                continue;
+            const entry = this.contentIndex.get(uuid);
+            if (!entry)
+                continue;
+            // Filter: flagged entries (default hidden, matches search() behavior).
+            if (!options.includeFlagged && entry.flag)
+                continue;
+            // Filter: userId (always required).
+            if (entry.userId !== options.userId)
+                continue;
+            // Filter: contentType (optional).
+            if (options.contentType && entry.contentType !== options.contentType)
+                continue;
+            // Filter: subject (optional).
+            if (options.subject !== undefined) {
+                const s = entry.metadata?.subject;
+                if (typeof s !== 'string' || s !== options.subject)
+                    continue;
+            }
+            // Clamp similarity to a sane range — defensive: cosine similarity should
+            // be in [-1, 1] but f32 round-off in HNSW can drift a touch beyond.
+            const sim = Math.max(-1, Math.min(1, r.score));
+            out.push({
+                id: entry.id,
+                similarity: sim,
+                contentType: entry.contentType,
+                source: entry.source,
+                subject: typeof entry.metadata?.subject === 'string' ? entry.metadata.subject : undefined,
+                created: entry.timestamp,
+                flag: entry.flag ?? null,
+                content_preview: (entry.content ?? '').slice(0, 200)
+            });
+            if (out.length >= topK)
+                break;
+        }
+        // vector_search already returns descending by similarity, but post-filter
+        // can leave the top-K out of order if any high-sim candidate was filtered.
+        // Re-sort defensively.
+        out.sort((a, b) => b.similarity - a.similarity);
+        return out;
     }
     // -------------------------------------------------------------------------
     // Corrective operations: delete / update / flag
@@ -321,6 +481,14 @@ export class SparrowDBStorage {
         if (hadEntry) {
             this.contentIndex.delete(id);
             this._saveSidecar();
+        }
+        // Also drop any stale internalId → UUID entries so findSimilar doesn't
+        // surface ghosts. Cheap: scan ~1200 keys.
+        for (const [nid, uuid] of this.internalIdToUuid) {
+            if (uuid === id) {
+                this.internalIdToUuid.delete(nid);
+                break;
+            }
         }
         return hadEntry;
     }

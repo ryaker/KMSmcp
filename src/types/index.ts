@@ -178,4 +178,29 @@ export interface GraphStorage extends StorageSystem {
   ): Promise<boolean>
   findById?(id: string): { id: string; flag?: KnowledgeFlag | null; flag_date?: string; [k: string]: any } | null
   listFlagged?(): Array<{ id: string; flag?: KnowledgeFlag | null; flag_date?: string; [k: string]: any }>
+  // Embedding write (DG-T1-A) — persists a 768-dim vector into the HNSW index
+  // for the (Knowledge, embedding) tuple. Optional so older bindings degrade.
+  storeEmbedding?(id: string, embedding: Float32Array, embedderId: string): Promise<boolean>
+  // Top-K vector retrieval (DG-T1-B) — used by the dedup gate to find
+  // candidate near-duplicates before persisting a new unified_store call.
+  // Optional so non-vector backends degrade to "no dedup".
+  findSimilar?(
+    embedding: Float32Array,
+    options: {
+      userId: string
+      contentType?: string
+      subject?: string
+      topK?: number
+      includeFlagged?: boolean
+    }
+  ): Promise<Array<{
+    id: string
+    similarity: number
+    contentType: string
+    source: string
+    subject?: string
+    created: string
+    flag?: string | null
+    content_preview: string
+  }>>
 }
