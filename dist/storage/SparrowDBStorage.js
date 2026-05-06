@@ -106,6 +106,15 @@ export class SparrowDBStorage {
     contentIndex = new Map();
     // Identity registry loaded from config/known-people.json.
     knownPeople = null;
+    // Vector index dimensions (dedup gate DG-T1-A). 768 = nomic-embed-text.
+    static VECTOR_DIMENSIONS = 768;
+    static VECTOR_LABEL = 'Knowledge';
+    static VECTOR_PROPERTY = 'embedding';
+    // True iff the loaded sparrowdb binding exposes createVectorIndex/vectorSearch
+    // AND the index initialization on the configured (label, property) succeeded.
+    // When false, storeEmbedding becomes a no-op so the dedup gate degrades to
+    // "graph-only" rather than crashing the store path.
+    vectorIndexAvailable = false;
     constructor(config) {
         this.dbPath =
             config?.dbPath ||
@@ -127,7 +136,38 @@ export class SparrowDBStorage {
         this._loadSidecar();
         // Load identity registry
         this._loadKnownPeople();
-        logger.debug(`✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar`);
+        // Initialize HNSW vector index for dedup gate (DG-T1-A).
+        // Idempotent in the binding (no-op if it already exists), but we
+        // additionally guard against missing-method on older builds.
+        this._initializeVectorIndex();
+        logger.debug(`✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar, ` +
+            `vectorIndex=${this.vectorIndexAvailable ? 'ready' : 'unavailable'}`);
+    }
+    _initializeVectorIndex() {
+        if (typeof this.db.createVectorIndex !== 'function') {
+            logger.warn('⚠️ SparrowDB binding does not expose createVectorIndex — ' +
+                'embedding-on-write disabled. Upgrade to sparrowdb >= 0.1.22.');
+            this.vectorIndexAvailable = false;
+            return;
+        }
+        try {
+            this.db.createVectorIndex(SparrowDBStorage.VECTOR_LABEL, SparrowDBStorage.VECTOR_PROPERTY, SparrowDBStorage.VECTOR_DIMENSIONS, 'cosine');
+            this.vectorIndexAvailable = true;
+            logger.debug(`✅ SparrowDB vector index ready: ` +
+                `(${SparrowDBStorage.VECTOR_LABEL}, ${SparrowDBStorage.VECTOR_PROPERTY}) ` +
+                `dim=${SparrowDBStorage.VECTOR_DIMENSIONS} metric=cosine`);
+        }
+        catch (e) {
+            // Per the binding contract, createVectorIndex is idempotent and a
+            // second call for the same (label, property) is a no-op. So a thrown
+            // error here is unexpected — log and continue with embedding disabled.
+            logger.warn(`⚠️ SparrowDB createVectorIndex failed — embedding-on-write disabled: ${e instanceof Error ? e.message : String(e)}`);
+            this.vectorIndexAvailable = false;
+        }
+    }
+    /** Whether the SparrowDB HNSW vector index is live for embedding writes. */
+    isVectorIndexAvailable() {
+        return this.vectorIndexAvailable;
     }
     async close() {
         if (this.db) {
@@ -188,6 +228,73 @@ export class SparrowDBStorage {
         await this._createSemanticRelationships(knowledge);
         logger.debug(`✅ SparrowDB stored ${knowledge.id} with ` +
             `${knowledge.relationships?.length ?? 0} relationships`);
+    }
+    // -------------------------------------------------------------------------
+    // Embedding write (DG-T1-A)
+    //
+    // Persists a 768-dim Float32Array into the HNSW vector index for the
+    // (Knowledge, embedding) tuple. Also stores `embedderId` as a property on
+    // the Knowledge node so an embedder swap can invalidate stale vectors via a
+    // single property-equality query (spec §9 — embedding drift mitigation).
+    //
+    // Idempotent: re-calling for the same id replaces the embedding by routing
+    // through SET (the binding's vector-index DDL handles upsert internally).
+    //
+    // Returns true if the embedding was persisted, false if the index isn't
+    // available or the node doesn't exist (e.g. sidecar-orphan).
+    // -------------------------------------------------------------------------
+    async storeEmbedding(id, embedding, embedderId) {
+        if (!this.vectorIndexAvailable) {
+            logger.debug(`storeEmbedding skipped (no vector index): ${id}`);
+            return false;
+        }
+        if (embedding.length !== SparrowDBStorage.VECTOR_DIMENSIONS) {
+            logger.warn(`⚠️ storeEmbedding rejected — dim mismatch: got ${embedding.length}, expected ${SparrowDBStorage.VECTOR_DIMENSIONS}`);
+            return false;
+        }
+        // Format the Float32Array as a Cypher list literal so SET attaches it to
+        // the existing node. SparrowDB indexes vectors automatically when the
+        // (label, property) is registered with createVectorIndex.
+        //
+        // Float formatting note: use Number.prototype.toString() defaults, NOT
+        // toFixed/toPrecision — we want full f32 precision in the literal.
+        let listLit = '[';
+        for (let i = 0; i < embedding.length; i++) {
+            if (i > 0)
+                listLit += ',';
+            // Handle ±Infinity / NaN defensively (shouldn't happen for nomic, but
+            // would crash the Cypher parser).
+            const v = embedding[i];
+            if (!Number.isFinite(v)) {
+                logger.warn(`⚠️ storeEmbedding rejected — non-finite value at [${i}]`);
+                return false;
+            }
+            listLit += v.toString();
+        }
+        listLit += ']';
+        try {
+            this.db.execute(`MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(id)}}) ` +
+                `SET k.${SparrowDBStorage.VECTOR_PROPERTY} = ${listLit}, ` +
+                `    k.embedderId = ${cypherStr(embedderId)}`);
+        }
+        catch (e) {
+            // The most common failure is "node not found" — happens for the ~185
+            // sidecar-orphan entries that exist in the JSON sidecar but never got
+            // a graph node (pre-cutover legacy). Logged at debug, not warn.
+            logger.debug(`storeEmbedding: graph SET failed for ${id} (likely sidecar-orphan): ` +
+                `${e instanceof Error ? e.message : String(e)}`);
+            return false;
+        }
+        // Mirror the bookkeeping into the sidecar so consumers can check
+        // "has-embedding?" without round-tripping to SparrowDB.
+        const entry = this.contentIndex.get(id);
+        if (entry) {
+            entry.embedder_id = embedderId;
+            entry.embedded_at = new Date().toISOString();
+            this.contentIndex.set(id, entry);
+            this._saveSidecar();
+        }
+        return true;
     }
     // -------------------------------------------------------------------------
     // Corrective operations: delete / update / flag

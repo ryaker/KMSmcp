@@ -16,6 +16,7 @@ import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js';
 import { OllamaInference } from './inference/OllamaInference.js';
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js';
 import { EntityLinker } from './inference/EntityLinker.js';
+import { OllamaEmbeddingService } from './embedding/EmbeddingService.js';
 import { MongoDBStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js';
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js';
 export class UnifiedKMSServer {
@@ -121,10 +122,17 @@ export class UnifiedKMSServer {
         const enrichmentQueue = new EnrichmentQueue(null);
         const entityLinker = new EntityLinker(ollamaInference, this.storage.graph, this.storage.mongodb);
         enrichmentQueue.setLinker(entityLinker);
+        // Embedding service for the dedup gate (DG-T1-A). Same Ollama host as
+        // the inference layer, but a different model (nomic-embed-text @ 768d).
+        // Failures here are non-fatal — UnifiedStoreTool catches and continues.
+        console.log('🧬 Initializing Embedding Service (nomic-embed-text)...');
+        const embeddingService = new OllamaEmbeddingService({
+            baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
+        });
         // Step 4: Initialize tools
         console.log('🛠️  Initializing Tools...');
         this.tools = {
-            store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue),
+            store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue, embeddingService),
             search: new UnifiedSearchTool(this.storage, this.factCache),
             instructions: new KMSInstructionsTool(),
             documentStore: new DocumentStoreTool(this.storage.mongodb)
