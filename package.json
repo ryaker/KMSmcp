@@ -21,7 +21,9 @@
     "clean": "rm -rf dist",
     "auth0:cleanup": "tsx scripts/cleanup-auth0-clients.ts",
     "auth0:cleanup:dry-run": "tsx scripts/cleanup-auth0-clients.ts --dry-run",
-    "build:sparrowdb": "bash scripts/build-sparrowdb-node.sh"
+    "build:sparrowdb": "bash scripts/build-sparrowdb-node.sh",
+    "import:granola": "tsx scripts/import-granola.ts",
+    "import:granola:dry-run": "tsx scripts/import-granola.ts --dry-run"
   },
   "keywords": [
     "mcp",
@@ -36,6 +38,7 @@
   "author": "Richard Yaker",
   "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.1",
     "@modelcontextprotocol/sdk": "^1.18.1",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.5.0",
