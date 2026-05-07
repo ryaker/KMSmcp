@@ -1,6 +1,9 @@
 node_modules/
 dist/
-scripts/
+# Ignore the top-level scripts/ directory only (not src/scripts/).
+# A bare "scripts/" matches at any depth — DG-BACKFILL added src/scripts/
+# (compiled to dist/scripts/) and was being silently swallowed.
+/scripts/
 .env*
 *.env
 .env.local
