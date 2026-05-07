@@ -2,11 +2,20 @@
  * DG-T1-A — embedding-on-write integration test (issue #43).
  *
  * Verifies the UnifiedStoreTool wires up the embedding pipeline correctly:
- *   1. Successful store → embed called → storeEmbedding called with right args
- *   2. metadata.embedder_id and metadata.embedded_at are set on every backend
+ *   1. Successful store → embed called → graph.store receives the vector
+ *      via transient metadata.__pending_embedding (inline-MERGE path)
+ *   2. metadata.embedder_id and metadata.embedded_at are set on every backend,
+ *      but metadata.__pending_embedding/__pending_embedder_id ARE NOT (transient
+ *      handoff fields scrubbed before non-graph backends see them)
  *   3. Ollama-unreachable case: store still succeeds, embedding skipped
  *   4. SparrowDB storeEmbedding-not-implemented case: store still succeeds
  *   5. No EmbeddingService injected: store works as before (back-compat)
+ *
+ * Why metadata-handoff and not a separate storeEmbedding() call: SparrowDB
+ * 0.1.22's HNSW vector index is populated only when the embedding appears
+ * INSIDE a MERGE/CREATE pattern's literal property dict. SET-on-existing-node
+ * (the previous shape) silently no-ops — no error, no property stored, no HNSW
+ * write. See channel msg #202 to SparrowDB session.
  */
 
 import { UnifiedStoreTool } from '../tools/UnifiedStoreTool.js'
@@ -87,7 +96,7 @@ describe('DG-T1-A — UnifiedStoreTool embedding-on-write (issue #43)', () => {
   // Happy path
   // -------------------------------------------------------------------------
 
-  it('calls embed() once and storeEmbedding() with the resulting vector', async () => {
+  it('calls embed() once and hands the vector to graph.store via transient metadata', async () => {
     const tool = new UnifiedStoreTool(
       router,
       { mongodb: mongo, graph, mem0 },
@@ -107,13 +116,19 @@ describe('DG-T1-A — UnifiedStoreTool embedding-on-write (issue #43)', () => {
     expect(embedder.embed).toHaveBeenCalledTimes(1)
     expect(embedder.embed).toHaveBeenCalledWith('this is a test fact for the dedup gate')
 
+    // The new contract: graph.store receives the embedding inline via metadata
+    // for HNSW population. The legacy storeEmbedding() is only used as a
+    // fallback when the graph backend isn't part of the routing decision.
+    const graphCalls = captured.filter(c => c.backend === 'graph')
+    expect(graphCalls.length).toBe(1)
+    const graphMeta = graphCalls[0].knowledge.metadata
+    expect(graphMeta.__pending_embedding).toBeInstanceOf(Float32Array)
+    expect(graphMeta.__pending_embedding.length).toBe(768)
+    expect(graphMeta.__pending_embedder_id).toBe('nomic-embed-text:v1')
+
+    // graph is the primary backend — fallback storeEmbedding() must NOT fire.
     const storeEmbeddingMock = (graph as any).storeEmbedding as jest.Mock
-    expect(storeEmbeddingMock).toHaveBeenCalledTimes(1)
-    const [id, vec, embedderId] = storeEmbeddingMock.mock.calls[0]
-    expect(id).toBe(result.id)
-    expect(vec).toBeInstanceOf(Float32Array)
-    expect(vec.length).toBe(768)
-    expect(embedderId).toBe('nomic-embed-text:v1')
+    expect(storeEmbeddingMock).not.toHaveBeenCalled()
   })
 
   it('persists metadata.embedder_id and metadata.embedded_at on every backend', async () => {
@@ -138,12 +153,19 @@ describe('DG-T1-A — UnifiedStoreTool embedding-on-write (issue #43)', () => {
       // Timestamp must parse to a valid date.
       expect(Number.isNaN(Date.parse(cap.knowledge.metadata.embedded_at))).toBe(false)
     }
+    // Transient handoff fields must be scrubbed from non-graph backends —
+    // they're only there to ride through SparrowDBStorage.store() and feed the
+    // inline-MERGE pattern. Mongo/Mem0 should never see them.
+    const nonGraph = captured.filter(c => c.backend !== 'graph')
+    for (const cap of nonGraph) {
+      expect(cap.knowledge.metadata.__pending_embedding).toBeUndefined()
+      expect(cap.knowledge.metadata.__pending_embedder_id).toBeUndefined()
+    }
   })
 
-  it('storeEmbedding is called AFTER the graph store (node must exist first)', async () => {
-    const callOrder: string[] = []
-    graph.store = jest.fn(async () => { callOrder.push('graph.store') })
-    ;(graph as any).storeEmbedding = jest.fn(async () => { callOrder.push('storeEmbedding') })
+  it('graph.store sees the inline-embedding handoff fields on its metadata payload', async () => {
+    let capturedMeta: any = null
+    graph.store = jest.fn(async (k: any) => { capturedMeta = k.metadata })
 
     const tool = new UnifiedStoreTool(
       router, { mongodb: mongo, graph, mem0 }, cache, null, null, embedder
@@ -151,10 +173,14 @@ describe('DG-T1-A — UnifiedStoreTool embedding-on-write (issue #43)', () => {
 
     await tool.store({ content: 'order test', contentType: 'fact', userId: 'u' })
 
-    const graphIdx = callOrder.indexOf('graph.store')
-    const embedIdx = callOrder.indexOf('storeEmbedding')
-    expect(graphIdx).toBeGreaterThanOrEqual(0)
-    expect(embedIdx).toBeGreaterThan(graphIdx)
+    expect(capturedMeta).not.toBeNull()
+    // The vector must be present on graph.store's view of metadata — that's
+    // how SparrowDBStorage knows to use the inline-MERGE pattern.
+    expect(capturedMeta.__pending_embedding).toBeInstanceOf(Float32Array)
+    expect(capturedMeta.__pending_embedder_id).toBe('nomic-embed-text:v1')
+    // The legacy post-store storeEmbedding() fallback is not invoked when
+    // graph is in the routing target list.
+    expect((graph as any).storeEmbedding).not.toHaveBeenCalled()
   })
 
   // -------------------------------------------------------------------------

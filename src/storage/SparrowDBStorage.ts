@@ -305,21 +305,85 @@ export class SparrowDBStorage implements StorageSystem {
       ? knowledge.timestamp.toISOString()
       : String(knowledge.timestamp)
 
-    // Store the structural identity in SparrowDB.
-    // Strings > 7 chars are truncated by the current binary (SPA bug), so we
-    // store only the ID (≤7 chars works for most ids, but we store it anyway
-    // to anchor graph structure), and keep full content in the sidecar.
-    this.db.execute(
-      `CREATE (k:Knowledge {` +
-      `  id: ${cypherStr(knowledge.id)},` +
-      `  contentType: ${cypherStr(knowledge.contentType)},` +
-      `  source: ${cypherStr(knowledge.source)},` +
-      `  userId: ${cypherStr(knowledge.userId ?? '')},` +
-      `  confidence: ${cypherStr(String(knowledge.confidence))}` +
-      `})`
-    )
+    // Pluck a transient embedding payload off knowledge.metadata if the caller
+    // attached one. This is the inline-MERGE path for HNSW population — see
+    // storeEmbedding() for the architectural rationale (SparrowDB 0.1.22's
+    // MATCH+SET silently no-ops for vector params; only MERGE/CREATE pattern's
+    // literal property dict triggers idx.insert). The payload uses a
+    // double-underscored key to mark it transient — we strip it before the
+    // sidecar write so it never persists.
+    const META_EMB_KEY = '__pending_embedding'
+    const META_EMB_ID_KEY = '__pending_embedder_id'
+    const inlineEmb = knowledge.metadata?.[META_EMB_KEY] as Float32Array | number[] | undefined
+    const inlineEmbId = knowledge.metadata?.[META_EMB_ID_KEY] as string | undefined
+    const hasInlineEmb =
+      inlineEmb !== undefined &&
+      inlineEmbId !== undefined &&
+      this.vectorIndexAvailable &&
+      (inlineEmb instanceof Float32Array
+        ? inlineEmb.length === SparrowDBStorage.VECTOR_DIMENSIONS
+        : Array.isArray(inlineEmb) && inlineEmb.length === SparrowDBStorage.VECTOR_DIMENSIONS)
+
+    if (hasInlineEmb) {
+      const embArray = inlineEmb instanceof Float32Array ? Array.from(inlineEmb) : (inlineEmb as number[])
+      // Reject non-finite values — would corrupt HNSW (same guard as storeEmbedding).
+      if (embArray.some(v => !Number.isFinite(v))) {
+        logger.warn(`⚠️ store: rejecting inline embedding (non-finite value) — falling back to no-embed CREATE`)
+        this._createWithoutEmbedding(knowledge)
+      } else {
+        try {
+          // ALL props INLINE in one MERGE pattern. SparrowDB 0.1.22 honours
+          // HNSW population only when the vector property appears as a $param
+          // inside the MERGE pattern's literal property dict. Compound
+          // MERGE+SET parses but the SET clause silently no-ops in 0.1.22
+          // (verified — see channel msg #202 to SparrowDB session).
+          ;(this.db as any).executeWithParams(
+            `MERGE (k:Knowledge {` +
+            `  id: ${cypherStr(knowledge.id)},` +
+            `  contentType: ${cypherStr(knowledge.contentType)},` +
+            `  source: ${cypherStr(knowledge.source)},` +
+            `  userId: ${cypherStr(knowledge.userId ?? '')},` +
+            `  confidence: ${cypherStr(String(knowledge.confidence))},` +
+            `  embedderId: ${cypherStr(inlineEmbId!)},` +
+            `  embedding: $emb` +
+            `})`,
+            { emb: embArray }
+          )
+          // Incrementally maintain the internalId → UUID map for findSimilar.
+          if (this.internalIdMapLoaded) {
+            try {
+              const res = this.db.execute(
+                `MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(knowledge.id)}}) RETURN id(k) AS nid`
+              )
+              const nid = res.rows[0]?.['nid']
+              if (nid !== null && nid !== undefined) {
+                this.internalIdToUuid.set(String(nid), knowledge.id)
+              }
+            } catch {
+              this.internalIdMapLoaded = false
+            }
+          }
+        } catch (e) {
+          // If the inline MERGE failed (parser change, etc.), don't lose the
+          // node entirely — fall back to CREATE-without-embedding so the
+          // entry still lands in the graph and can be re-embedded later.
+          logger.warn(
+            `⚠️ store: inline-embedding MERGE failed (${e instanceof Error ? e.message : String(e)}) — ` +
+            `falling back to no-embed CREATE`
+          )
+          this._createWithoutEmbedding(knowledge)
+        }
+      }
+    } else {
+      this._createWithoutEmbedding(knowledge)
+    }
 
     // Persist full-length content in the sidecar.
+    // Strip the transient embedding payload before persisting so it never
+    // serializes into the JSON sidecar (would balloon the file by ~6KB/entry).
+    const cleanMetadata = { ...(knowledge.metadata ?? {}) }
+    delete cleanMetadata[META_EMB_KEY]
+    delete cleanMetadata[META_EMB_ID_KEY]
     const entry: ContentEntry = {
       id: knowledge.id,
       content: knowledge.content,
@@ -328,7 +392,7 @@ export class SparrowDBStorage implements StorageSystem {
       userId: knowledge.userId ?? '',
       confidence: knowledge.confidence,
       timestamp: ts,
-      metadata: knowledge.metadata ?? {},
+      metadata: cleanMetadata,
       flag: knowledge.flag ?? null,
       flag_note: knowledge.flag_note,
       flag_date: knowledge.flag_date instanceof Date ? knowledge.flag_date.toISOString() : knowledge.flag_date,
@@ -351,6 +415,25 @@ export class SparrowDBStorage implements StorageSystem {
     logger.debug(
       `✅ SparrowDB stored ${knowledge.id} with ` +
       `${knowledge.relationships?.length ?? 0} relationships`
+    )
+  }
+
+  /**
+   * Plain CREATE for the no-embedding path (and the inline-MERGE fallback).
+   * Kept identical to the legacy 0.1.x shape — five literal string props on a
+   * single MATCH-ready row. Don't use SET to add props later; SparrowDB 0.1.22
+   * silently no-ops SET on existing nodes (proven in /tmp/test-single-prop.js
+   * and reported upstream via channel #202). All node props go inline here.
+   */
+  private _createWithoutEmbedding(knowledge: UnifiedKnowledge): void {
+    this.db.execute(
+      `CREATE (k:Knowledge {` +
+      `  id: ${cypherStr(knowledge.id)},` +
+      `  contentType: ${cypherStr(knowledge.contentType)},` +
+      `  source: ${cypherStr(knowledge.source)},` +
+      `  userId: ${cypherStr(knowledge.userId ?? '')},` +
+      `  confidence: ${cypherStr(String(knowledge.confidence))}` +
+      `})`
     )
   }
 
@@ -385,27 +468,24 @@ export class SparrowDBStorage implements StorageSystem {
       return false
     }
 
-    // Format the Float32Array as a Cypher list literal so SET attaches it to
-    // the existing node. SparrowDB indexes vectors automatically when the
-    // (label, property) is registered with createVectorIndex.
-    //
-    // Float formatting note: use Number.prototype.toString() defaults, NOT
-    // toFixed/toPrecision — we want full f32 precision in the literal.
-    //
-    // Defensive check: reject if any value is ±Infinity / NaN — would crash
-    // the Cypher parser. Use .some() for early-exit over the whole array, then
-    // build the literal idiomatically.
+    // SparrowDB indexes vectors automatically when the (label, property) was
+    // registered via createVectorIndex. Defensive check: reject if any value is
+    // ±Infinity / NaN — would corrupt HNSW.
     if (Array.from(embedding).some(v => !Number.isFinite(v))) {
       logger.warn(`⚠️ storeEmbedding rejected — embedding contains non-finite value(s)`)
       return false
     }
-    const listLit = `[${Array.from(embedding).join(',')}]`
 
     try {
-      this.db.execute(
+      // SparrowDB 0.1.22+: Cypher parser rejects list literals in SET, so the
+      // embedding MUST go through executeWithParams (PR #409). The engine
+      // coerces JS Array → engine List → Vec<f32> for HNSW index population.
+      // String props (embedderId) still work via literal SET.
+      ;(this.db as any).executeWithParams(
         `MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(id)}}) ` +
-        `SET k.${SparrowDBStorage.VECTOR_PROPERTY} = ${listLit}, ` +
-        `    k.embedderId = ${cypherStr(embedderId)}`
+        `SET k.${SparrowDBStorage.VECTOR_PROPERTY} = $emb, ` +
+        `    k.embedderId = ${cypherStr(embedderId)}`,
+        { emb: Array.from(embedding) }
       )
     } catch (e) {
       // The most common failure is "node not found" — happens for the ~185
@@ -908,20 +988,10 @@ export class SparrowDBStorage implements StorageSystem {
       )
       const totalNodes = Number(nodeResult.rows[0]?.['count(n)'] ?? 0)
 
-      // SparrowDB 0.1.22 binding regression: MATCH ()-[r]->() RETURN count(r)
-      // throws "not found" / GenericFailure even when relationships exist. Until the
-      // upstream fix lands, default to 0 and don't propagate the error — node count
-      // is the more important figure and rel count can be reconstructed from the
-      // sidecar if needed.
-      let totalRelationships = 0
-      try {
-        const relResult = this.db.execute(
-          `MATCH ()-[r]->() RETURN count(r) AS cnt`
-        )
-        totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0)
-      } catch (relErr) {
-        logger.warn('⚠️ SparrowDB rel-count query failed (binding regression — defaulting to 0):', relErr)
-      }
+      const relResult = this.db.execute(
+        `MATCH ()-[r]->() RETURN count(r) AS cnt`
+      )
+      const totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0)
 
       // Content type distribution from sidecar (authoritative — SparrowDB strings truncated).
       const contentTypes: Record<string, number> = {}

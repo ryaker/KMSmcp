@@ -62,13 +62,19 @@ export class Mem0Storage implements StorageSystem {
 
       const userId = this.generateUserId(knowledge)
 
-      // Store in Mem0 with rich metadata. v3: top-level entity is `userId` (camelCase).
+      // Mem0 v3 add expects `user_id` (snake) at top level — NOT `userId` (camel).
+      // Same shape as v3 search/getAll (see Mem0Storage.search above and PR #59):
+      // the SDK forwards options to the wire as-is for /v1/memories/, and the
+      // server requires one of {agent_id, user_id, app_id, run_id} at body root
+      // ("non_field_errors: At least one of the filters: ... is required!"
+      // observed live in production after the search/getAll fix shipped, since
+      // add was overlooked in PR #59). camelCase `userId` is silently dropped.
       const messages = [{
         role: 'user' as const,
         content: knowledge.content
       }]
-      const options = {
-        userId,
+      const options: any = {
+        user_id: userId,
         metadata: {
           kms_id: knowledge.id,
           content_type: knowledge.contentType,
