@@ -80,6 +80,10 @@ export interface FileRecord {
 export interface CliOptions {
   roots: string[]
   includeAskMethod: boolean
+  /** Opt-in for ~/Documents/Light_Work. Excluded by default — known misinfo corpus. */
+  includeLightWork: boolean
+  /** Opt-in for /Volumes-style path to L16 reverse-engineering (codex-curated, trusted). */
+  includeL16ReverseEng: boolean
   dryRun: boolean
   limit: number | null
   after: Date | null
@@ -98,10 +102,13 @@ export interface CliOptions {
 
 export const HOME = os.homedir()
 
-/** The 7 verified canonical roots, per spec. ASK Method opt-in adds an 8th. */
+/**
+ * Default canonical roots — 6 high-trust corpus locations.
+ * Two opt-in roots (Light_Work, ASK Method) require explicit flags because
+ * they contain content KMS shouldn't ingest by default.
+ */
 export const DEFAULT_ROOTS = [
   path.join(HOME, 'Documents/Notes'),
-  path.join(HOME, 'Documents/Light_Work'),
   path.join(HOME, 'Documents/Job_Search_2026'),
   path.join(HOME, 'Documents/Project Caribou'),
   path.join(HOME, 'Desktop/Tengo'),
@@ -129,6 +136,39 @@ export const EXPLICIT_ROOTS_OVERRIDE_GIT_CHECK = true
 
 /** ASK Method opt-in root. */
 export const ASK_METHOD_ROOT = path.join(HOME, 'Documents/ASK Method')
+
+/**
+ * Light_Work opt-in root — UNTRUSTED corpus.
+ *
+ * Excluded from defaults per Rich's 2026-05-07 directive: "The light_work stuff
+ * may have a lot of misinfo." The L16 reverse-engineering project went through
+ * many wrong paths before being re-run by codex under disciplined controls;
+ * artifacts in this directory predate that discipline and may contain incorrect
+ * claims about Lumen/libcp internals (e.g. wrong AWB direction, wrong tone-curve
+ * version, wrong demosaic stage, wrong B-camera config semantics — see KMS
+ * memory "L16 Phoenix spike failure root cause inventory" 2026-04-13).
+ *
+ * Ingesting this corpus by default would pollute KMS with misinformation that
+ * would then leak into context injection on every future session. Operator must
+ * explicitly opt in via --include-light-work AND understand that the dedup gate
+ * cannot filter for accuracy — only for novelty.
+ */
+export const LIGHT_WORK_ROOT = path.join(HOME, 'Documents/Light_Work')
+
+/**
+ * L16 reverse-engineering opt-in root — TRUSTED curated corpus.
+ *
+ * Per Rich's 2026-05-07 directive, this path is the disciplined codex-run
+ * version of the L16 reverse-engineering work, replacing the contaminated
+ * Light_Work artifacts. Codex enforces verification gates and guards against
+ * the "agent producing plausible-looking but wrong specs" failure mode that
+ * affected Light_Work. Content here is trustworthy in a way Light_Work isn't.
+ *
+ * Opt-in (not default) because it's project-specific, not personal-knowledge:
+ * 124 .md files covering libcp disassembly, pipeline stages, calibration data.
+ * Operators explicitly working on L16/Phoenix should pass --include-l16-reveng.
+ */
+export const L16_REVENG_ROOT = '/Users/ryaker/Dev/L16_Lumen_ReverseEngineering'
 
 /** Default sync-log path. */
 export const DEFAULT_SYNC_LOG = path.join(HOME, '.kms-md-corpus-sync.json')
@@ -319,6 +359,8 @@ export async function walkRoot(
 export async function discoverFiles(opts: CliOptions): Promise<FileRecord[]> {
   const roots = [...opts.roots, ...opts.extraRoots]
   if (opts.includeAskMethod) roots.push(ASK_METHOD_ROOT)
+  if (opts.includeLightWork) roots.push(LIGHT_WORK_ROOT)
+  if (opts.includeL16ReverseEng) roots.push(L16_REVENG_ROOT)
 
   const seen = new Set<string>()
   const out: FileRecord[] = []
@@ -786,6 +828,8 @@ export function parseArgs(argv: string[]): CliOptions {
     roots: DEFAULT_ROOTS,
     extraRoots: [],
     includeAskMethod: false,
+    includeLightWork: false,
+    includeL16ReverseEng: false,
     dryRun: false,
     limit: null,
     after: null,
@@ -804,6 +848,12 @@ export function parseArgs(argv: string[]): CliOptions {
         break
       case '--include-ask-method':
         opts.includeAskMethod = true
+        break
+      case '--include-light-work':
+        opts.includeLightWork = true
+        break
+      case '--include-l16-reveng':
+        opts.includeL16ReverseEng = true
         break
       case '--dry-run':
         opts.dryRun = true
@@ -850,6 +900,12 @@ Usage:
 Options:
   --root <path>           Add an extra root (in addition to defaults)
   --include-ask-method    Include ~/Documents/ASK Method (1317 files, 742MB)
+                          (separate product corpus, not personal knowledge)
+  --include-light-work    Include ~/Documents/Light_Work (51 files)
+                          ⚠️  UNTRUSTED — contains pre-discipline L16 misinfo.
+                          Dedup gate cannot filter for accuracy. Use with caution.
+  --include-l16-reveng    Include /Users/ryaker/Dev/L16_Lumen_ReverseEngineering
+                          (124 files, codex-curated, trusted)
   --dry-run               Plan only, no writes
   --limit <n>             Process at most N files
   --after <YYYY-MM-DD>    Only files mtime > date
@@ -902,7 +958,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (opts.limit) console.log(`Limit:         ${opts.limit}`)
   if (opts.after) console.log(`After:         ${opts.after.toISOString()}`)
   console.log(`Roots:         ${opts.roots.length} default + ${opts.extraRoots.length} extra` +
-    (opts.includeAskMethod ? ' + ASK Method' : ''))
+    (opts.includeAskMethod ? ' + ASK Method' : '') +
+    (opts.includeLightWork ? ' + Light_Work[UNTRUSTED]' : '') +
+    (opts.includeL16ReverseEng ? ' + L16_Lumen_ReverseEngineering[trusted]' : ''))
 
   // 1. Validate prerequisites
   if (!opts.dryRun && !opts.anthropicApiKey) {
