@@ -203,7 +203,16 @@ Per-contentType overrides:
 - `procedure` → refuse threshold = 0.85 (refutation rewrites cluster lower)
 - `pattern` → refuse threshold = 0.92 (duplicates extremely tight)
 
-**DG-T1-C dispatch is not yet wired** (issue #46). For now, when the gate returns `dedup_required` you should manually call `kms_supersede(old_id, new_content, reason)` (or `kms_update`, `kms_delete`, etc.) using the candidate ID from the response. The `action=…` field will be honored as the dispatch shortcut once DG-T1-C lands; until then, passing `action` simply bypasses the gate and proceeds to a normal `unified_store`.
+**Action dispatch is wired** (DG-T1-C, issue #46). When the gate returns `dedup_required`, retry the same `unified_store` call with one of the four `action` values rather than calling `kms_supersede` / `kms_update` separately. The dispatcher routes internally:
+
+| `action` | Required fields | Effect |
+|---|---|---|
+| `supersede` | `old_id`, `reason` | Calls supersede() — atomic replace. Returns `{ status: 'superseded', success, id, old_id, backends, reason, error? }`. |
+| `update` | `old_id`, `reason` | Calls update() — in-place edit; appends to `metadata.update_history`. Returns `{ status: 'updated', success, id, backends, reason }`. |
+| `complement` | `related_to` | Stores a NEW entry with `metadata.related_to = [<related_to>]` (merged into any existing array). Bypasses the dedup gate. Returns the normal store result. |
+| `force-new` | `reason` | Stores a NEW entry with `metadata.force_new_reason = <reason>`. Bypasses the dedup gate. Returns the normal store result. |
+
+If a required field is missing, you get `{ status: 'invalid_action', success: false, error: '...' }` and nothing is stored. The error message names the missing field. Pick another action or supply the field — do not just retry the original write.
 
 **The gate uses `metadata.subject` as a scope filter when present.** Two writes with the same `subject` get the tightest dedup check (narrowed to that facet of that topic). When you omit `subject`, the gate falls back to `userId + contentType` only — so writes without a subject still trigger dedup against any same-userId-same-contentType entry, not zero matches. Tag high-traffic facts with explicit `metadata.subject` (see preceding section) to scope the dedup check tighter and avoid false positives across unrelated facets of the same topic.
 

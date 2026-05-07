@@ -103,6 +103,47 @@ export interface DedupRequiredResponse {
   thresholds: { refuse: number; confirm: number }
 }
 
+/**
+ * DG-T1-C — result shape for `action=supersede`. Wraps the supersede() return
+ * (which is `{ success, old_id, new_id?, backends?, reason?, error? }`) and
+ * exposes `new_id` as `id` so callers that branch on the discriminated union
+ * can treat a successful supersede the same way they treat a normal store
+ * result. Includes the original `old_id` and `backends` for audit/observability.
+ */
+export interface SupersedeActionResult {
+  status: 'superseded'
+  success: boolean
+  /** new_id from the underlying supersede() call (the replacement entry). */
+  id?: string
+  old_id: string
+  backends?: string[]
+  reason?: string
+  error?: string
+}
+
+/**
+ * DG-T1-C — result shape for `action=update`. Wraps the update() return.
+ */
+export interface UpdateActionResult {
+  status: 'updated'
+  success: boolean
+  /** The id that was updated (echoed from old_id). */
+  id: string
+  backends: string[]
+  reason?: string
+}
+
+/**
+ * DG-T1-C — returned when `action` is set but required fields are missing.
+ * Distinct from a refuse (the gate found a duplicate); this is "you asked
+ * for an action but didn't tell us what to act on".
+ */
+export interface InvalidActionResponse {
+  status: 'invalid_action'
+  success: false
+  error: string
+}
+
 export type UnifiedStoreResult =
   | {
       success: true
@@ -119,6 +160,9 @@ export type UnifiedStoreResult =
       performance: { routingTime: number; storageTime: number; totalTime: number }
     }
   | DedupRequiredResponse
+  | SupersedeActionResult
+  | UpdateActionResult
+  | InvalidActionResponse
 
 export class UnifiedStoreTool {
   private router: IntelligentStorageRouter
@@ -170,13 +214,24 @@ export class UnifiedStoreTool {
       strength: number
     }>
     /**
-     * DG-T1-C placeholder. When the dedup gate returns `dedup_required`, the
-     * caller may retry with `action` + `old_id` + `reason` to dispatch the
-     * appropriate corrective tool. The action dispatch path is NOT yet wired
-     * (tracked in DG-T1-C / issue #46). For now, the presence of `action` is
-     * logged and treated as an "explicit-retry" signal that bypasses the gate
-     * and proceeds to a normal store. This makes the gate end-to-end testable
-     * before the dispatch logic lands.
+     * DG-T1-C action dispatch. When the dedup gate returns `dedup_required`,
+     * the caller retries with `action` (+ supporting fields) to declare intent:
+     *   - 'supersede'  → calls supersede(old_id, new_content, reason). Atomic
+     *                    replace: stores new entry with metadata.supersedes,
+     *                    flags old as SUPERSEDED. Requires old_id + reason.
+     *   - 'update'     → calls update(old_id, content, reason). In-place edit;
+     *                    appends to metadata.update_history. Requires old_id +
+     *                    reason.
+     *   - 'complement' → stores a NEW entry with metadata.related_to=[old_id].
+     *                    Skips the dedup gate (caller has acknowledged the
+     *                    existing entry and is deliberately adding a related
+     *                    one). Requires related_to.
+     *   - 'force-new'  → stores a NEW entry with metadata.force_new_reason.
+     *                    Skips the dedup gate (caller has justified the
+     *                    apparent duplicate). Requires reason.
+     *
+     * If a required field is missing, returns `{ status: 'invalid_action',
+     * success: false, error: ... }` without storing.
      */
     action?: 'supersede' | 'update' | 'complement' | 'force-new'
     old_id?: string
@@ -198,6 +253,30 @@ export class UnifiedStoreTool {
 
     debug(`\n🚀 UNIFIED STORE Starting...`)
     debug(`📝 Content: "${args.content.slice(0, 100)}${args.content.length > 100 ? '...' : ''}"`)
+
+    // ---------------------------------------------------------------------
+    // DG-T1-C — action dispatch (issue #46).
+    //
+    // When the dedup gate returns `dedup_required`, the caller retries with
+    // an explicit `action` declaring intent. We dispatch BEFORE inference,
+    // embedding, or routing because:
+    //   - supersede/update fully delegate to existing methods that own the
+    //     full lifecycle (re-embedding, fan-out, rollback), so duplicating
+    //     that work here would be wasteful and a source of drift.
+    //   - complement/force-new are normal stores with extra metadata + the
+    //     dedup gate disabled. We mutate args.metadata + force skip_dedup
+    //     here, then fall through to the normal store flow.
+    // ---------------------------------------------------------------------
+    if (args.action) {
+      const dispatchResult = await this._dispatchAction(args)
+      if (dispatchResult !== null) {
+        // supersede / update / invalid_action all return a terminal result —
+        // no fall-through to the normal store path.
+        return dispatchResult
+      }
+      // complement / force-new return null from _dispatchAction after mutating
+      // args; fall through to the normal store path with the modified args.
+    }
 
     // Apply smart inference if needed
     let enrichedArgs = { ...args }
@@ -320,26 +399,17 @@ export class UnifiedStoreTool {
     // an explicit action (supersede/update/complement/force-new).
     //
     // Skipped when:
-    //   - options.skip_dedup === true (admin escape hatch)
-    //   - args.action is set (caller is explicitly retrying after a refusal —
-    //     dispatch is DG-T1-C / issue #46; for now we log and let it through)
+    //   - options.skip_dedup === true (admin escape hatch, also set by the
+    //     DG-T1-C dispatcher for action=complement / action=force-new)
     //   - no embedding was generated (Ollama down, dim mismatch, etc.)
     //   - the graph backend doesn't expose findSimilar (older binding)
     //
     // Latency: typical p50 ~5-15 ms (HNSW search 1-3 ms + JS post-filter).
     // ---------------------------------------------------------------------
     const skipDedup = args.options?.skip_dedup === true
-    if (args.action) {
-      console.info(
-        `[unified_store] action="${args.action}" received — action dispatch ` +
-        `not yet wired (DG-T1-C pending). Proceeding to normal store; caller ` +
-        `should manually invoke kms_supersede/kms_update for corrective writes.`
-      )
-    }
     if (
       pendingEmbedding &&
       !skipDedup &&
-      !args.action &&
       typeof (this.storage.graph as any).findSimilar === 'function'
     ) {
       const subjectFacet = typeof knowledge.metadata?.subject === 'string'
@@ -706,6 +776,168 @@ export class UnifiedStoreTool {
           routingTime,
           storageTime: Date.now() - storageStartTime,
           totalTime: Date.now() - startTime
+        }
+      }
+    }
+  }
+
+  /**
+   * DG-T1-C action dispatch (issue #46).
+   *
+   * Called from store() when args.action is set. Returns one of:
+   *   - A terminal `UnifiedStoreResult` (supersede/update/invalid) — the
+   *     caller returns this directly without falling through to the normal
+   *     store flow.
+   *   - `null` (complement/force-new) — args has been mutated in place
+   *     (metadata + options.skip_dedup) and the caller continues with the
+   *     normal store flow, which now skips the dedup gate.
+   *
+   * The two terminal actions delegate to existing methods (supersede() and
+   * update()) so this layer stays thin: it validates inputs, calls the
+   * heavy lifter, and adapts the response into UnifiedStoreResult.
+   */
+  private async _dispatchAction(args: {
+    content: string
+    contentType?: 'memory' | 'insight' | 'pattern' | 'relationship' | 'fact' | 'procedure'
+    source?: 'personal' | 'technical' | 'cross_domain'
+    userId?: string
+    metadata?: Record<string, any>
+    confidence?: number
+    action?: 'supersede' | 'update' | 'complement' | 'force-new'
+    old_id?: string
+    reason?: string
+    related_to?: string
+    options?: { skip_dedup?: boolean; dedup_threshold_override?: { refuse?: number; confirm?: number } }
+  }): Promise<UnifiedStoreResult | null> {
+    const action = args.action!
+    console.info(`[unified_store] action="${action}" — DG-T1-C dispatch engaged`)
+
+    switch (action) {
+      case 'supersede': {
+        if (!args.old_id || !args.reason) {
+          return {
+            status: 'invalid_action',
+            success: false,
+            error: `action=supersede requires both 'old_id' and 'reason'. See retry_with hint from the prior dedup_required response.`
+          }
+        }
+        const r = await this.supersede({
+          old_id: args.old_id,
+          new_content: args.content,
+          contentType: args.contentType,
+          source: args.source,
+          userId: args.userId,
+          confidence: args.confidence,
+          metadata: args.metadata,
+          reason: args.reason
+        })
+        return {
+          status: 'superseded',
+          success: r.success,
+          // Expose new_id as `id` so callers branching on the union can
+          // treat a successful supersede the same as a normal store.
+          id: r.new_id,
+          old_id: r.old_id,
+          backends: r.backends,
+          reason: r.reason,
+          error: r.error
+        }
+      }
+
+      case 'update': {
+        if (!args.old_id || !args.reason) {
+          return {
+            status: 'invalid_action',
+            success: false,
+            error: `action=update requires both 'old_id' and 'reason'. See retry_with hint from the prior dedup_required response.`
+          }
+        }
+        // update() accepts content as an optional field; we pass it through
+        // so callers can correct typos in one round-trip without an extra
+        // store. The spec didn't preclude this and the existing update()
+        // already handles content updates cleanly.
+        const r = await this.update({
+          id: args.old_id,
+          content: args.content,
+          metadata: args.metadata,
+          confidence: args.confidence,
+          reason: args.reason
+        })
+        return {
+          status: 'updated',
+          success: r.success,
+          id: r.id,
+          backends: r.backends,
+          reason: r.reason
+        }
+      }
+
+      case 'complement': {
+        if (!args.related_to) {
+          return {
+            status: 'invalid_action',
+            success: false,
+            error: `action=complement requires 'related_to' (the id of the existing entry being complemented). See retry_with hint from the prior dedup_required response.`
+          }
+        }
+        // Mutate args so the normal store flow stores a NEW entry with the
+        // bidirectional link injected and the dedup gate disabled (the
+        // caller has explicitly acknowledged the candidate). related_to is
+        // an array so a future write can complement multiple entries; we
+        // merge with any existing array the caller may have set.
+        const priorRelatedTo = Array.isArray(args.metadata?.related_to)
+          ? args.metadata!.related_to as string[]
+          : []
+        args.metadata = {
+          ...(args.metadata || {}),
+          related_to: priorRelatedTo.includes(args.related_to)
+            ? priorRelatedTo
+            : [...priorRelatedTo, args.related_to]
+        }
+        args.options = { ...(args.options || {}), skip_dedup: true }
+
+        // Best-effort reverse link in the graph. Spec asks for "bidirectional
+        // link"; the forward link (metadata.related_to on the new entry) is
+        // guaranteed by the store path. The reverse link is a graph-only
+        // concern and may not be supported by every backend, so we attempt
+        // it post-store via the graph's _createRelationship hook if present.
+        // Wiring deferred to a follow-up so this path stays additive: the
+        // forward link alone is sufficient for the dedup gate's audit
+        // trail and downstream readers.
+        debug(`🔗 complement: forward-link injected (related_to=${args.related_to}); reverse-link is best-effort and not yet wired`)
+
+        return null  // fall through to normal store
+      }
+
+      case 'force-new': {
+        if (!args.reason) {
+          return {
+            status: 'invalid_action',
+            success: false,
+            error: `action=force-new requires 'reason' (justification for storing despite the apparent duplicate). See retry_with hint from the prior dedup_required response.`
+          }
+        }
+        // Mutate args: stamp the justification into metadata so the audit
+        // trail explains why this write bypassed the gate, and disable the
+        // gate for this call.
+        args.metadata = {
+          ...(args.metadata || {}),
+          force_new_reason: args.reason
+        }
+        args.options = { ...(args.options || {}), skip_dedup: true }
+        return null  // fall through to normal store
+      }
+
+      default: {
+        // TypeScript exhaustiveness check — unreachable if the union stays
+        // in sync. If a future contributor adds a new action without
+        // updating this switch, this returns a clear error rather than
+        // silently falling through.
+        const _exhaustive: never = action
+        return {
+          status: 'invalid_action',
+          success: false,
+          error: `Unknown action: ${String(_exhaustive)}`
         }
       }
     }
