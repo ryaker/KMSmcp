@@ -11,7 +11,11 @@ import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
 import type { GraphStorage } from '../types/index.js'
 import { ContentInference } from '../inference/ContentInference.js'
-import type { EmbeddingService } from '../embedding/EmbeddingService.js'
+import {
+  EmbeddingService,
+  PENDING_EMBEDDING_KEY,
+  PENDING_EMBEDDER_ID_KEY
+} from '../embedding/EmbeddingService.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -464,8 +468,9 @@ export class UnifiedStoreTool {
     // a noisy metadata field. Restored after fan-out so non-graph backends
     // see clean metadata.
     // -----------------------------------------------------------------
-    const META_EMB_KEY = '__pending_embedding'
-    const META_EMB_ID_KEY = '__pending_embedder_id'
+    // Transient handoff keys live in ../embedding/EmbeddingService.ts so the
+    // producer (here) and consumer (SparrowDBStorage.store) share one source
+    // of truth — see PR #69 review feedback.
 
     // Helper: clone knowledge with the embedding payload spliced into metadata.
     // We use a clone (not in-place mutation) so non-graph backends see clean
@@ -476,8 +481,8 @@ export class UnifiedStoreTool {
       ...k,
       metadata: {
         ...k.metadata,
-        [META_EMB_KEY]: pendingEmbedding,
-        [META_EMB_ID_KEY]: pendingEmbedderId
+        [PENDING_EMBEDDING_KEY]: pendingEmbedding,
+        [PENDING_EMBEDDER_ID_KEY]: pendingEmbedderId
       }
     })
 
