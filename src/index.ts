@@ -27,6 +27,8 @@ import { OllamaInference } from './inference/OllamaInference.js'
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js'
 import { EntityLinker } from './inference/EntityLinker.js'
 import { OllamaEmbeddingService } from './embedding/EmbeddingService.js'
+import { AnthropicHaikuJudge } from './embedding/AnthropicHaikuJudge.js'
+import type { LLMJudgeService } from './embedding/LLMJudgeService.js'
 import { MongoDBStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js'
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js'
 
@@ -174,10 +176,27 @@ export class UnifiedKMSServer {
       baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
     })
 
+    // LLM judge for the dedup gate's Tier 2 borderline classification
+    // (DG-T2-A, issue #49). Optional — when ANTHROPIC_API_KEY is missing we
+    // pass null and the gate degrades gracefully (every candidate gets
+    // `llm_relation: null`). API key is Doppler-injected in production.
+    let llmJudge: LLMJudgeService | null = null
+    if (process.env.ANTHROPIC_API_KEY) {
+      console.log('🤖 Initializing LLM Judge (Claude Haiku 4.5)...')
+      llmJudge = new AnthropicHaikuJudge({
+        apiKey: process.env.ANTHROPIC_API_KEY
+      })
+    } else {
+      console.warn(
+        '⚠️  ANTHROPIC_API_KEY not set — Tier 2 dedup classifier disabled. ' +
+        'Confirm-band candidates will return llm_relation=null.'
+      )
+    }
+
     // Step 4: Initialize tools
     console.log('🛠️  Initializing Tools...')
     this.tools = {
-      store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue, embeddingService),
+      store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue, embeddingService, llmJudge),
       search: new UnifiedSearchTool(this.storage, this.factCache),
       instructions: new KMSInstructionsTool(),
       documentStore: new DocumentStoreTool(this.storage.mongodb)

@@ -16,6 +16,7 @@ import {
   PENDING_EMBEDDING_KEY,
   PENDING_EMBEDDER_ID_KEY
 } from '../embedding/EmbeddingService.js'
+import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js' 
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -75,8 +76,19 @@ export interface DedupCandidate {
   subject?: string
   created: string
   flag?: string | null
-  /** Populated by Tier 2 LLM judge (DG-T2-A). null until that ticket lands. */
-  llm_relation: string | null
+  /**
+   * Populated by Tier 2 LLM judge (DG-T2-A, issue #49). One of:
+   *   - 'duplicate' | 'supersedes' | 'supersedes-reverse'
+   *   - 'complement' | 'contradicts' | 'unrelated'
+   *
+   * Null when:
+   *   - judge unavailable (no API key configured)
+   *   - candidate is in the refuse band (was set to 'duplicate' inline; see
+   *     UnifiedStoreTool.store)
+   *   - the individual classify() call failed/timed out (other candidates'
+   *     classifications still ship)
+   */
+  llm_relation: LLMRelation | null
 }
 
 export interface DedupRequiredResponse {
@@ -118,6 +130,7 @@ export class UnifiedStoreTool {
   private ollamaRouter: OllamaStorageRouter | null
   private enrichmentQueue: EnrichmentQueue | null
   private embeddingService: EmbeddingService | null
+  private llmJudge: LLMJudgeService | null
   /** Tracks last known availability to detect transitions and log them. */
   private _lastEmbedderAvailable: boolean | null = null
 
@@ -127,7 +140,8 @@ export class UnifiedStoreTool {
     cache: FACTCache | null,
     ollamaRouter?: OllamaStorageRouter | null,
     enrichmentQueue?: EnrichmentQueue | null,
-    embeddingService?: EmbeddingService | null
+    embeddingService?: EmbeddingService | null,
+    llmJudge?: LLMJudgeService | null
   ) {
     this.router = router
     this.storage = storage
@@ -135,6 +149,7 @@ export class UnifiedStoreTool {
     this.ollamaRouter = ollamaRouter ?? null
     this.enrichmentQueue = enrichmentQueue ?? null
     this.embeddingService = embeddingService ?? null
+    this.llmJudge = llmJudge ?? null
   }
 
   /**
@@ -366,10 +381,81 @@ export class UnifiedStoreTool {
               ? `Likely duplicate found (cos=${top.similarity.toFixed(3)} ≥ ${refuseThreshold}). Retry with action.`
               : `Borderline match found (cos=${top.similarity.toFixed(3)} in [${confirmThreshold}, ${refuseThreshold})). Retry with action to confirm intent.`
 
+            // -------------------------------------------------------------
+            // Tier 2 LLM judge (DG-T2-A) — classify candidate relationships
+            //
+            // For each candidate decide its `llm_relation`:
+            //   - sim ≥ refuseThreshold → 'duplicate' inline (cost-free; the
+            //     embedder agrees so strongly we don't need the LLM)
+            //   - confirmThreshold ≤ sim < refuseThreshold → call judge
+            //   - judge unavailable → null for all
+            //   - per-candidate classify failure → null for that one only
+            //
+            // All confirm-band classifications run in parallel because they
+            // are independent. Hard 5s timeout enforced by the judge itself.
+            // -------------------------------------------------------------
+            const llmRelations: Array<LLMRelation | null> = candidates.map(c =>
+              c.similarity >= refuseThreshold ? 'duplicate' : null
+            )
+
+            if (this.llmJudge) {
+              let judgeAvailable = false
+              try {
+                judgeAvailable = await this.llmJudge.isAvailable()
+              } catch (e) {
+                console.warn(
+                  `⚠️ unified_store: llmJudge.isAvailable() threw (skipping Tier 2): ` +
+                  `${e instanceof Error ? e.message : String(e)}`
+                )
+              }
+
+              if (judgeAvailable) {
+                const confirmBandIndices: number[] = []
+                candidates.forEach((c, idx) => {
+                  if (c.similarity < refuseThreshold && c.similarity >= confirmThreshold) {
+                    confirmBandIndices.push(idx)
+                  }
+                })
+
+                if (confirmBandIndices.length > 0) {
+                  // Resolve in parallel — independent calls, the LLMJudgeService
+                  // owns its own timeout. We use Promise.allSettled so a single
+                  // failure doesn't drop the others.
+                  const judge = this.llmJudge
+                  const results = await Promise.allSettled(
+                    confirmBandIndices.map(idx => judge.classify({
+                      newContent: knowledge.content,
+                      candidateContent: candidates[idx].content_preview,
+                    }))
+                  )
+                  results.forEach((r, i) => {
+                    const idx = confirmBandIndices[i]
+                    if (r.status === 'fulfilled') {
+                      llmRelations[idx] = r.value
+                    } else {
+                      // Per-candidate failure: log and leave null — other
+                      // candidates' results still ship.
+                      console.warn(
+                        `⚠️ unified_store: llmJudge.classify failed for candidate ${candidates[idx].id} ` +
+                        `(continuing with llm_relation=null): ` +
+                        `${r.reason instanceof Error ? r.reason.message : String(r.reason)}`
+                      )
+                    }
+                  })
+                  debug(
+                    `🤖 Tier 2 judge classified ${confirmBandIndices.length} confirm-band candidate(s) ` +
+                    `(model=${this.llmJudge.modelId})`
+                  )
+                }
+              } else {
+                debug(`🤖 Tier 2 judge unavailable — leaving llm_relation=null for confirm-band candidates`)
+              }
+            }
+
             const oldIdHint = top.id
             const response: DedupRequiredResponse = {
               status: 'dedup_required',
-              candidates: candidates.map(c => ({
+              candidates: candidates.map((c, idx) => ({
                 id: c.id,
                 similarity: c.similarity,
                 content_preview: c.content_preview,
@@ -378,7 +464,7 @@ export class UnifiedStoreTool {
                 subject: c.subject,
                 created: c.created,
                 flag: c.flag ?? null,
-                llm_relation: null  // Tier 2 (DG-T2-A) will populate this
+                llm_relation: llmRelations[idx]
               })),
               message: msg,
               retry_with: [
