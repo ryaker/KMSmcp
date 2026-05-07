@@ -244,6 +244,13 @@ describe('UnifiedStoreTool — corrective operations', () => {
   // -------------------------------------------------------------------------
 
   describe('supersede', () => {
+    beforeEach(() => {
+      // Default: entry exists in both backends. Individual tests override
+      // to simulate routing-asymmetric or missing-entry cases.
+      graph.findById = jest.fn().mockReturnValue({ id: 'old-id', content: 'stale' })
+      mongo.findById = jest.fn().mockResolvedValue({ id: 'old-id', content: 'stale' })
+    })
+
     it('stores new entry then flags old entry as SUPERSEDED with back-link', async () => {
       const result = await tool.supersede({
         old_id: 'old-id',
@@ -265,19 +272,43 @@ describe('UnifiedStoreTool — corrective operations', () => {
       )
     })
 
-    it('rolls back the new entry if flagging the old one fails', async () => {
-      // Make flag fail (entry not found)
+    it('returns error without storing or flagging when old_id exists in no backend', async () => {
+      // Both findById return null — entry truly missing.
+      graph.findById = jest.fn().mockReturnValue(null)
+      mongo.findById = jest.fn().mockResolvedValue(null)
+
+      const result = await tool.supersede({
+        old_id: 'missing-id',
+        new_content: 'replacement',
+        reason: 'test no-such-id'
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('not found in any backend')
+
+      // Should fail FAST: no new entry stored, nothing to roll back, no flags attempted
+      expect(graph.store).not.toHaveBeenCalled()
+      expect(mongo.store).not.toHaveBeenCalled()
+      expect(graph.flag).not.toHaveBeenCalled()
+      expect(mongo.flag).not.toHaveBeenCalled()
+      expect(graph.delete).not.toHaveBeenCalled()
+      expect(mongo.delete).not.toHaveBeenCalled()
+    })
+
+    it('rolls back the new entry if flagging fails on a backend where the entry exists', async () => {
+      // Entry exists in both, but flag fails on both — simulates a real
+      // backend write error mid-supersede.
       graph.flag = jest.fn().mockResolvedValue(false)
       mongo.flag = jest.fn().mockResolvedValue(false)
 
       const result = await tool.supersede({
-        old_id: 'missing-id',
+        old_id: 'old-id',
         new_content: 'replacement',
         reason: 'test rollback'
       })
 
       expect(result.success).toBe(false)
-      expect(result.error).toContain('not found')
+      expect(result.error).toContain('Flag step failed')
 
       // Rollback should have hard-deleted the new entry from all 3 backends
       expect(graph.delete).toHaveBeenCalled()

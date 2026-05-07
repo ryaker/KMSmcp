@@ -637,14 +637,82 @@ export class UnifiedStoreTool {
         };
     }
     /**
+     * Probe each backend for whether `id` exists. Returns the set of backend
+     * names where the entry is present. Used by supersede() to compute the
+     * `requiredBackends` set — i.e. the backends whose flag() must succeed for
+     * the operation to be considered atomic.
+     *
+     * Why this is needed: `IntelligentStorageRouter` (and `OllamaStorageRouter`)
+     * route many entries to graph + mem0 only, skipping MongoDB unless the
+     * content matches procedure/technical/MONGODB_PATTERN heuristics. A naïve
+     * "flag every backend, require every flag to succeed" supersede then fails
+     * on graph-only entries because mongo.flag() returns false (entry not
+     * present), even though the supersede succeeded everywhere it needed to.
+     *
+     * Mem0 deliberately omitted: supersede does not flag Mem0 (Mem0 has no flag
+     * concept), so its existence does not factor into the success criterion.
+     */
+    async _existsInBackends(id) {
+        let inGraph = false;
+        let inMongo = false;
+        if (typeof this.storage.graph.findById === 'function') {
+            try {
+                // SparrowDBStorage.findById is sync (returns ContentEntry | null);
+                // GraphStorage interface allows async. `await` resolves both.
+                const entry = await this.storage.graph.findById(id);
+                inGraph = entry !== null && entry !== undefined;
+            }
+            catch (e) {
+                // Treat probe error as "not found" — supersede will short-circuit if
+                // both backends report missing, which is the correct behavior for a
+                // truly missing id. Log so ops can see if probes are flaky.
+                debug(`supersede: graph.findById(${id}) errored — treating as not-present:`, e);
+            }
+        }
+        try {
+            const entry = await this.storage.mongodb.findById(id);
+            inMongo = entry !== null && entry !== undefined;
+        }
+        catch (e) {
+            debug(`supersede: mongodb.findById(${id}) errored — treating as not-present:`, e);
+        }
+        return { inGraph, inMongo };
+    }
+    /**
      * Atomic supersede: store a new entry, then flag the old one as SUPERSEDED
      * with a back-link to the new entry. The new entry's metadata gets a forward
      * link (`supersedes`) for bidirectional chain tracing.
      *
-     * If the flag step fails, rolls back by hard-deleting the new entry to keep
-     * the operation atomic. Returns the new entry's ID on success.
+     * Routing-aware (issue #62): the storage router only writes to MongoDB for
+     * a subset of contentTypes (procedure / source=technical / MONGODB_PATTERN
+     * keywords). Entries routed to graph + mem0 only do not exist in MongoDB,
+     * so requiring MongoDB.flag success would silently fail and roll back — the
+     * exact bug DG-INV-2 found 4 historical orphans of. Fix: query each backend
+     * for the entry first, build a `requiredBackends` set, and require all-of
+     * THAT set to succeed (option (b) in issue #62).
+     *
+     * If flagging fails on any required backend, rolls back: hard-deletes the
+     * new entry, un-flags any backend whose flag succeeded. Returns the new
+     * entry's ID on success.
      */
     async supersede(args) {
+        // Step 0: probe backends to find out where the old entry actually lives.
+        // We do this BEFORE storing the new entry so we can fail fast (and avoid
+        // a wasted store + rollback) when old_id is wrong / truly missing.
+        const presence = await this._existsInBackends(args.old_id);
+        const requiredBackends = [];
+        if (presence.inGraph)
+            requiredBackends.push('sparrowdb');
+        if (presence.inMongo)
+            requiredBackends.push('mongodb');
+        if (requiredBackends.length === 0) {
+            return {
+                success: false,
+                old_id: args.old_id,
+                error: `supersede: old_id ${args.old_id} not found in any backend (checked: sparrowdb, mongodb). Verify the id is correct.`
+            };
+        }
+        debug(`🔁 supersede: old_id=${args.old_id} present in [${requiredBackends.join(', ')}] — requiring flag success on these only`);
         // Step 1: store the new entry (with forward-link to the old one).
         // skip_dedup: true — supersede is itself the corrective action that the
         // dedup gate would suggest; running it through the gate would either
@@ -674,14 +742,13 @@ export class UnifiedStoreTool {
         }
         const new_id = storeResult.id;
         // Step 2: flag the old entry as SUPERSEDED with back-link to the new one.
-        // Each required backend is called individually so we can detect partial
-        // failures — flag() returns success=true if ANY backend succeeded, which
-        // would leave the old entry live in the graph if SparrowDB succeeded but
-        // MongoDB failed (or vice-versa). We require ALL present backends to succeed.
+        // Only flag the backends where the entry actually exists. Skip the others
+        // — flagging an absent entry would fail with "not found" and incorrectly
+        // trigger rollback for routing-asymmetric entries (e.g. graph-only).
         const flagNote = args.reason || `Superseded by ${new_id}`;
         const flaggedBackends = [];
         const failedBackends = [];
-        if (typeof this.storage.graph.flag === 'function') {
+        if (presence.inGraph && typeof this.storage.graph.flag === 'function') {
             try {
                 const ok = await this.storage.graph.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
                 if (ok)
@@ -694,16 +761,24 @@ export class UnifiedStoreTool {
                 console.warn(`⚠️  unified_supersede SparrowDB flag error:`, e);
             }
         }
-        try {
-            const ok = await this.storage.mongodb.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
-            if (ok)
-                flaggedBackends.push('mongodb');
-            else
-                failedBackends.push('mongodb');
+        else if (!presence.inGraph) {
+            debug(`supersede: entry ${args.old_id} not in sparrowdb, skipping flag on that backend`);
         }
-        catch (e) {
-            failedBackends.push('mongodb');
-            console.warn(`⚠️  unified_supersede MongoDB flag error:`, e);
+        if (presence.inMongo) {
+            try {
+                const ok = await this.storage.mongodb.flag(args.old_id, 'SUPERSEDED', flagNote, undefined, new_id);
+                if (ok)
+                    flaggedBackends.push('mongodb');
+                else
+                    failedBackends.push('mongodb');
+            }
+            catch (e) {
+                failedBackends.push('mongodb');
+                console.warn(`⚠️  unified_supersede MongoDB flag error:`, e);
+            }
+        }
+        else {
+            debug(`supersede: entry ${args.old_id} not in mongodb, skipping flag on that backend`);
         }
         // Invalidate cache after flagging (mirrors flag() behavior).
         if (this.cache) {
@@ -739,7 +814,7 @@ export class UnifiedStoreTool {
             return {
                 success: false,
                 old_id: args.old_id,
-                error: `Flag step failed on backend(s): [${failedBackends.join(', ')}] for entry ${args.old_id} (entry not found or backend write error). New entry ${new_id} was rolled back — retry may succeed if this was transient.`
+                error: `Flag step failed on backend(s): [${failedBackends.join(', ')}] for entry ${args.old_id} (backend write error or race). New entry ${new_id} was rolled back — retry may succeed if this was transient.`
             };
         }
         return {

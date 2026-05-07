@@ -127,6 +127,20 @@ kms_supersede({
 // Now unified_search returns only the corrected version by default.
 ```
 
+### How `kms_supersede` actually works (issue #62 fix)
+
+The storage router writes to `graph + mem0` for every entry, but only adds `mongodb` when the content is `procedure` / `source=technical` / matches a structured-content keyword pattern. So an `insight` entry routed to graph+mem0-only does **not** exist in MongoDB at all.
+
+Before issue #62 was fixed, supersede unconditionally required MongoDB.flag to succeed — for graph-only entries this silently failed (entry not in mongo), triggered rollback, and left 4/12 historical chains with orphan `superseded_by` IDs (DG-INV-2 audit).
+
+After the fix, supersede now:
+1. Probes each backend with `findById(old_id)` to determine where the entry actually lives.
+2. Builds a `requiredBackends` set from the probes (e.g. `[sparrowdb]` for graph-only, `[sparrowdb, mongodb]` for procedure/technical).
+3. Flags only those required backends. Backends that don't have the entry are skipped with a debug log, not failed.
+4. Succeeds only if **every required backend** flagged successfully. If any required flag fails, rolls back: hard-deletes the new entry and un-flags the partial successes.
+
+**Rare error you may see**: `supersede: old_id <id> not found in any backend (checked: sparrowdb, mongodb). Verify the id is correct.` This means the id is wrong (typo, deleted entry, etc.) — not a routing oddity. Look up the id with `kms_get_memory_by_id` or `unified_search` first.
+
 ### Tag high-traffic entries with `metadata.subject` (DG-FACET-A)
 
 For long-running projects (Phoenix, L16, Rich's preferences, etc.), include an explicit `metadata.subject` facet on every `unified_store` call. The subject is a dotted path that names the *specific* fact, not the broad topic — `Phoenix.camera_count`, `L16.distribution_model`, `Rich.preferences.communication_style`. Stored verbatim, no transformation.
