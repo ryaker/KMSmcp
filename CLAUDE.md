@@ -161,6 +161,54 @@ Naming convention: `Project.fact_name` or `Person.preferences.facet`. Reuse the 
 
 When in doubt, omit subject — pure pass-through, no validation. But for any fact you expect to update or supersede later, set it.
 
+## Dedup Gate (Tier 1 — DG-T1-B)
+
+When you call `unified_store`, the gate may refuse the write if a near-duplicate already exists for the same `userId` + `contentType` + (optional) `metadata.subject`. The response shape:
+
+```json
+{
+  "status": "dedup_required",
+  "candidates": [
+    {
+      "id": "abc-123",
+      "similarity": 0.91,
+      "content_preview": "Phoenix camera count is UNKNOWN pending canvas bounds verification...",
+      "contentType": "fact",
+      "subject": "Phoenix.camera_count",
+      "created": "2026-04-13T...",
+      "flag": null,
+      "llm_relation": null
+    }
+  ],
+  "message": "Likely duplicate found (cos=0.91 >= 0.88). Retry with action.",
+  "retry_with": [
+    "action=supersede&old_id=abc-123&reason=<...>",
+    "action=update&old_id=abc-123&reason=<...>",
+    "action=complement&related_to=abc-123",
+    "action=force-new&reason=<justification>"
+  ],
+  "band": "refuse",
+  "thresholds": { "refuse": 0.88, "confirm": 0.78 }
+}
+```
+
+If you receive `dedup_required`, **choose ONE retry action**: `supersede`, `update`, `complement`, or `force-new`. Each requires a `reason` (except `complement`, which uses `related_to`). Do NOT just retry the original write — the gate will refuse again.
+
+**Thresholds (calibrated empirically against the real KMS corpus by DG-INV-2):**
+- `>= 0.88` (refuse band): likely duplicate — must choose explicit action
+- `0.78 – 0.88` (confirm band): borderline — must choose explicit action
+- `< 0.78`: distinct, proceeds normally
+
+Per-contentType overrides:
+- `procedure` → refuse threshold = 0.85 (refutation rewrites cluster lower)
+- `pattern` → refuse threshold = 0.92 (duplicates extremely tight)
+
+**DG-T1-C dispatch is not yet wired** (issue #46). For now, when the gate returns `dedup_required` you should manually call `kms_supersede(old_id, new_content, reason)` (or `kms_update`, `kms_delete`, etc.) using the candidate ID from the response. The `action=…` field will be honored as the dispatch shortcut once DG-T1-C lands; until then, passing `action` simply bypasses the gate and proceeds to a normal `unified_store`.
+
+**The gate uses `metadata.subject` as a scope filter when present.** Two writes with the same `subject` get the tightest dedup check (narrowed to that facet of that topic). When you omit `subject`, the gate falls back to `userId + contentType` only — so writes without a subject still trigger dedup against any same-userId-same-contentType entry, not zero matches. Tag high-traffic facts with explicit `metadata.subject` (see preceding section) to scope the dedup check tighter and avoid false positives across unrelated facets of the same topic.
+
+**Known limitation (upstream)**: As of sparrowdb 0.1.22, the Node.js binding does NOT expose parameter-binding for `execute()` (no `execute_with_params`), and the Cypher parser rejects list literals in `SET` / `CREATE`. This means `storeEmbedding`'s `SET k.embedding = [...]` write path silently fails — the HNSW index stays empty, and the dedup gate is inert in practice (it always finds 0 candidates and proceeds to a normal store). The gate logic, type guards, and threshold dispatch are all correct and will activate the moment the upstream binding gains either (a) `execute_with_params` for vector inserts, or (b) parser support for f32-list literals in SET. Tracked separately from DG-T1-B.
+
 ## Best Practices
 
 ### Search First, Store Smart
