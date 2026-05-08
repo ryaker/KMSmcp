@@ -15,6 +15,7 @@ scripts/
 !tsconfig.json
 !tsconfig.test.json
 !test-fixtures/*.json
+!skills/**/*.json
 *.sh
 !examples/**/*.sh
 *.tf
