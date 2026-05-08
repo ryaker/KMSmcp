@@ -22,7 +22,7 @@ import { promises as fs } from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import { createHash } from 'crypto'
-import { execSync } from 'child_process'
+import { execFileSync } from 'child_process'
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -183,8 +183,11 @@ export const HUGE_DOC_BYTES = 500 * 1024  // fallback paragraph chunking
 export const PARAGRAPH_CHUNK_BYTES = 3 * 1024
 export const MAX_CLAIMS_PER_DOC = 8
 
-/** Anthropic distillation model. */
-export const HAIKU_MODEL = 'claude-haiku-4-5-20251001'
+/**
+ * Anthropic distillation model.
+ * Override via ANTHROPIC_HAIKU_MODEL env var so ops can swap without a code change.
+ */
+export const HAIKU_MODEL = process.env.ANTHROPIC_HAIKU_MODEL || 'claude-haiku-4-5-20251001'
 
 // ─── Pure helpers (unit-testable) ──────────────────────────────────────────────
 
@@ -272,7 +275,9 @@ export function approxWordCount(content: string): number {
 /** Decide whether a file path is inside a git repo (used only for non-explicit roots). */
 export function isInsideGitRepo(filePath: string): boolean {
   try {
-    execSync(`git -C ${JSON.stringify(path.dirname(filePath))} rev-parse --is-inside-work-tree`, {
+    // Use execFileSync (not execSync) so the directory argument is passed as a
+    // separate argv element and cannot be interpreted by the shell.
+    execFileSync('git', ['-C', path.dirname(filePath), 'rev-parse', '--is-inside-work-tree'], {
       stdio: ['ignore', 'pipe', 'ignore']
     })
     return true
@@ -289,11 +294,13 @@ export function pathHasSkipSegment(p: string): boolean {
 
 /**
  * Recursively (or top-level only for NON_RECURSIVE_ROOTS) walks a root and yields
- * MD file records. Honors SKIP_SEGMENTS. The git-repo check is suppressed for the
- * provided explicit root itself but still applied to any subpath that introduces
- * a NEW .git boundary deeper than the root.
+ * MD file records. Honors SKIP_SEGMENTS (which includes '.git'). All provided roots
+ * are treated as trusted; no nested git-repo boundary check is performed beyond the
+ * SKIP_SEGMENTS filter that already excludes '.git' directories.
  *
- * `existsCheck` is injectable for testing — defaults to fs.access.
+ * Note: `isInsideGitRepo` is available as a standalone helper and may be applied
+ * externally to filter roots before calling walkRoot if git-boundary enforcement
+ * is required for a specific caller.
  */
 export async function walkRoot(
   rootDir: string,
@@ -491,7 +498,12 @@ export async function loadSyncLog(syncLogPath: string): Promise<SyncLog> {
   try {
     const raw = await fs.readFile(syncLogPath, 'utf8')
     const parsed = JSON.parse(raw)
-    if (parsed?.version === 1 && typeof parsed.entries === 'object') return parsed as SyncLog
+    if (
+      parsed?.version === 1 &&
+      parsed.entries !== null &&
+      typeof parsed.entries === 'object' &&
+      !Array.isArray(parsed.entries)
+    ) return parsed as SyncLog
     // unknown shape — start fresh but back up
     const backup = `${syncLogPath}.bak.${Date.now()}`
     await fs.writeFile(backup, raw)
@@ -570,11 +582,20 @@ export class KmsHttpClient {
       params
     }
 
-    const res = await fetch(this.kmsUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body)
-    })
+    // 60-second timeout so a network blip doesn't hang the importer indefinitely.
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 60_000)
+    let res: Response
+    try {
+      res = await fetch(this.kmsUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal
+      })
+    } finally {
+      clearTimeout(timeoutId)
+    }
 
     if (isInit) {
       const sid = res.headers.get('mcp-session-id')
@@ -637,11 +658,25 @@ export class KmsHttpClient {
     }
     if (this.bearerToken) headers['Authorization'] = `Bearer ${this.bearerToken}`
     if (this.sessionId) headers['mcp-session-id'] = this.sessionId
-    await fetch(this.kmsUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ jsonrpc: '2.0', method, params })
-    })
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 10_000)
+    try {
+      const res = await fetch(this.kmsUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ jsonrpc: '2.0', method, params }),
+        signal: controller.signal
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        console.warn(`  ⚠️  MCP notification ${method} returned ${res.status}: ${text.slice(0, 200)}`)
+      }
+    } catch (err) {
+      // Non-fatal — the session may still be usable even if the notification fails.
+      console.warn(`  ⚠️  MCP notification ${method} failed: ${(err as Error).message}`)
+    } finally {
+      clearTimeout(timeoutId)
+    }
   }
 
   /** Probe — calls kms_ping. Throws on failure. */
@@ -858,9 +893,14 @@ export function parseArgs(argv: string[]): CliOptions {
       case '--dry-run':
         opts.dryRun = true
         break
-      case '--limit':
-        opts.limit = parseInt(argv[++i], 10)
+      case '--limit': {
+        const limitVal = parseInt(argv[++i], 10)
+        if (!Number.isInteger(limitVal) || limitVal < 0) {
+          throw new Error(`--limit must be a non-negative integer, got: ${argv[i]}`)
+        }
+        opts.limit = limitVal
         break
+      }
       case '--after':
         opts.after = new Date(argv[++i])
         if (isNaN(opts.after.getTime())) throw new Error(`Invalid --after date: ${argv[i]}`)
@@ -955,7 +995,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   console.log(`Sync log:      ${opts.syncLogPath}`)
   console.log(`Dry run:       ${opts.dryRun}`)
   console.log(`Force re-run:  ${opts.force}`)
-  if (opts.limit) console.log(`Limit:         ${opts.limit}`)
+  if (opts.limit !== null) console.log(`Limit:         ${opts.limit}`)
   if (opts.after) console.log(`After:         ${opts.after.toISOString()}`)
   console.log(`Roots:         ${opts.roots.length} default + ${opts.extraRoots.length} extra` +
     (opts.includeAskMethod ? ' + ASK Method' : '') +
@@ -1015,8 +1055,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   }
   console.log(`📋 Plan: ${planned.length} to process, ${stats.skipped} skipped (already up-to-date)`)
 
-  // 6. Apply limit
-  const toProcess = opts.limit ? planned.slice(0, opts.limit) : planned
+  // 6. Apply limit (null = no limit; 0 = process nothing)
+  const toProcess = opts.limit !== null ? planned.slice(0, opts.limit) : planned
 
   // 7. Dry-run? Print sample plan and exit.
   if (opts.dryRun) {
@@ -1124,14 +1164,15 @@ async function processFile(
     partial = true
   }
 
-  const baseMetadata = {
+  const baseMetadata: Record<string, any> = {
     subject,
-    source: 'markdown_corpus' as const,
+    source: 'markdown_corpus',
     source_doc: file.absolutePath,
     source_project: file.sourceProject,
     file_mtime: file.mtime.toISOString(),
     file_size: file.size,
-    word_count: wordCount
+    word_count: wordCount,
+    ...(partial ? { distillation_status: 'fallback' } : {})
   }
 
   // 2. Store whole-doc entry (with action=update if applicable)
@@ -1151,6 +1192,12 @@ async function processFile(
   const wholeRes = await client.unifiedStore(wholeDocArgs)
   const wholeId = await resolveStoreResult(client, wholeRes, wholeDocArgs, action, priorEntry)
 
+  // Treat a missing wholeId as a hard failure — proceeding would orphan any
+  // claim entries (their metadata.related_to would reference nothing).
+  if (!wholeId) {
+    throw new Error(`whole-doc store returned no id for ${file.absolutePath}; aborting claim writes to prevent orphans.`)
+  }
+
   // 3. Store claim entries
   const claimIds: string[] = []
   for (const claim of distillation.claims) {
@@ -1160,7 +1207,7 @@ async function processFile(
       source: 'cross_domain',
       metadata: {
         ...baseMetadata,
-        related_to: wholeId ? [wholeId] : [],
+        related_to: [wholeId],
         claim_type: claim.type,
         qualitative_confidence: claim.qualitative_confidence,
         topics: claim.topics || [],
@@ -1201,8 +1248,10 @@ async function processFile(
  *   - success            → return id
  *   - dedup_required + we already passed action=update → that's a real refusal; throw
  *   - dedup_required (unchanged content, unexpected here) → log + return prior id (skip)
+ *
+ * Exported for direct unit testing.
  */
-async function resolveStoreResult(
+export async function resolveStoreResult(
   client: KmsHttpClient,
   res: KmsStoreResponse,
   args: UnifiedStoreArgs,
