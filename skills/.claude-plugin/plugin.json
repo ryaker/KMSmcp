@@ -1,0 +1,21 @@
+{
+  "name": "kms-skills",
+  "description": "Five portable behavioral protocols for Richard's Personal KMS — auto-capture, meeting-synthesis, reconcile-pass, search-first, trust-boundaries. Codifies the OB1 Pattern 1 outer-loop model: dumb storage primitive (KMSmcp) plus skill-layer curation policy that works across Claude Code, Cowork, claude.ai web, iOS, and Codex. Connects to KMS at https://kms.yaker.org/mcp.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Richard Yaker",
+    "email": "ryaker@yaker.org"
+  },
+  "homepage": "https://github.com/ryaker/KMSmcp",
+  "repository": "https://github.com/ryaker/KMSmcp",
+  "license": "MIT",
+  "keywords": [
+    "kms",
+    "memory",
+    "knowledge-management",
+    "behavioral-skills",
+    "ob1-pattern-1",
+    "dedup-gate",
+    "supersede"
+  ]
+}
