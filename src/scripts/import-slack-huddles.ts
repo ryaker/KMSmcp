@@ -397,11 +397,19 @@ export class MinimalMcpClient {
     if (this.bearer) headers['Authorization'] = `Bearer ${this.bearer}`
     if (this.sessionId) headers['mcp-session-id'] = this.sessionId
 
-    const res = await fetch(this.kmsUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body)
-    })
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 30_000)
+    let res: Response
+    try {
+      res = await fetch(this.kmsUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal
+      })
+    } finally {
+      clearTimeout(timer)
+    }
 
     const sessionHeader = res.headers.get('mcp-session-id')
     const text = await res.text()
@@ -436,12 +444,54 @@ export class MinimalMcpClient {
   }
 }
 
+/**
+ * Parse an SSE body into a JSON-RPC response object.
+ *
+ * MCP StreamableHTTP may send multiple SSE events for a single request (e.g.
+ * a progress notification followed by the actual result). Each SSE event is
+ * separated by a blank line; its payload is the concatenation of all `data:`
+ * field lines within that event block.
+ *
+ * Strategy: split into per-event blocks first, then parse each block's data
+ * payload as JSON. Return the last event that parses successfully — that is
+ * always the JSON-RPC result, since notifications arrive first.
+ */
 function parseSseToJson(sse: string): any {
   const lines = sse.split(/\r?\n/)
   const dataLines = lines.filter(l => l.startsWith('data: ')).map(l => l.slice(6))
   if (dataLines.length === 0) {
     throw new Error(`Could not parse MCP response (not JSON, not SSE): ${sse.slice(0, 200)}`)
   }
+
+  // Split the raw SSE body into event blocks (separated by blank lines) and
+  // attempt to parse each block's accumulated data payload. Return the last
+  // one that parses — the result event arrives after any notification events.
+  const blocks: string[][] = []
+  let current: string[] = []
+  for (const line of lines) {
+    if (line === '' || line === '\r') {
+      if (current.length > 0) { blocks.push(current); current = [] }
+    } else if (line.startsWith('data: ')) {
+      current.push(line.slice(6))
+    }
+  }
+  if (current.length > 0) blocks.push(current)
+
+  let lastParsed: any
+  let parsed = false
+  for (const block of blocks) {
+    const payload = block.join('')
+    if (!payload) continue
+    try {
+      lastParsed = JSON.parse(payload)
+      parsed = true
+    } catch {
+      // not a JSON event — skip (e.g. SSE comment or keep-alive)
+    }
+  }
+  if (parsed) return lastParsed
+
+  // Fallback: original join (handles a single multi-line data field)
   const joined = dataLines.join('')
   return JSON.parse(joined)
 }

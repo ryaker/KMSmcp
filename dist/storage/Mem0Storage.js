@@ -1,16 +1,25 @@
 /**
  * Mem0 Storage System Implementation
  *
- * Targets mem0ai SDK v3.x. Key v1 → v3 deltas applied:
- *  - `add`: `user_id` (snake) → `userId` (camel) at top level. Wire still snake — SDK converts.
- *  - `search` / `getAll`: top-level entity params (`user_id`, `userId`, etc.) are REJECTED.
- *    Must pass `filters: { user_id: '...' }` instead. SDK throws if you don't.
- *  - `search`: `limit` → `topK`, `api_version` removed (SDK now hits /v3/memories/search/ unconditionally),
- *    return shape is `{ results: Memory[] }` (wrapped) — was `Memory[]` (unwrapped).
- *  - `get(memoryId)` only takes a string. The 1.x `get({ user_id, limit })` overload
- *    moved to `getAll(options)` returning `PaginatedMemories { count, next, previous, results }`.
- *  - Response keys are converted snake → camel by the SDK (`createdAt`, `updatedAt`, `userId`).
- *  - `enable_graph` is no longer a recognized option (none in this codebase, but flagged).
+ * Targets mem0ai SDK v3.x (verified against 3.0.2). v1 → v3 contract deltas:
+ *  - `add(messages, options)`: top-level `userId` or `user_id` BOTH allowed
+ *    (SDK runs camelToSnakeKeys on the merged payload). No rejectTopLevelEntityParams.
+ *  - `search(query, options)`: REJECTS top-level entity params via
+ *    rejectTopLevelEntityParams() as the very first line. {user_id, agent_id,
+ *    app_id, run_id} MUST be passed inside `filters: { ... }`. Throws otherwise.
+ *  - `getAll(options)`: same rejection as search. `filters: { user_id }` required.
+ *    Returns PaginatedMemories `{ count, next, previous, results }` (was bare array).
+ *  - `search`: `limit` → `topK`, `api_version` removed (always /v3/memories/search/).
+ *    Return shape `{ results: Memory[] }`.
+ *  - `get(memoryId)` only takes a string. The 1.x `get({ user_id, limit })`
+ *    overload moved to `getAll(options)`.
+ *  - Response keys converted snake → camel by SDK (`createdAt`, `updatedAt`, `userId`).
+ *  - `enable_graph` no longer a recognized option (none in this codebase).
+ *
+ * Verification anchors:
+ *  - `node_modules/mem0ai/dist/index.mjs` — rejectTopLevelEntityParams as first line of search/getAll
+ *  - `mem0` CLI (npm i -g @mem0/cli) — translates --user-id to filters.user_id
+ *  - Live `kms_ping` previously threw on getStats top-level user_id (caught + fixed 2026-05-07)
  */
 export class Mem0Storage {
     config;
@@ -89,14 +98,18 @@ export class Mem0Storage {
             const userId = this.generateUserIdFromQuery(query);
             console.log(`🧠 [Mem0Storage.search] Using user ID: ${userId}`);
             const searchQuery = query.query;
-            // Mem0 v1 endpoint expects user_id at TOP LEVEL of payload, not nested under filters.
-            // (Earlier comment claimed v3 SDK rejected top-level entity params — that was wrong;
-            // the SDK has no such throw, and v1 search rejects the request unless one of
-            // {user_id, agent_id, app_id, run_id} is present at body root.)
+            // Mem0 v3 SDK: search() throws via rejectTopLevelEntityParams() if any of
+            // {user_id, agent_id, app_id, run_id} appear at TOP LEVEL of options.
+            // Entity-scope MUST go inside `filters`. Verified 2026-05-07 against
+            // mem0ai@3.0.2 SDK source (rejectTopLevelEntityParams runs as the FIRST
+            // line of search()) and against the live `mem0` CLI (which translates
+            // --user-id to filters.user_id internally and works correctly).
+            // Previous implementation passed user_id at top level → SDK threw →
+            // outer try/catch swallowed → returned [] → Mem0 dimension of dedup
+            // gate has been silently dark since the 1.x→3.x cutover.
             const searchOptions = {
-                user_id: userId,
                 topK: query.options?.maxResults || 10,
-                filters: this.buildMem0Filters(query.filters)
+                filters: { user_id: userId, ...this.buildMem0Filters(query.filters) }
             };
             console.log(`🧠 [Mem0Storage.search] Search query: "${searchQuery}"`);
             console.log(`🧠 [Mem0Storage.search] Search options:`, JSON.stringify(searchOptions, null, 2));
@@ -123,13 +136,14 @@ export class Mem0Storage {
     }
     async getStats() {
         try {
-            // v3 SDK: use getAll() with filters.user_id and pageSize=1 to get the count.
-            // Avoids the brittle raw fetch to /v1/memories/ that was used in the 1.x days.
+            // v3 SDK: use getAll() with filters.user_id and page_size=1 to get the count.
+            // user_id MUST be inside filters — getAll() throws via rejectTopLevelEntityParams
+            // if it appears at top level (verified against mem0ai@3.0.2 source).
             const userId = this.config.defaultUserId || 'personal';
             const page = await this.client.getAll({
                 page: 1,
                 page_size: 1,
-                user_id: userId
+                filters: { user_id: userId }
             });
             // Paginated response: { count, next, previous, results }. Bare array fallback for non-paginated.
             const totalMemories = (Array.isArray(page) ? page.length : page?.count) ?? 'unknown';
@@ -154,7 +168,7 @@ export class Mem0Storage {
             const page = await this.client.getAll({
                 page: 1,
                 page_size: limit,
-                user_id: userId
+                filters: { user_id: userId }
             });
             // getAll runtime shape varies (bare array vs { results: [...], count }).
             const memList = Array.isArray(page) ? page : (page?.results ?? []);
@@ -258,10 +272,10 @@ export class Mem0Storage {
         try {
             console.log(`🧪 [Mem0Storage.testDirectSearch] Testing direct search for: "${query}" with user: ${userId}`);
             const searchQuery = query;
-            // Mem0 v1 search expects user_id at top level of payload (see Mem0Storage.search above).
+            // v3 SDK contract: user_id inside filters (see Mem0Storage.search above).
             const searchOptions = {
-                user_id: userId,
-                topK: 10
+                topK: 10,
+                filters: { user_id: userId }
             };
             console.log(`🧪 [Mem0Storage.testDirectSearch] Search query: "${searchQuery}"`);
             console.log(`🧪 [Mem0Storage.testDirectSearch] Search options:`, JSON.stringify(searchOptions, null, 2));

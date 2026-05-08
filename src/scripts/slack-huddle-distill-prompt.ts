@@ -246,7 +246,7 @@ export function extractCanvasId(
   // mrkdwn `<url|label>` wrapping. Team IDs and file IDs in Slack are
   // alphanumeric and start with T / F respectively, but we accept any
   // [A-Z0-9]+ to stay forward-compatible.
-  const re = /slack\.com\/docs\/([A-Z0-9]+)\/([A-Z0-9]+)/
+  const re = /slack\.com\/docs\/([a-zA-Z0-9]+)\/([a-zA-Z0-9]+)/i
   const m = messageText.match(re)
   if (!m) return null
   return { teamId: m[1], fileId: m[2] }
