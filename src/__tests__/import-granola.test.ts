@@ -440,6 +440,13 @@ describe('processMeeting', () => {
     expect(claim0.args.metadata.subject).toBe('Granola.B.claim_0')
     expect(claim0.args.contentType).toBe('insight')   // decision → insight
     expect(claim1.args.contentType).toBe('memory')    // context → memory
+    // First-class relationships link should also be present (DERIVED_FROM summary)
+    expect(claim0.args.relationships).toEqual([
+      { targetId: 'kms-id-1', type: 'DERIVED_FROM', strength: 1.0 }
+    ])
+    expect(claim1.args.relationships).toEqual([
+      { targetId: 'kms-id-1', type: 'DERIVED_FROM', strength: 1.0 }
+    ])
   })
 
   it('handles dedup_required on summary write — counts as dedup_refused, not failed', async () => {

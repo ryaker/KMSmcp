@@ -167,19 +167,35 @@ export function parseArgs(argv: string[]): CliOptions {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
-    const next = () => argv[++i]
+    const next = (flag: string): string => {
+      const val = argv[++i]
+      if (val === undefined) {
+        console.error(`❌ Flag ${flag} requires a value.`)
+        process.exit(2)
+      }
+      return val
+    }
     switch (arg) {
-      case '--input':              opts.input = next(); break
-      case '--time-range':         opts.timeRange = next(); break
-      case '--custom-start':       opts.customStart = next(); break
-      case '--custom-end':         opts.customEnd = next(); break
-      case '--kms-url':            opts.kmsUrl = next(); break
-      case '--sync-log':           opts.syncLogPath = next(); break
-      case '--user-id':            opts.userId = next(); break
-      case '--anthropic-model':    opts.anthropicModel = next(); break
-      case '--bearer-token':       opts.bearerToken = next(); break
+      case '--input':              opts.input = next('--input'); break
+      case '--time-range':         opts.timeRange = next('--time-range'); break
+      case '--custom-start':       opts.customStart = next('--custom-start'); break
+      case '--custom-end':         opts.customEnd = next('--custom-end'); break
+      case '--kms-url':            opts.kmsUrl = next('--kms-url'); break
+      case '--sync-log':           opts.syncLogPath = next('--sync-log'); break
+      case '--user-id':            opts.userId = next('--user-id'); break
+      case '--anthropic-model':    opts.anthropicModel = next('--anthropic-model'); break
+      case '--bearer-token':       opts.bearerToken = next('--bearer-token'); break
       case '--dry-run':            opts.dryRun = true; break
-      case '--max-meetings':       opts.maxMeetings = parseInt(next(), 10); break
+      case '--max-meetings': {
+        const raw = next('--max-meetings')
+        const parsed = parseInt(raw, 10)
+        if (isNaN(parsed) || parsed <= 0) {
+          console.error(`❌ --max-meetings requires a positive integer, got: ${raw}`)
+          process.exit(2)
+        }
+        opts.maxMeetings = parsed
+        break
+      }
       case '-h':
       case '--help':
         printHelp()
@@ -379,7 +395,8 @@ export class MinimalMcpClient {
 
   private async postRaw(
     body: any,
-    captureSession: boolean
+    captureSession: boolean,
+    timeoutMs = 30_000
   ): Promise<{ sessionId: string | null; body: any }> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -389,11 +406,24 @@ export class MinimalMcpClient {
     if (this.bearer) headers['Authorization'] = `Bearer ${this.bearer}`
     if (this.sessionId) headers['mcp-session-id'] = this.sessionId
 
-    const res = await fetch(this.kmsUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body)
-    })
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    let res: Response
+    try {
+      res = await fetch(this.kmsUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal
+      })
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        throw new Error(`MCP request timed out after ${timeoutMs}ms`)
+      }
+      throw e
+    } finally {
+      clearTimeout(timer)
+    }
 
     const sessionHeader = res.headers.get('mcp-session-id')
     const text = await res.text()
@@ -635,7 +665,10 @@ export async function processMeeting(
 
   const summaryEntryId = summaryResult.id as string
 
-  // Step 2: write each claim with metadata.related_to=[summaryEntryId]
+  // Step 2: write each claim linked back to the whole-meeting summary.
+  // The first-class `relationships` array is the canonical link (persisted by
+  // the storage router). metadata.related_to is kept as a human-readable
+  // breadcrumb for search/audit tooling.
   const claimEntryIds: string[] = []
   const claimFailures: string[] = []
   for (let ci = 0; ci < distilled.claims.length; ci++) {
@@ -656,7 +689,14 @@ export async function processMeeting(
         topics: claim.topics,
         people: claim.people,
         related_to: [summaryEntryId]
-      }
+      },
+      relationships: [
+        {
+          targetId: summaryEntryId,
+          type: 'DERIVED_FROM',
+          strength: 1.0
+        }
+      ]
     }
 
     try {
@@ -816,9 +856,13 @@ async function main(): Promise<void> {
   const log = loadSyncLog(opts.syncLogPath)
   console.log(`📓 Sync log has ${log.completed.length} previously-completed meeting(s).`)
 
-  const report = await runImport({ source, distiller, kms, opts, log })
-
-  if (kms) await kms.close()
+  let report: ImportReport
+  try {
+    report = await runImport({ source, distiller, kms, opts, log })
+  } finally {
+    // Always close the MCP session, even if runImport throws.
+    if (kms) await kms.close()
+  }
 
   console.log(`\n══════════════ FINAL REPORT ══════════════`)
   console.log(`Total meetings:       ${report.totalMeetings}`)
