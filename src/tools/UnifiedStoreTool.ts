@@ -16,7 +16,8 @@ import {
   PENDING_EMBEDDING_KEY,
   PENDING_EMBEDDER_ID_KEY
 } from '../embedding/EmbeddingService.js'
-import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js' 
+import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js'
+import { logger } from '../logger.js' 
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -403,8 +404,8 @@ export class UnifiedStoreTool {
               try {
                 judgeAvailable = await this.llmJudge.isAvailable()
               } catch (e) {
-                console.warn(
-                  `⚠️ unified_store: llmJudge.isAvailable() threw (skipping Tier 2): ` +
+                logger.warn(
+                  `unified_store: llmJudge.isAvailable() threw (skipping Tier 2): ` +
                   `${e instanceof Error ? e.message : String(e)}`
                 )
               }
@@ -418,6 +419,29 @@ export class UnifiedStoreTool {
                 })
 
                 if (confirmBandIndices.length > 0) {
+                  // Hydrate full content for each confirm-band candidate before
+                  // classification. content_preview is capped at 200 chars which
+                  // can cause misclassification on longer entries. Fall back to
+                  // content_preview if the graph backend doesn't expose findById
+                  // or the entry is unexpectedly missing.
+                  const graph = this.storage.graph as any
+                  const hasGraphFindById = typeof graph.findById === 'function'
+                  const fullContents: Record<number, string> = {}
+                  for (const idx of confirmBandIndices) {
+                    let full = candidates[idx].content_preview
+                    if (hasGraphFindById) {
+                      try {
+                        const entry = await graph.findById(candidates[idx].id)
+                        if (entry && typeof entry.content === 'string' && entry.content.length > 0) {
+                          full = entry.content
+                        }
+                      } catch {
+                        // Non-fatal — fall back to content_preview
+                      }
+                    }
+                    fullContents[idx] = full
+                  }
+
                   // Resolve in parallel — independent calls, the LLMJudgeService
                   // owns its own timeout. We use Promise.allSettled so a single
                   // failure doesn't drop the others.
@@ -425,7 +449,7 @@ export class UnifiedStoreTool {
                   const results = await Promise.allSettled(
                     confirmBandIndices.map(idx => judge.classify({
                       newContent: knowledge.content,
-                      candidateContent: candidates[idx].content_preview,
+                      candidateContent: fullContents[idx],
                     }))
                   )
                   results.forEach((r, i) => {
@@ -435,8 +459,8 @@ export class UnifiedStoreTool {
                     } else {
                       // Per-candidate failure: log and leave null — other
                       // candidates' results still ship.
-                      console.warn(
-                        `⚠️ unified_store: llmJudge.classify failed for candidate ${candidates[idx].id} ` +
+                      logger.warn(
+                        `unified_store: llmJudge.classify failed for candidate ${candidates[idx].id} ` +
                         `(continuing with llm_relation=null): ` +
                         `${r.reason instanceof Error ? r.reason.message : String(r.reason)}`
                       )

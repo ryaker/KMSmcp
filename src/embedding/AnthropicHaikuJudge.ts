@@ -36,7 +36,6 @@ const DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
 const DEFAULT_TIMEOUT_MS = 5_000
 const DEFAULT_CACHE_SIZE = 1000
 const DEFAULT_MAX_TOKENS = 12  // single-word response — 12 tokens is plenty
-const AVAILABILITY_CACHE_TTL_MS = 30_000
 
 // The classifier prompt — tight and forced to a single-word response. We feed
 // the candidate first and the new content second because the relations are
@@ -76,7 +75,6 @@ export class AnthropicHaikuJudge implements LLMJudgeService {
   private readonly timeoutMs: number
   private readonly cache: LRUCache<string, LLMRelation>
   private readonly hasApiKey: boolean
-  private availableCache: { value: boolean; expiresAt: number } | null = null
 
   constructor(config: AnthropicHaikuJudgeConfig = {}) {
     const apiKey = config.apiKey ?? process.env.ANTHROPIC_API_KEY ?? ''
@@ -93,19 +91,10 @@ export class AnthropicHaikuJudge implements LLMJudgeService {
   }
 
   async isAvailable(): Promise<boolean> {
-    // No API key → definitively unavailable; don't waste a 30s cache slot.
-    if (!this.hasApiKey) return false
-
-    // Cached probe: we can't ping the Anthropic API for "alive?" cheaply
-    // (every endpoint counts against quota), so we use the api-key-presence
-    // signal as the liveness indicator. If a real network failure happens
-    // mid-classify, the caller already handles the throw → null.
-    const now = Date.now()
-    if (this.availableCache && this.availableCache.expiresAt > now) {
-      return this.availableCache.value
-    }
-    this.availableCache = { value: true, expiresAt: now + AVAILABILITY_CACHE_TTL_MS }
-    return true
+    // API-key-presence is the only reliable liveness signal we have without
+    // burning a real API call. Network failures mid-classify are caught by the
+    // caller (UnifiedStoreTool) which already handles the throw → null path.
+    return this.hasApiKey
   }
 
   async classify(args: {
@@ -145,7 +134,7 @@ export class AnthropicHaikuJudge implements LLMJudgeService {
           system: SYSTEM_PROMPT,
           messages: [{ role: 'user', content: userMessage }],
         },
-        { signal: controller.signal as any }
+        { signal: controller.signal, timeout: this.timeoutMs }
       )
 
       // Pull the first text block. The SDK can return tool_use / image blocks

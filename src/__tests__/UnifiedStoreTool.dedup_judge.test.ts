@@ -348,11 +348,17 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
       { id: 'c', similarity: 0.80, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'C' },
     ])
 
-    let callOrder = 0
-    const callOrderMap: Record<string, number> = {}
-    judge.classify.mockImplementation(async ({ candidateContent }) => {
-      callOrderMap[candidateContent] = ++callOrder
-      // Return a different relation per call so we can verify they're all routed correctly.
+    // Block each classify() call until all three have entered the mock. This
+    // only resolves if the production code dispatched them in parallel —
+    // sequential dispatch would deadlock here (the barrier never reaches 3).
+    let startedCount = 0
+    let barrierResolve: (() => void) | undefined
+    const barrier = new Promise<void>(resolve => { barrierResolve = resolve })
+
+    judge.classify.mockImplementation(async ({ candidateContent }: { candidateContent: string }) => {
+      startedCount++
+      if (startedCount === 3) barrierResolve!()
+      await barrier
       const map: Record<string, LLMRelation> = { A: 'duplicate', B: 'complement', C: 'unrelated' }
       return map[candidateContent] ?? 'unrelated'
     })
