@@ -38,7 +38,7 @@ Portable behavioral protocols for Richard's Personal KMS — deployable across C
 
 ### Claude Code — install all 5 skills personally
 ```bash
-SKILLS_SRC=/Users/ryaker/Dev/KMSmcp/skills
+SKILLS_SRC=$(pwd)/skills
 for s in kms-auto-capture kms-meeting-synthesis kms-reconcile-pass kms-search-first kms-trust-boundaries; do
   mkdir -p ~/.claude/skills/$s
   cp $SKILLS_SRC/$s/SKILL.md ~/.claude/skills/$s/SKILL.md
@@ -47,10 +47,10 @@ done
 
 ### Claude Code — symlink at project scope (so skills track repo updates)
 ```bash
-SKILLS_SRC=/Users/ryaker/Dev/KMSmcp/skills
-mkdir -p /Users/ryaker/Dev/KMSmcp/.claude/skills
+SKILLS_SRC=$(pwd)/skills
+mkdir -p $(pwd)/.claude/skills
 for s in kms-auto-capture kms-meeting-synthesis kms-reconcile-pass kms-search-first kms-trust-boundaries; do
-  ln -sfn $SKILLS_SRC/$s /Users/ryaker/Dev/KMSmcp/.claude/skills/$s
+  ln -sfn $SKILLS_SRC/$s $(pwd)/.claude/skills/$s
 done
 ```
 
@@ -105,7 +105,7 @@ Until then, install via:
 
 All skills share these invariants:
 
-- **`userId: richard_yaker`** — every KMS call is scoped to Rich's data
+- **`userId: <USER_ID>`** — every KMS call is scoped to the current user's data (replace with your KMS user ID, e.g. `richard_yaker`)
 - **`metadata.subject`** — every store includes a dotted-path facet (e.g., `Phoenix.camera_count`, `Rich.preferences.communication_style`) when the fact is one Rich expects to update or supersede later
 - **Search before store** — every skill searches first to avoid duplicates
 - **Supersede over re-store** — contradicting facts use `kms_supersede`, never additive `unified_store`

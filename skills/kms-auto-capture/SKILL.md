@@ -67,7 +67,7 @@ For each candidate, call `unified_search` BEFORE storing:
 ```json
 {
   "query": "<natural language version of the candidate>",
-  "filters": { "userId": "richard_yaker" },
+  "filters": { "userId": "<USER_ID>" },
   "options": { "maxResults": 5, "includeRelationships": true }
 }
 ```
@@ -104,7 +104,7 @@ When in doubt, omit subject — pure pass-through, no validation. But for any fa
   "content": "<atomic claim, self-contained, 1-3 sentences>",
   "contentType": "<insight | memory | fact | procedure | pattern | relationship>",
   "source": "<personal | technical | coaching | cross_domain>",
-  "userId": "richard_yaker",
+  "userId": "<USER_ID>",
   "metadata": {
     "subject": "<dotted-path facet>",
     "captured_via": "kms-auto-capture",

@@ -55,7 +55,7 @@ Run `unified_search` with the meeting topic AND attendees BEFORE storing anythin
 {
   "query": "<topic> meeting <primary attendee>",
   "filters": {
-    "userId": "richard_yaker",
+    "userId": "<USER_ID>",
     "contentType": ["memory"]
   },
   "options": { "maxResults": 8, "includeRelationships": true }
@@ -87,13 +87,13 @@ Store it:
   "content": "<150-300 word summary>",
   "contentType": "memory",
   "source": "<personal | technical | coaching | cross_domain>",
-  "userId": "richard_yaker",
+  "userId": "<USER_ID>",
   "metadata": {
-    "subject": "Meetings.2026-05-06.phoenix_calibration_review",
+    "subject": "Meetings.<ISO date>.<short_topic>",
     "source_doc": "<Granola URL | Slack URL | file path | null>",
     "source_type": "granola | slack | zoom | voice_memo | manual",
-    "meeting_date": "2026-05-06",
-    "attendees": ["Rich", "Jesse", "Kevin"],
+    "meeting_date": "<ISO date>",
+    "attendees": ["<attendee1>", "<attendee2>"],
     "captured_via": "kms-meeting-synthesis"
   },
   "relationships": []
@@ -121,12 +121,12 @@ Each claim entry:
   "content": "<self-contained atomic claim, 1-3 sentences>",
   "contentType": "<insight | memory | fact | procedure | pattern>",
   "source": "<inferred from topic>",
-  "userId": "richard_yaker",
+  "userId": "<USER_ID>",
   "metadata": {
     "subject": "<dotted-path facet — e.g., Phoenix.camera_count>",
     "related_to": ["<whole_meeting_id from step 3>"],
     "source_doc": "<same as whole-meeting>",
-    "meeting_date": "2026-05-06",
+    "meeting_date": "<ISO date>",
     "captured_via": "kms-meeting-synthesis"
   }
 }
