@@ -11,7 +11,11 @@ import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
 import type { GraphStorage } from '../types/index.js'
 import { ContentInference } from '../inference/ContentInference.js'
-import type { EmbeddingService } from '../embedding/EmbeddingService.js'
+import {
+  EmbeddingService,
+  PENDING_EMBEDDING_KEY,
+  PENDING_EMBEDDER_ID_KEY
+} from '../embedding/EmbeddingService.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -448,9 +452,47 @@ export class UnifiedStoreTool {
     // Step 2: Store in systems
     const storageStartTime = Date.now()
 
+    // -----------------------------------------------------------------
+    // Embedding handoff to SparrowDB graph store (DG-T1-A inline path).
+    //
+    // SparrowDB 0.1.22's HNSW vector index is populated only when the
+    // embedding appears as a $param INSIDE a MERGE/CREATE pattern's literal
+    // property dict. Compound MERGE+SET parses but the SET clause silently
+    // no-ops; MATCH+SET (the previous storeEmbedding shape) also silently
+    // no-ops — neither stores the property NOR populates HNSW. Verified
+    // via direct repro and reported upstream (channel msg #202).
+    //
+    // Workaround: thread the vector through transient metadata keys that
+    // SparrowDBStorage.store() plucks off before the sidecar write. Don't
+    // attach to mem0/mongo paths — those would just persist the vector as
+    // a noisy metadata field. Restored after fan-out so non-graph backends
+    // see clean metadata.
+    // -----------------------------------------------------------------
+    // Transient handoff keys live in ../embedding/EmbeddingService.ts so the
+    // producer (here) and consumer (SparrowDBStorage.store) share one source
+    // of truth — see PR #69 review feedback.
+
+    // Helper: clone knowledge with the embedding payload spliced into metadata.
+    // We use a clone (not in-place mutation) so non-graph backends see clean
+    // metadata without needing finally-block scrubbing — and so any later
+    // observers of the original `knowledge` (cache writer, return-value
+    // builder) don't see the transient fields.
+    const withEmbeddingHandoff = (k: typeof knowledge) => ({
+      ...k,
+      metadata: {
+        ...k.metadata,
+        [PENDING_EMBEDDING_KEY]: pendingEmbedding,
+        [PENDING_EMBEDDER_ID_KEY]: pendingEmbedderId
+      }
+    })
+
     try {
       // Store in primary system
-      await this.storeInSystem(knowledge, primarySystem)
+      if (primarySystem === 'graph' && pendingEmbedding && pendingEmbedderId) {
+        await this.storeInSystem(withEmbeddingHandoff(knowledge), primarySystem)
+      } else {
+        await this.storeInSystem(knowledge, primarySystem)
+      }
 
       // Store in secondary systems (for cross-linking)
       if (secondarySystems.length > 0) {
@@ -458,7 +500,11 @@ export class UnifiedStoreTool {
         await Promise.all(
           secondarySystems.map(async (system) => {
             try {
-              await this.storeInSystem(knowledge, system)
+              if (system === 'graph' && pendingEmbedding && pendingEmbedderId) {
+                await this.storeInSystem(withEmbeddingHandoff(knowledge), system)
+              } else {
+                await this.storeInSystem(knowledge, system)
+              }
               debug(`✅ Cross-stored in ${system}`)
             } catch (error) {
               console.warn(`⚠️ Failed to cross-store in ${system}:`, error instanceof Error ? error.message : String(error))
@@ -473,13 +519,14 @@ export class UnifiedStoreTool {
       }
 
       // -----------------------------------------------------------------
-      // Persist embedding into SparrowDB HNSW vector index (DG-T1-A).
-      // The graph node was just created by storeInSystem('graph', ...);
-      // this SET attaches the 768-dim vector for the dedup gate's later
-      // retrieval (DG-T1-B). Non-fatal on failure — the metadata flag
-      // already on the record tells consumers an embedding was attempted.
+      // Belt-and-suspenders: if the graph backend is not the primary or a
+      // secondary target (e.g. mem0-only routing) but we still have an
+      // embedding, populate the graph node anyway so the dedup gate can
+      // see it on the next call. Currently routes always include graph,
+      // so this is a defensive no-op until/unless that changes — but cheap.
       // -----------------------------------------------------------------
-      if (pendingEmbedding && pendingEmbedderId) {
+      const graphTouched = primarySystem === 'graph' || secondarySystems.includes('graph')
+      if (!graphTouched && pendingEmbedding && pendingEmbedderId) {
         const graphAny = this.storage.graph as any
         if (typeof graphAny.storeEmbedding === 'function') {
           try {
@@ -487,11 +534,11 @@ export class UnifiedStoreTool {
               knowledge.id, pendingEmbedding, pendingEmbedderId
             )
             if (!ok) {
-              debug(`⚠️ storeEmbedding returned false for ${knowledge.id} (likely no graph node — sidecar-orphan or vector index unavailable)`)
+              debug(`⚠️ storeEmbedding fallback returned false for ${knowledge.id}`)
             }
           } catch (e) {
             console.warn(
-              `⚠️  unified_store: storeEmbedding failed (non-fatal): ` +
+              `⚠️  unified_store: storeEmbedding fallback failed (non-fatal): ` +
               `${e instanceof Error ? e.message : String(e)}`
             )
           }
