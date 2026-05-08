@@ -395,6 +395,15 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     if (!entryNeedsBackfill(entry)) continue
     if (completedSet.has(entry.id)) {
       alreadyCompleted++
+      // Sync in-memory sidecar so final saveSidecar() persists the metadata
+      // for entries completed in a previous (interrupted) run. Without this,
+      // resumed entries remain without embedder_id in the on-disk sidecar even
+      // though their vectors exist in the HNSW index.
+      entry.metadata = {
+        ...(entry.metadata || {}),
+        embedder_id: opts.embeddingService.embedderId,
+        embedded_at: (entry.metadata?.embedded_at as string | undefined) || new Date().toISOString(),
+      }
       continue
     }
     candidates.push(entry)
@@ -514,6 +523,28 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
   // ----- Final flush ----------------------------------------------------------
   saveState(opts.statePath, state)
 
+  // Persist the sidecar ONCE — see comment in storeEmbedding (PR #69) about
+  // the cost of repeated sidecar writes. Done BEFORE the fatalError early
+  // return so that embeddings successfully inserted before the abort are not
+  // lost: the HNSW vectors are already in the index; without this sidecar
+  // write their embedder_id stamps would be missing, causing the next run to
+  // redundantly re-embed the same entries (and the state-file skip would hide
+  // that inconsistency).
+  if (succeeded > 0) {
+    saveSidecar(opts.sidecarPath, sidecar)
+    log(`💾 Sidecar persisted (${sidecar.size} entries).`)
+  } else if (!fatalError) {
+    log(`(no successes — sidecar unchanged)`)
+  }
+
+  // Best-effort checkpoint so the HNSW write hits disk. Also before
+  // fatalError return for the same reason.
+  try {
+    db.checkpoint?.()
+  } catch (e) {
+    log(`⚠️  checkpoint failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+
   if (fatalError) {
     log(`\n💥 Aborted due to fatal error: ${fatalError.message}`)
     log(`   ${succeeded} embeddings persisted before abort. State file updated.`)
@@ -528,22 +559,6 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
       elapsedMs: Date.now() - startTime,
       aborted: { reason: `fatal_typeerror: ${fatalError.message}` },
     }
-  }
-
-  // Persist the sidecar ONCE — see comment in storeEmbedding (PR #69) about
-  // the cost of repeated sidecar writes.
-  if (succeeded > 0) {
-    saveSidecar(opts.sidecarPath, sidecar)
-    log(`💾 Sidecar persisted (${sidecar.size} entries).`)
-  } else {
-    log(`(no successes — sidecar unchanged)`)
-  }
-
-  // Best-effort checkpoint so the HNSW write hits disk.
-  try {
-    db.checkpoint?.()
-  } catch (e) {
-    log(`⚠️  checkpoint failed: ${e instanceof Error ? e.message : String(e)}`)
   }
 
   return {

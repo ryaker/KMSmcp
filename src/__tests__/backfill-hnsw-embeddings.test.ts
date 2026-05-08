@@ -514,6 +514,67 @@ describe('backfill-hnsw-embeddings', () => {
 
   // -------------------------------------------------------------------------
 
+  it('TypeError abort: sidecar is still persisted for entries that succeeded before abort', async () => {
+    const sidecar = makeSidecar([
+      makeEntry('a'),
+      makeEntry('bad'),
+      makeEntry('c'),
+    ])
+
+    const failWith = new Map<string, Error>()
+    failWith.set('bad', new TypeError('vector.length 512 does not match index dimensions 768'))
+
+    const opts = buildOpts(tmp, sidecar, {
+      concurrency: 1, // deterministic: a → bad → (abort, c never runs)
+      openSparrowDB: () => makeMockDb({ failWith }),
+    })
+
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeDefined()
+    expect(report.succeeded).toBe(1)
+
+    // Even though the script aborted, 'a' succeeded and its embedder_id must
+    // be persisted to the on-disk sidecar so the next resume run (which skips
+    // 'a' via state.completed) doesn't end up with a sidecar missing the stamp.
+    const persisted = JSON.parse(readFileSync(opts.sidecarPath, 'utf8')) as Record<string, SidecarEntry>
+    expect(persisted['a'].metadata?.embedder_id).toBe('nomic-embed-text:v1')
+    expect(persisted['a'].metadata?.embedded_at).toBeDefined()
+  })
+
+  it('resume: previously-completed entries get embedder_id stamped in final sidecar save', async () => {
+    const sidecar = makeSidecar([
+      makeEntry('a'),
+      makeEntry('b'),
+      makeEntry('c'),
+    ])
+    const dbCalls: Array<{ id: string; vec: Float32Array }> = []
+    const opts = buildOpts(tmp, sidecar, {
+      openSparrowDB: () => makeMockDb({ recorded: dbCalls }),
+    })
+
+    // Pre-seed state file: pretend 'a' and 'b' were done in a previous run.
+    // Their sidecar entries still lack embedder_id (interrupted before saveSidecar ran).
+    writeFileSync(opts.statePath, JSON.stringify({
+      completed: ['a', 'b'],
+      failed: [],
+      started_at: new Date().toISOString(),
+      last_update_at: new Date().toISOString(),
+    }), 'utf8')
+
+    const report = await runBackfill(opts)
+
+    expect(report.alreadyCompleted).toBe(2)
+    expect(report.succeeded).toBe(1) // only 'c' newly embedded
+
+    // All three entries — including the two resumed ones — must have
+    // embedder_id in the final sidecar write.
+    const persisted = JSON.parse(readFileSync(opts.sidecarPath, 'utf8')) as Record<string, SidecarEntry>
+    expect(persisted['a'].metadata?.embedder_id).toBe('nomic-embed-text:v1')
+    expect(persisted['b'].metadata?.embedder_id).toBe('nomic-embed-text:v1')
+    expect(persisted['c'].metadata?.embedder_id).toBe('nomic-embed-text:v1')
+  })
+
   it('mixed batch: orphan + embed-fail + success all coexist in one run', async () => {
     const sidecar = makeSidecar([
       makeEntry('good-1'),
