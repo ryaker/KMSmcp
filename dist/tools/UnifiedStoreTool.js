@@ -541,7 +541,7 @@ export class UnifiedStoreTool {
      */
     async _dispatchAction(args) {
         const action = args.action;
-        console.info(`[unified_store] action="${action}" — DG-T1-C dispatch engaged`);
+        debug(`[unified_store] action="${action}" — DG-T1-C dispatch engaged`);
         switch (action) {
             case 'supersede': {
                 if (!args.old_id || !args.reason) {
@@ -614,7 +614,7 @@ export class UnifiedStoreTool {
                 // an array so a future write can complement multiple entries; we
                 // merge with any existing array the caller may have set.
                 const priorRelatedTo = Array.isArray(args.metadata?.related_to)
-                    ? args.metadata.related_to
+                    ? args.metadata.related_to.filter(item => typeof item === 'string')
                     : [];
                 args.metadata = {
                     ...(args.metadata || {}),

@@ -810,7 +810,7 @@ export class UnifiedStoreTool {
     options?: { skip_dedup?: boolean; dedup_threshold_override?: { refuse?: number; confirm?: number } }
   }): Promise<UnifiedStoreResult | null> {
     const action = args.action!
-    console.info(`[unified_store] action="${action}" — DG-T1-C dispatch engaged`)
+    debug(`[unified_store] action="${action}" — DG-T1-C dispatch engaged`)
 
     switch (action) {
       case 'supersede': {
@@ -886,7 +886,7 @@ export class UnifiedStoreTool {
         // an array so a future write can complement multiple entries; we
         // merge with any existing array the caller may have set.
         const priorRelatedTo = Array.isArray(args.metadata?.related_to)
-          ? args.metadata!.related_to as string[]
+          ? (args.metadata!.related_to as any[]).filter(item => typeof item === 'string')
           : []
         args.metadata = {
           ...(args.metadata || {}),
