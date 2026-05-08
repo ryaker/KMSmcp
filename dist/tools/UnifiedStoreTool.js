@@ -4,6 +4,7 @@
 import crypto from 'crypto';
 import { FACTCache } from '../cache/FACTCache.js';
 import { ContentInference } from '../inference/ContentInference.js';
+import { logger } from '../logger.js';
 const debug = (...args) => { if (process.env.KMS_DEBUG)
     console.error(...args); };
 // -------------------------------------------------------------------------
@@ -52,15 +53,17 @@ export class UnifiedStoreTool {
     ollamaRouter;
     enrichmentQueue;
     embeddingService;
+    llmJudge;
     /** Tracks last known availability to detect transitions and log them. */
     _lastEmbedderAvailable = null;
-    constructor(router, storage, cache, ollamaRouter, enrichmentQueue, embeddingService) {
+    constructor(router, storage, cache, ollamaRouter, enrichmentQueue, embeddingService, llmJudge) {
         this.router = router;
         this.storage = storage;
         this.cache = cache; // Now using real cache
         this.ollamaRouter = ollamaRouter ?? null;
         this.enrichmentQueue = enrichmentQueue ?? null;
         this.embeddingService = embeddingService ?? null;
+        this.llmJudge = llmJudge ?? null;
     }
     /**
      * Store knowledge with intelligent routing
@@ -220,10 +223,93 @@ export class UnifiedStoreTool {
                         const msg = inRefuse
                             ? `Likely duplicate found (cos=${top.similarity.toFixed(3)} ≥ ${refuseThreshold}). Retry with action.`
                             : `Borderline match found (cos=${top.similarity.toFixed(3)} in [${confirmThreshold}, ${refuseThreshold})). Retry with action to confirm intent.`;
+                        // -------------------------------------------------------------
+                        // Tier 2 LLM judge (DG-T2-A) — classify candidate relationships
+                        //
+                        // For each candidate decide its `llm_relation`:
+                        //   - sim ≥ refuseThreshold → 'duplicate' inline (cost-free; the
+                        //     embedder agrees so strongly we don't need the LLM)
+                        //   - confirmThreshold ≤ sim < refuseThreshold → call judge
+                        //   - judge unavailable → null for all
+                        //   - per-candidate classify failure → null for that one only
+                        //
+                        // All confirm-band classifications run in parallel because they
+                        // are independent. Hard 5s timeout enforced by the judge itself.
+                        // -------------------------------------------------------------
+                        const llmRelations = candidates.map(c => c.similarity >= refuseThreshold ? 'duplicate' : null);
+                        if (this.llmJudge) {
+                            let judgeAvailable = false;
+                            try {
+                                judgeAvailable = await this.llmJudge.isAvailable();
+                            }
+                            catch (e) {
+                                logger.warn(`unified_store: llmJudge.isAvailable() threw (skipping Tier 2): ` +
+                                    `${e instanceof Error ? e.message : String(e)}`);
+                            }
+                            if (judgeAvailable) {
+                                const confirmBandIndices = [];
+                                candidates.forEach((c, idx) => {
+                                    if (c.similarity < refuseThreshold && c.similarity >= confirmThreshold) {
+                                        confirmBandIndices.push(idx);
+                                    }
+                                });
+                                if (confirmBandIndices.length > 0) {
+                                    // Hydrate full content for each confirm-band candidate before
+                                    // classification. content_preview is capped at 200 chars which
+                                    // can cause misclassification on longer entries. Fall back to
+                                    // content_preview if the graph backend doesn't expose findById
+                                    // or the entry is unexpectedly missing.
+                                    const graph = this.storage.graph;
+                                    const hasGraphFindById = typeof graph.findById === 'function';
+                                    const fullContents = {};
+                                    for (const idx of confirmBandIndices) {
+                                        let full = candidates[idx].content_preview;
+                                        if (hasGraphFindById) {
+                                            try {
+                                                const entry = await graph.findById(candidates[idx].id);
+                                                if (entry && typeof entry.content === 'string' && entry.content.length > 0) {
+                                                    full = entry.content;
+                                                }
+                                            }
+                                            catch {
+                                                // Non-fatal — fall back to content_preview
+                                            }
+                                        }
+                                        fullContents[idx] = full;
+                                    }
+                                    // Resolve in parallel — independent calls, the LLMJudgeService
+                                    // owns its own timeout. We use Promise.allSettled so a single
+                                    // failure doesn't drop the others.
+                                    const judge = this.llmJudge;
+                                    const results = await Promise.allSettled(confirmBandIndices.map(idx => judge.classify({
+                                        newContent: knowledge.content,
+                                        candidateContent: fullContents[idx],
+                                    })));
+                                    results.forEach((r, i) => {
+                                        const idx = confirmBandIndices[i];
+                                        if (r.status === 'fulfilled') {
+                                            llmRelations[idx] = r.value;
+                                        }
+                                        else {
+                                            // Per-candidate failure: log and leave null — other
+                                            // candidates' results still ship.
+                                            logger.warn(`unified_store: llmJudge.classify failed for candidate ${candidates[idx].id} ` +
+                                                `(continuing with llm_relation=null): ` +
+                                                `${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+                                        }
+                                    });
+                                    debug(`🤖 Tier 2 judge classified ${confirmBandIndices.length} confirm-band candidate(s) ` +
+                                        `(model=${this.llmJudge.modelId})`);
+                                }
+                            }
+                            else {
+                                debug(`🤖 Tier 2 judge unavailable — leaving llm_relation=null for confirm-band candidates`);
+                            }
+                        }
                         const oldIdHint = top.id;
                         const response = {
                             status: 'dedup_required',
-                            candidates: candidates.map(c => ({
+                            candidates: candidates.map((c, idx) => ({
                                 id: c.id,
                                 similarity: c.similarity,
                                 content_preview: c.content_preview,
@@ -232,7 +318,7 @@ export class UnifiedStoreTool {
                                 subject: c.subject,
                                 created: c.created,
                                 flag: c.flag ?? null,
-                                llm_relation: null // Tier 2 (DG-T2-A) will populate this
+                                llm_relation: llmRelations[idx]
                             })),
                             message: msg,
                             retry_with: [

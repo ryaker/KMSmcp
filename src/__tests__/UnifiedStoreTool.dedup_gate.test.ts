@@ -163,7 +163,10 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     expect(result.candidates).toHaveLength(1)
     expect(result.candidates[0].id).toBe('existing-fact-id')
     expect(result.candidates[0].similarity).toBeCloseTo(0.92, 5)
-    expect(result.candidates[0].llm_relation).toBeNull()  // Tier 2 not yet wired
+    // DG-T2-A: refuse-band candidates get 'duplicate' inline (no LLM call —
+    // the embedder agrees so strongly we don't need a Tier 2 classification).
+    // Tests with no llmJudge wired still get this free-win 'duplicate' tag.
+    expect(result.candidates[0].llm_relation).toBe('duplicate')
     expect(result.thresholds.refuse).toBe(0.88)
     expect(result.thresholds.confirm).toBe(0.78)
     expect(result.retry_with).toEqual(

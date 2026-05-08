@@ -161,7 +161,7 @@ Naming convention: `Project.fact_name` or `Person.preferences.facet`. Reuse the 
 
 When in doubt, omit subject — pure pass-through, no validation. But for any fact you expect to update or supersede later, set it.
 
-## Dedup Gate (Tier 1 — DG-T1-B)
+## Dedup Gate (Tier 1 — DG-T1-B + Tier 2 — DG-T2-A)
 
 When you call `unified_store`, the gate may refuse the write if a near-duplicate already exists for the same `userId` + `contentType` + (optional) `metadata.subject`. The response shape:
 
@@ -177,7 +177,7 @@ When you call `unified_store`, the gate may refuse the write if a near-duplicate
       "subject": "Phoenix.camera_count",
       "created": "2026-04-13T...",
       "flag": null,
-      "llm_relation": null
+      "llm_relation": "duplicate"
     }
   ],
   "message": "Likely duplicate found (cos=0.91 >= 0.88). Retry with action.",
@@ -206,6 +206,27 @@ Per-contentType overrides:
 **DG-T1-C dispatch is not yet wired** (issue #46). For now, when the gate returns `dedup_required` you should manually call `kms_supersede(old_id, new_content, reason)` (or `kms_update`, `kms_delete`, etc.) using the candidate ID from the response. The `action=…` field will be honored as the dispatch shortcut once DG-T1-C lands; until then, passing `action` simply bypasses the gate and proceeds to a normal `unified_store`.
 
 **The gate uses `metadata.subject` as a scope filter when present.** Two writes with the same `subject` get the tightest dedup check (narrowed to that facet of that topic). When you omit `subject`, the gate falls back to `userId + contentType` only — so writes without a subject still trigger dedup against any same-userId-same-contentType entry, not zero matches. Tag high-traffic facts with explicit `metadata.subject` (see preceding section) to scope the dedup check tighter and avoid false positives across unrelated facets of the same topic.
+
+### Tier 2 — `llm_relation` (DG-T2-A, issue #49)
+
+Each candidate in a `dedup_required` response now carries an `llm_relation` field populated by **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`) for confirm-band candidates. Refuse-band candidates get the relation `"duplicate"` inline (free win — the embedder already agrees so strongly we skip the LLM call).
+
+**Relation enum:**
+
+| Relation | Meaning | Recommended action |
+|---|---|---|
+| `duplicate` | Same fact expressed differently; no new information in NEW | `kms_delete` the new write (or skip) — nothing to add |
+| `supersedes` | NEW corrects/replaces the existing entry | `kms_supersede(old_id, new_content, reason)` |
+| `supersedes-reverse` | The existing entry is the more accurate one; NEW is outdated | Don't write NEW; consider `kms_update` on existing if NEW has incremental info |
+| `complement` | Both are true — different facets of related topic | `action=complement&related_to=<old_id>` (write both, link them) |
+| `contradicts` | **Factually opposed; only one can be true** | **STOP.** Do NOT proceed without explicit acknowledgement. Surface to the human; one of the two must be retracted via `kms_supersede` or `kms_flag(RETRACTED)`. |
+| `unrelated` | Different facts that happen to share keywords | Proceed with `action=force-new&reason=<...>` — the embedder mis-fired |
+
+**On `contradicts`:** treat as a hard stop. The new write directly opposes an existing fact. Either the existing entry is wrong (use `kms_supersede`) or the new claim is wrong (don't write it). Picking blindly creates two contradicting entries that both leak into context injection — exactly the failure mode the gate exists to prevent.
+
+**Graceful degradation:** when `ANTHROPIC_API_KEY` is unset, `llm_relation` is `null` for all confirm-band candidates and `"duplicate"` for refuse-band. The gate still works on Tier 1 cosine alone — Tier 2 is purely advisory enrichment.
+
+**Cost & latency budget:** Haiku 4.5 with 5 s per-candidate timeout, single-word forced response (~12 tokens). LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
 
 **Known limitation (upstream)**: As of sparrowdb 0.1.22, the Node.js binding does NOT expose parameter-binding for `execute()` (no `execute_with_params`), and the Cypher parser rejects list literals in `SET` / `CREATE`. This means `storeEmbedding`'s `SET k.embedding = [...]` write path silently fails — the HNSW index stays empty, and the dedup gate is inert in practice (it always finds 0 candidates and proceeds to a normal store). The gate logic, type guards, and threshold dispatch are all correct and will activate the moment the upstream binding gains either (a) `execute_with_params` for vector inserts, or (b) parser support for f32-list literals in SET. Tracked separately from DG-T1-B.
 
