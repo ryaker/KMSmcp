@@ -245,7 +245,7 @@ Each candidate in a `dedup_required` response now carries an `llm_relation` fiel
 1. Always search before storing to avoid duplicates
 2. Use search results to inform storage decisions
 3. Build on existing knowledge rather than creating isolated memories
-4. **If search returns a fact you're about to contradict, use `kms_supersede`, not `unified_store`**
+4. **If search returns a fact you're about to contradict, retry `unified_store` with `action=supersede` (or use `kms_supersede` directly) — do not issue a bare additive `unified_store` call**
 
 ### Natural Language Processing
 - Use natural descriptions in storage
