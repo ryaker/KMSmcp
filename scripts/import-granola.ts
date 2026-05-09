@@ -110,12 +110,17 @@ import {
   mapClaimTypeToContentType,
   parseDistilledResponse
 } from '../src/scripts/granola-distill-prompt.js'
+import {
+  GranolaCacheV6Source,
+  DEFAULT_CACHE_V6_PATH,
+  DEFAULT_WATERMARK_PATH
+} from '../src/scripts/granola-cache-v6-source.js'
 
 // ─────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────
 
-interface RawMeeting {
+export interface RawMeeting {
   id: string
   title: string
   date?: string
@@ -138,6 +143,14 @@ interface ImportReport {
 
 interface CliOptions {
   input?: string
+  /** Source selector: 'file' (default, --input dump) or 'cache-v6' (read Granola cache directly). */
+  source: 'file' | 'cache-v6'
+  /** When source=cache-v6: path to Granola's cache-v6.json (default: DEFAULT_CACHE_V6_PATH). */
+  cachePath?: string
+  /** When source=cache-v6: watermark file path (default: DEFAULT_WATERMARK_PATH). */
+  watermarkPath?: string
+  /** When source=cache-v6: only emit meetings with end-ts >= this date (ISO). */
+  since?: string
   timeRange: string
   customStart?: string
   customEnd?: string
@@ -156,6 +169,7 @@ interface CliOptions {
 
 export function parseArgs(argv: string[]): CliOptions {
   const opts: CliOptions = {
+    source: 'file',
     timeRange: 'last_30_days',
     kmsUrl: process.env.KMS_URL || 'http://localhost:8180/mcp',
     syncLogPath: process.env.KMS_GRANOLA_SYNC_LOG || join(homedir(), '.kms-granola-sync.json'),
@@ -177,6 +191,20 @@ export function parseArgs(argv: string[]): CliOptions {
     }
     switch (arg) {
       case '--input':              opts.input = next('--input'); break
+      case '--source': {
+        const v = next('--source')
+        if (v !== 'file' && v !== 'cache-v6') {
+          console.error(`❌ Invalid --source: ${v} (expected 'file' or 'cache-v6')`)
+          process.exit(2)
+        }
+        opts.source = v
+        break
+      }
+      // --cache-v6 is sugar for --source cache-v6
+      case '--cache-v6':           opts.source = 'cache-v6'; break
+      case '--cache-path':         opts.cachePath = next('--cache-path'); break
+      case '--watermark-path':     opts.watermarkPath = next('--watermark-path'); break
+      case '--since':              opts.since = next('--since'); break
       case '--time-range':         opts.timeRange = next('--time-range'); break
       case '--custom-start':       opts.customStart = next('--custom-start'); break
       case '--custom-end':         opts.customEnd = next('--custom-end'); break
@@ -215,10 +243,23 @@ function printHelp(): void {
 Granola → KMS importer
 
 Usage:
+  # Source A — pre-dumped JSON file (claude.ai-driven workflow):
   tsx scripts/import-granola.ts --input <meetings.json> [options]
 
-Required:
-  --input <file>            Path to a JSON array of meetings.
+  # Source B — read Granola desktop app's cache directly (autonomous / cron):
+  tsx scripts/import-granola.ts --source cache-v6 [options]
+  # (or use the shorthand: --cache-v6)
+
+Source selection:
+  --source <kind>           'file' (default; --input required) or 'cache-v6'
+  --cache-v6                Shorthand for --source cache-v6.
+  --input <file>            Required when --source file: JSON array of meetings.
+  --cache-path <path>       --source cache-v6 only. Path to cache-v6.json
+                            (default: ~/Library/Application Support/Granola/cache-v6.json).
+  --watermark-path <path>   --source cache-v6 only. Resumability state file
+                            (default: ~/.kms-granola-state.json).
+  --since <ISO>             --source cache-v6 only. Skip meetings ending before this.
+                            (Watermark wins if it's later.)
 
 Options:
   --time-range <r>          last_30_days (default) | this_week | last_week | custom | all_time (advisory)
@@ -480,6 +521,12 @@ function parseSseToJson(sse: string): any {
 
 export interface GranolaSource {
   list(): Promise<RawMeeting[]>
+  /**
+   * Optional hook: tell the source that meeting <id> was successfully imported.
+   * Sources that maintain a watermark (e.g. GranolaCacheV6Source) advance it
+   * here. No-op for stateless sources (FileGranolaSource).
+   */
+  markImported?(meetingId: string): void
 }
 
 export class FileGranolaSource implements GranolaSource {
@@ -772,7 +819,20 @@ export async function runImport(deps: ImporterDeps): Promise<ImportReport> {
         deps.log.completed.push(meeting.id)
         // Save sync log immediately after each success — partial progress is
         // valuable, especially for long Haiku-bound runs.
-        if (!deps.opts.dryRun) saveSyncLog(deps.opts.syncLogPath, deps.log)
+        if (!deps.opts.dryRun) {
+          saveSyncLog(deps.opts.syncLogPath, deps.log)
+          // Advance the source's watermark (if any) so cron-mode skips on next run.
+          // Skipped under dry-run — nothing was actually written, so we shouldn't
+          // poison the watermark for the real run.
+          try {
+            deps.source.markImported?.(meeting.id)
+          } catch (e) {
+            console.warn(
+              `⚠️  source.markImported failed for ${meeting.id}: ` +
+              `${e instanceof Error ? e.message : e}`
+            )
+          }
+        }
         break
       case 'skipped':
         report.skipped.push({ id: meeting.id, title: meeting.title })
@@ -815,10 +875,21 @@ export async function runImport(deps: ImporterDeps): Promise<ImportReport> {
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2))
 
-  if (!opts.input) {
-    console.error('❌ --input <file> is required (path to a JSON array of meetings).')
-    console.error('   See --help for the expected file shape.')
+  if (opts.source === 'file' && !opts.input) {
+    console.error(`❌ --input <file> is required when --source=file (the default).`)
+    console.error(`   Use --source cache-v6 (or --cache-v6) for autonomous reads.`)
+    console.error(`   See --help for the expected file shape.`)
     process.exit(2)
+  }
+
+  let sinceDate: Date | undefined
+  if (opts.since) {
+    const d = new Date(opts.since)
+    if (isNaN(d.getTime())) {
+      console.error(`❌ --since must be a valid ISO date, got: ${opts.since}`)
+      process.exit(2)
+    }
+    sinceDate = d
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY
@@ -829,7 +900,14 @@ async function main(): Promise<void> {
   }
 
   console.log(`🚀 Granola → KMS importer starting`)
-  console.log(`   Input:        ${opts.input}`)
+  console.log(`   Source:       ${opts.source}`)
+  if (opts.source === 'file') {
+    console.log(`   Input:        ${opts.input}`)
+  } else {
+    console.log(`   Cache path:   ${opts.cachePath ?? DEFAULT_CACHE_V6_PATH}`)
+    console.log(`   Watermark:    ${opts.watermarkPath ?? DEFAULT_WATERMARK_PATH}`)
+    if (sinceDate) console.log(`   Since:        ${sinceDate.toISOString()}`)
+  }
   console.log(`   KMS URL:      ${opts.kmsUrl}`)
   console.log(`   Sync log:     ${opts.syncLogPath}`)
   console.log(`   User ID:      ${opts.userId}`)
@@ -837,7 +915,13 @@ async function main(): Promise<void> {
   console.log(`   Dry run:      ${opts.dryRun}`)
   if (opts.maxMeetings) console.log(`   Cap:          ${opts.maxMeetings} meetings`)
 
-  const source = new FileGranolaSource(opts.input)
+  const source: GranolaSource = opts.source === 'cache-v6'
+    ? new GranolaCacheV6Source({
+        cachePath: opts.cachePath,
+        watermarkPath: opts.watermarkPath,
+        since: sinceDate
+      })
+    : new FileGranolaSource(opts.input!)
   const distiller = opts.dryRun
     ? new NoopDistiller()
     : new HaikuDistiller(apiKey!, opts.anthropicModel)
