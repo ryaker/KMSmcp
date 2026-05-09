@@ -433,6 +433,11 @@ export class UnifiedKMSServer {
         break
 
       case 'kms_update':
+        // Inject auth-context userId so Mem0 propagation can scope its
+        // metadata.kms_id lookup to the right user (Mem0 is per-user).
+        if (authContext.user?.id && !args.userId) {
+          args.userId = authContext.user.id
+        }
         result = await this.tools.store.update(args)
         break
 
@@ -807,7 +812,7 @@ export class UnifiedKMSServer {
       },
       {
         name: 'kms_update',
-        description: 'Update an existing KMS entry by ID — mutate content, metadata, or confidence in place. Use for genuine edits (typo fix, metadata correction, confidence adjustment). NOT for retraction — use kms_supersede when correcting a wrong fact with a new one. Bumps the timestamp and appends the reason to metadata.update_history for audit.',
+        description: 'Update an existing KMS entry by ID — mutate content, metadata, or confidence in place across SparrowDB, MongoDB, and Mem0 (best-effort). Use for genuine edits (typo fix, metadata correction, confidence adjustment). NOT for retraction — use kms_supersede when correcting a wrong fact with a new one. Bumps the timestamp and appends the reason to metadata.update_history for audit. Mem0 propagation looks the entry up by metadata.kms_id and skips silently if the entry was never routed to Mem0.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -815,7 +820,8 @@ export class UnifiedKMSServer {
             content: { type: 'string', description: 'OPTIONAL — new content' },
             metadata: { type: 'object', description: 'OPTIONAL — fields to merge into existing metadata' },
             confidence: { type: 'number', minimum: 0, maximum: 1, description: 'OPTIONAL — new confidence score' },
-            reason: { type: 'string', description: 'Why this update is being made (recorded in audit history)' }
+            reason: { type: 'string', description: 'Why this update is being made (recorded in audit history)' },
+            userId: { type: 'string', description: 'OPTIONAL — defaults to current user context. Used to scope the Mem0 lookup.' }
           },
           required: ['id', 'reason']
         }

@@ -40,7 +40,8 @@ describe('UnifiedStoreTool — corrective operations', () => {
 
     mem0 = {
       store: jest.fn().mockResolvedValue(undefined),
-      deleteMemory: jest.fn().mockResolvedValue(true)
+      deleteMemory: jest.fn().mockResolvedValue(true),
+      update: jest.fn().mockResolvedValue(true)
     }
 
     cache = {
@@ -95,9 +96,63 @@ describe('UnifiedStoreTool — corrective operations', () => {
       expect(result.backends).toEqual(expect.arrayContaining(['sparrowdb', 'mongodb']))
     })
 
-    it('does NOT call Mem0 (Mem0 is LLM-managed)', async () => {
+    it('propagates to Mem0 via mem0.update (no longer skipped)', async () => {
+      // Was skipped historically — caused Mem0 corpus to drift from corrected
+      // truth. Now we propagate via Mem0Storage.update (probe-and-skip if the
+      // entry was never routed to Mem0).
       await tool.update({ id: 'abc-123', content: 'x', reason: 'test' })
+      expect(mem0.update).toHaveBeenCalledWith('abc-123', 'x', undefined, undefined)
+      // deleteMemory must NOT be called — update is non-destructive.
       expect(mem0.deleteMemory).not.toHaveBeenCalled()
+    })
+
+    it('records mem0 in backends list when mem0.update returns true', async () => {
+      mem0.update = jest.fn().mockResolvedValue(true)
+      const result = await tool.update({ id: 'abc-123', content: 'x', reason: 'test' })
+      expect(result.backends).toEqual(expect.arrayContaining(['sparrowdb', 'mongodb', 'mem0']))
+    })
+
+    it('omits mem0 from backends list when mem0.update returns false (probe-and-skip)', async () => {
+      mem0.update = jest.fn().mockResolvedValue(false)
+      const result = await tool.update({ id: 'abc-123', content: 'x', reason: 'test' })
+      expect(result.backends).toEqual(expect.arrayContaining(['sparrowdb', 'mongodb']))
+      expect(result.backends).not.toContain('mem0')
+      // The kms_update overall still succeeds — Mem0 skip is non-fatal.
+      expect(result.success).toBe(true)
+    })
+
+    it('passes existing userId from MongoDB record to Mem0 lookup', async () => {
+      mongo.findById = jest.fn().mockResolvedValue({
+        id: 'abc-123',
+        userId: 'rich',
+        metadata: { tags: ['existing'] }
+      })
+      await tool.update({ id: 'abc-123', content: 'corrected', reason: 'test' })
+      expect(mem0.update).toHaveBeenCalledWith('abc-123', 'corrected', undefined, 'rich')
+    })
+
+    it('caller-supplied userId overrides existing record userId for Mem0 scope', async () => {
+      mongo.findById = jest.fn().mockResolvedValue({
+        id: 'abc-123',
+        userId: 'rich',
+        metadata: {}
+      })
+      await tool.update({
+        id: 'abc-123',
+        content: 'corrected',
+        reason: 'test',
+        userId: 'override-user'
+      })
+      expect(mem0.update).toHaveBeenCalledWith('abc-123', 'corrected', undefined, 'override-user')
+    })
+
+    it('does not fail kms_update when Mem0 propagation throws', async () => {
+      mem0.update = jest.fn().mockRejectedValue(new Error('Mem0 unreachable'))
+      const result = await tool.update({ id: 'abc-123', content: 'x', reason: 'test' })
+      // Mongo + SparrowDB should still have updated successfully.
+      expect(result.success).toBe(true)
+      expect(result.backends).toEqual(expect.arrayContaining(['sparrowdb', 'mongodb']))
+      expect(result.backends).not.toContain('mem0')
     })
 
     it('merges existing metadata so prior keys are not overwritten by $set', async () => {
@@ -146,13 +201,15 @@ describe('UnifiedStoreTool — corrective operations', () => {
     it('does not invalidate cache if all backends fail', async () => {
       graph.update = jest.fn().mockResolvedValue(false)
       mongo.update = jest.fn().mockResolvedValue(false)
+      mem0.update = jest.fn().mockResolvedValue(false)
       await tool.update({ id: 'abc-123', content: 'x' })
       expect(cache.invalidate).not.toHaveBeenCalled()
     })
 
-    it('returns success=false if both backends fail', async () => {
+    it('returns success=false if all backends fail', async () => {
       graph.update = jest.fn().mockResolvedValue(false)
       mongo.update = jest.fn().mockResolvedValue(false)
+      mem0.update = jest.fn().mockResolvedValue(false)
       const result = await tool.update({ id: 'nope', reason: 'test' })
       expect(result.success).toBe(false)
       expect(result.backends).toEqual([])

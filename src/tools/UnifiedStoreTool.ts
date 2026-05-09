@@ -861,7 +861,8 @@ export class UnifiedStoreTool {
           content: args.content,
           metadata: args.metadata,
           confidence: args.confidence,
-          reason: args.reason
+          reason: args.reason,
+          userId: args.userId
         })
         return {
           status: 'updated',
@@ -1085,8 +1086,12 @@ export class UnifiedStoreTool {
    * Use update for genuine edits (typo fix, metadata correction, confidence
    * adjustment).
    *
-   * Calls SparrowDB and MongoDB. Mem0 is skipped — its memories are LLM-managed
-   * and re-extracted on next store, so direct edits don't make sense.
+   * Calls SparrowDB, MongoDB, and Mem0 (best-effort). Mem0 propagation looks
+   * the entry up by kms_id metadata and rewrites its text via Mem0's update
+   * endpoint; if the entry was never routed to Mem0 it's a no-op (probe-and-
+   * skip, same pattern as kms_supersede in PR #65). Without Mem0 propagation,
+   * Mem0's LLM-extracted memories drift from corrected truth and leak stale
+   * content into search + the kms-context-fetch hook.
    */
   async update(args: {
     id: string
@@ -1094,6 +1099,7 @@ export class UnifiedStoreTool {
     metadata?: Record<string, any>
     confidence?: number
     reason?: string
+    userId?: string
   }): Promise<{ success: boolean; id: string; backends: string[]; reason?: string }> {
     const updates: Partial<UnifiedKnowledge> = {}
     if (args.content !== undefined) updates.content = args.content
@@ -1102,10 +1108,14 @@ export class UnifiedStoreTool {
     // Fetch existing record so we can merge metadata instead of overwriting it.
     // This prevents $set from dropping existing metadata keys and prior
     // update_history entries that the caller did not include in args.metadata.
+    // Also surfaces the existing userId so Mem0 propagation can scope its
+    // search to the right user when the caller didn't supply args.userId.
     let existingMetadata: Record<string, any> = {}
+    let existingUserId: string | undefined
     try {
       const existing = await this.storage.mongodb.findById(args.id)
       if (existing?.metadata) existingMetadata = existing.metadata as Record<string, any>
+      if (existing?.userId) existingUserId = existing.userId
     } catch (e) {
       console.warn('⚠️  unified_update: could not fetch existing metadata for merge (non-fatal):', e)
     }
@@ -1138,6 +1148,27 @@ export class UnifiedStoreTool {
       if (ok) backends.push('mongodb')
     } catch (e) {
       console.warn('⚠️  unified_update MongoDB error:', e)
+    }
+
+    // Mem0 propagation (best-effort). Mem0 indexes by its own internal id,
+    // not the KMS id; Mem0Storage.update looks the mem0_id up via search
+    // filtered by metadata.kms_id and skips silently if the entry was never
+    // routed to Mem0 (probe-and-skip). Without this, Mem0's corpus drifts
+    // from corrected truth and stale content leaks into context injection.
+    if (typeof (this.storage.mem0 as any).update === 'function') {
+      try {
+        const ok = await (this.storage.mem0 as any).update(
+          args.id,
+          args.content,
+          args.metadata,
+          args.userId ?? existingUserId
+        )
+        if (ok) backends.push('mem0')
+      } catch (e) {
+        // Non-fatal — kms_update already mutated Mongo + SparrowDB. A Mem0
+        // propagation failure shouldn't tear down the whole call.
+        console.warn('⚠️  unified_update Mem0 error (non-fatal):', e)
+      }
     }
 
     // Invalidate cache after any successful backend update so stale search
