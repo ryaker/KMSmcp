@@ -684,7 +684,8 @@ export class UnifiedStoreTool {
                     content: args.content,
                     metadata: args.metadata,
                     confidence: args.confidence,
-                    reason: args.reason
+                    reason: args.reason,
+                    userId: args.userId
                 });
                 return {
                     status: 'updated',
@@ -876,8 +877,12 @@ export class UnifiedStoreTool {
      * Use update for genuine edits (typo fix, metadata correction, confidence
      * adjustment).
      *
-     * Calls SparrowDB and MongoDB. Mem0 is skipped — its memories are LLM-managed
-     * and re-extracted on next store, so direct edits don't make sense.
+     * Calls SparrowDB, MongoDB, and Mem0 (best-effort). Mem0 propagation looks
+     * the entry up by kms_id metadata and rewrites its text via Mem0's update
+     * endpoint; if the entry was never routed to Mem0 it's a no-op (probe-and-
+     * skip, same pattern as kms_supersede in PR #65). Without Mem0 propagation,
+     * Mem0's LLM-extracted memories drift from corrected truth and leak stale
+     * content into search + the kms-context-fetch hook.
      */
     async update(args) {
         const updates = {};
@@ -893,6 +898,8 @@ export class UnifiedStoreTool {
         //      existing entry (caller can't change them via update()). Without
         //      this, an updated entry would keep its OLD fingerprint and Tier 0
         //      would mis-match the next write of the OLD content.
+        //   3. Surface existingUserId so Mem0 propagation (PR #79) can scope its
+        //      search to the right user when the caller didn't supply args.userId.
         //
         // Prefer the graph's findById since the sidecar holds full content + the
         // current fingerprint authoritative metadata; fall back to MongoDB for
@@ -984,6 +991,16 @@ export class UnifiedStoreTool {
         }
         catch (e) {
             console.warn('⚠️  unified_update MongoDB error:', e);
+        }
+        // Mem0 propagation (best-effort). Mem0 indexes by its own internal id,
+        // not the KMS id; Mem0Storage.update looks the mem0_id up via search
+        // filtered by metadata.kms_id and skips silently if the entry was never
+        // routed to Mem0 (probe-and-skip). Without this, Mem0's corpus drifts
+        // from corrected truth and stale content leaks into context injection.
+        if (typeof this.storage.mem0.update === 'function') {
+            const ok = await this.storage.mem0.update(args.id, args.content, args.metadata, args.userId ?? existingUserId);
+            if (ok)
+                backends.push('mem0');
         }
         // Invalidate cache after any successful backend update so stale search
         // results and knowledge cache entries don't serve pre-update content.
