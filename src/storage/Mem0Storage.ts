@@ -24,6 +24,7 @@
 
 import { MemoryClient, Memory } from 'mem0ai'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
+import { logger } from '../logger.js'
 
 export class Mem0Storage implements StorageSystem {
   public name = 'mem0'
@@ -245,6 +246,143 @@ export class Mem0Storage implements StorageSystem {
       return true
     } catch (error) {
       console.error('❌ Mem0 delete error:', error)
+      return false
+    }
+  }
+
+  /**
+   * Update an existing Mem0 entry by KMS id (kms_update propagation).
+   *
+   * Why this exists: kms_update mutates content + metadata in Mongo and
+   * SparrowDB, but historically skipped Mem0 — the rationale was "Mem0
+   * memories are LLM-managed and re-extracted on next store". In practice
+   * this caused Mem0's corpus to drift from corrected truth: a fact
+   * superseded or rewritten in Mongo would still surface its outdated form
+   * via Mem0 search (and via the kms-context-fetch hook). By calling Mem0's
+   * own update endpoint with the new text, we let Mem0's LLM re-extract a
+   * coherent memory from the corrected content rather than continuing to
+   * surface the stale extraction.
+   *
+   * Mem0 indexes by its own internal id, NOT the KMS id. The mapping is
+   * one-way: at store() time we set `metadata.kms_id = knowledge.id` on the
+   * Mem0 record but we never persisted Mem0's returned id back into our
+   * canonical record. So here we look the Mem0 id up via search-and-filter:
+   *
+   *   1. Search Mem0 with the kms id as the query, scoped to user_id.
+   *      Mem0 stores metadata as searchable text, so the kms id usually
+   *      surfaces the right entry near the top.
+   *   2. Filter results client-side for `metadata.kms_id === kmsId` (exact
+   *      match — a substring hit on a different entry's metadata is a false
+   *      positive we must not act on).
+   *   3. If exactly one match, call client.update(mem0Id, content).
+   *   4. If zero matches → probe-and-skip: log debug, return false. This
+   *      mirrors the kms_supersede pattern (PR #65 / issue #62): an entry
+   *      may not have been routed to Mem0 (routing is content-type
+   *      dependent), and the corrective op should succeed silently rather
+   *      than fail the whole update.
+   *   5. If multiple matches → log warning, update the first (most-relevant
+   *      per Mem0's ranking). Multi-match shouldn't happen in practice
+   *      (kms_id is set once per store) but defensive logging surfaces
+   *      anomalies.
+   *
+   * Mem0 v3 SDK update signature is `update(memoryId, message)` — text
+   * only, no metadata. Mem0's LLM re-extracts metadata from the new text
+   * itself; we cannot directly set kms_id / subject / etc. on update. The
+   * kms_id we wrote at store() time persists.
+   *
+   * Return value mirrors the boolean shape of MongoStorage.update /
+   * SparrowDBStorage.update: true on successful propagation, false on any
+   * skip / soft-fail / unexpected error. We never throw — Mem0 propagation
+   * is best-effort by design (a Mem0 outage must not tear down a kms_update
+   * that already mutated Mongo + SparrowDB).
+   */
+  async update(
+    id: string,
+    content?: string,
+    _metadata?: Record<string, unknown>,
+    userId?: string
+  ): Promise<boolean> {
+    // No content → no-op. Mem0's update endpoint requires `text`. A
+    // metadata-only or confidence-only kms_update has no Mem0 equivalent
+    // (Mem0 re-extracts metadata from content; there's no direct setter).
+    if (content === undefined || content === null || content === '') {
+      logger.debug(`[Mem0Storage.update] No content provided for ${id} — skipping Mem0 propagation (Mem0 update requires text)`)
+      return false
+    }
+
+    try {
+      const resolvedUserId = userId || this.config.defaultUserId || 'personal'
+
+      // Step 1: locate the Mem0 internal id via search.
+      // Use the kms_id as the query string. Mem0 stores metadata fields as
+      // part of the indexed payload, so the id usually surfaces in the top
+      // few hits. Cap at 50 to bound the client-side filter cost.
+      let mem0Id: string | null = null
+      try {
+        type Mem0SearchResponse = any[] | { results?: any[] }
+        // Mirrors Mem0Storage.search() above: declare the options as a free
+        // object literal (not typed against SearchOptions) so the SDK's
+        // camelCase `topK` — which it converts to snake_case at the wire —
+        // is accepted. The SDK's published .d.ts only lists `top_k`; the
+        // runtime accepts both.
+        const searchOptions = {
+          topK: 50,
+          filters: { user_id: resolvedUserId }
+        }
+        const response = await this.client.search(id, searchOptions) as unknown as Mem0SearchResponse
+        const results: any[] = Array.isArray(response) ? response : (response?.results ?? [])
+
+        // Step 2: exact-match filter on metadata.kms_id. Substring hits on
+        // adjacent entries' metadata would be false positives.
+        const matches = results.filter((r: any) => r?.metadata?.kms_id === id)
+
+        if (matches.length === 0) {
+          // Probe-and-skip — entry may never have been routed to Mem0
+          // (routing is content-type dependent). Same pattern as PR #65.
+          logger.debug(`[Mem0Storage.update] kms_id=${id} not found in Mem0 for user=${resolvedUserId} — skipping (probe-and-skip)`)
+          return false
+        }
+
+        if (matches.length > 1) {
+          logger.warn(`[Mem0Storage.update] kms_id=${id} returned ${matches.length} Mem0 matches — using first. This usually means a duplicate kms_id was written to Mem0; investigate.`)
+        }
+
+        mem0Id = matches[0].id
+        if (!mem0Id) {
+          logger.warn(`[Mem0Storage.update] Mem0 search match for kms_id=${id} has no id field — skipping`)
+          return false
+        }
+      } catch (searchError) {
+        // Search failure is non-fatal — log and skip. We don't want a
+        // transient Mem0 search error to fail the whole kms_update.
+        logger.warn(`[Mem0Storage.update] Mem0 search failed while looking up kms_id=${id}:`, searchError)
+        return false
+      }
+
+      // Step 3: call Mem0 update with the resolved internal id.
+      try {
+        logger.debug(`[Mem0Storage.update] Updating Mem0 entry mem0Id=${mem0Id} for kms_id=${id}`)
+        await this.client.update(mem0Id, content)
+        logger.debug(`[Mem0Storage.update] Successfully propagated kms_update to Mem0 (kms_id=${id}, mem0Id=${mem0Id})`)
+        return true
+      } catch (updateError) {
+        // 404 = entry was deleted between our search and update (rare
+        // race). Treat as probe-and-skip — there's nothing to update,
+        // and we don't want to fail the kms_update for a vanished entry.
+        const errMsg = updateError instanceof Error ? updateError.message : String(updateError)
+        if (/\b404\b|not found|does not exist/i.test(errMsg)) {
+          logger.debug(`[Mem0Storage.update] Mem0 entry mem0Id=${mem0Id} returned 404 on update — skipping (probe-and-skip)`)
+          return false
+        }
+        // Other unexpected errors are swallowed by the outer catch below —
+        // re-throw here so the outer handler can log them and return false.
+        throw updateError
+      }
+    } catch (error) {
+      // Outer catch for anything that escaped — keep the same defensive
+      // shape as the rest of this class so a Mem0 hiccup never tears down
+      // a kms_update call.
+      logger.warn(`[Mem0Storage.update] Failed to propagate kms_update to Mem0 for kms_id=${id}:`, error)
       return false
     }
   }
