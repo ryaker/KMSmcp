@@ -880,6 +880,44 @@ export class SparrowDBStorage implements StorageSystem {
     return out
   }
 
+  /**
+   * Tier 0 fingerprint dedup lookup (DG-T0).
+   *
+   * Returns the first entry whose `metadata.fingerprint === fingerprint` AND
+   * `userId === userId`. Scans the in-memory contentIndex (~1200 entries on
+   * the production corpus → ~0.1 ms typical). Skips flagged entries by
+   * default — the gate should not refuse a write because of a previously
+   * deleted/superseded/retracted match. Pass `includeFlagged: true` for
+   * audit / reaper paths.
+   *
+   * Returns `null` when no match is found (no entry has the fingerprint, or
+   * the only matches are flagged when `includeFlagged` is false).
+   *
+   * Why a linear scan rather than a fingerprint→id index: the contentIndex
+   * is an in-memory Map already holding every entry; scanning is bounded
+   * and the cost is well below the Tier 1 latency floor. A separate index
+   * would be a maintenance burden (load/save sidecar, dedup eviction on
+   * delete/update, etc.) for negligible gain at current corpus size. If
+   * the corpus grows past ~10k entries we can revisit.
+   */
+  findByFingerprint(
+    fingerprint: string,
+    userId: string,
+    options?: { includeFlagged?: boolean }
+  ): ContentEntry | null {
+    const includeFlagged = options?.includeFlagged === true
+    if (!fingerprint || !userId) return null
+    for (const entry of this.contentIndex.values()) {
+      if (entry.userId !== userId) continue
+      if (!includeFlagged && entry.flag) continue
+      const fp = entry.metadata?.fingerprint
+      if (typeof fp === 'string' && fp === fingerprint) {
+        return entry
+      }
+    }
+    return null
+  }
+
   // -------------------------------------------------------------------------
   // StorageSystem.search
   // -------------------------------------------------------------------------

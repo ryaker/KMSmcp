@@ -17,7 +17,8 @@ import {
   PENDING_EMBEDDER_ID_KEY
 } from '../embedding/EmbeddingService.js'
 import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js'
-import { logger } from '../logger.js' 
+import { computeFingerprint } from '../dedup/Fingerprint.js'
+import { logger } from '../logger.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -97,8 +98,17 @@ export interface DedupRequiredResponse {
   candidates: DedupCandidate[]
   message: string
   retry_with: string[]
-  /** Threshold band for the highest-similarity candidate ('refuse' | 'confirm'). */
-  band: 'refuse' | 'confirm'
+  /**
+   * Threshold band for the highest-similarity candidate.
+   *  - 'exact'   — Tier 0 fingerprint match (DG-T0). Identical normalized
+   *    content for the same userId / contentType / subject scope. similarity
+   *    is reported as 1.0 and llm_relation is 'duplicate' inline (no LLM
+   *    call — the fingerprint is a stronger signal than any embedder).
+   *  - 'refuse'  — Tier 1 cosine similarity ≥ refuseThreshold (default 0.88,
+   *    or per-contentType override).
+   *  - 'confirm' — Tier 1 cosine similarity ∈ [confirmThreshold, refuseThreshold).
+   */
+  band: 'exact' | 'refuse' | 'confirm'
   /** Echo of the thresholds applied to this call (for caller diagnostics). */
   thresholds: { refuse: number; confirm: number }
 }
@@ -335,6 +345,114 @@ export class UnifiedStoreTool {
       timestamp: new Date(),
       confidence: enrichedArgs.confidence || 0.8,
       relationships: enrichedArgs.relationships || []
+    }
+
+    // ---------------------------------------------------------------------
+    // Dedup gate — Tier 0 (DG-T0) fingerprint check (PREPENDS Tier 1)
+    //
+    // Cheap O(n) scan of the in-memory sidecar against a SHA-256 fingerprint
+    // of (normalized_content, userId, contentType, subject ?? ''). Catches:
+    //   - Whitespace-only differences that the embedder may not score above
+    //     the cosine refuse threshold.
+    //   - Repeated submits / batch importer re-runs.
+    //   - Anything identical when the embedder or LLM judge is down.
+    //
+    // Skipped when:
+    //   - options.skip_dedup === true (admin escape hatch; same path the
+    //     DG-T1-C dispatcher uses for action=complement / action=force-new).
+    //   - The graph backend doesn't expose findByFingerprint (older builds).
+    //
+    // The fingerprint is also stamped into knowledge.metadata so subsequent
+    // Tier 0 lookups match against it directly.
+    // ---------------------------------------------------------------------
+    const tier0SubjectFacet = typeof knowledge.metadata?.subject === 'string'
+      ? (knowledge.metadata.subject as string)
+      : undefined
+
+    const fingerprint = computeFingerprint({
+      content: knowledge.content,
+      userId: knowledge.userId,
+      contentType: knowledge.contentType,
+      subject: tier0SubjectFacet
+    })
+
+    // Stamp fingerprint into metadata for future Tier 0 hits. We do this
+    // unconditionally (regardless of whether Tier 0 finds a match this call)
+    // so the next write of identical content lands a fingerprint match. Set
+    // BEFORE the Tier 0 check so the in-memory metadata clone propagates
+    // through embedding, routing, and storage fan-out.
+    knowledge.metadata = {
+      ...knowledge.metadata,
+      fingerprint
+    }
+
+    if (
+      args.options?.skip_dedup !== true &&
+      typeof (this.storage.graph as any).findByFingerprint === 'function'
+    ) {
+      try {
+        const existing = (this.storage.graph as any).findByFingerprint(
+          fingerprint,
+          knowledge.userId
+        ) as { id: string; content?: string; contentType?: string; source?: string; metadata?: Record<string, any>; timestamp?: string; flag?: KnowledgeFlag | null } | null
+
+        if (existing && !existing.flag) {
+          const subject = typeof existing.metadata?.subject === 'string'
+            ? (existing.metadata.subject as string)
+            : undefined
+          const preview = (existing.content ?? '').slice(0, 200)
+
+          // Reuse the resolved Tier 1 thresholds for the response echo so the
+          // caller sees the *same* threshold context across tiers (Tier 0 is
+          // additive, not a replacement). The thresholds aren't actually used
+          // to make the Tier 0 decision — fingerprint identity is binary.
+          const { refuse: refuseThreshold, confirm: confirmThreshold } = resolveDedupThresholds(
+            knowledge.contentType,
+            args.options?.dedup_threshold_override
+          )
+
+          const response: DedupRequiredResponse = {
+            status: 'dedup_required',
+            candidates: [{
+              id: existing.id,
+              similarity: 1.0,
+              content_preview: preview,
+              contentType: existing.contentType ?? knowledge.contentType,
+              source: existing.source ?? knowledge.source,
+              subject,
+              created: existing.timestamp ?? '',
+              flag: existing.flag ?? null,
+              // Fingerprint match is a stronger signal than any embedder
+              // similarity, so we tag 'duplicate' inline without invoking
+              // the Tier 2 LLM judge.
+              llm_relation: 'duplicate'
+            }],
+            message:
+              `Exact-match duplicate found via Tier 0 fingerprint (sha256). ` +
+              `Identical normalized content for the same userId+contentType+subject scope. ` +
+              `Retry with action.`,
+            retry_with: [
+              `action=supersede&old_id=${existing.id}&reason=<...>`,
+              `action=update&old_id=${existing.id}&reason=<...>`,
+              `action=complement&related_to=${existing.id}`,
+              `action=force-new&reason=<justification>`
+            ],
+            band: 'exact',
+            thresholds: { refuse: refuseThreshold, confirm: confirmThreshold }
+          }
+          debug(
+            `🛑 DEDUP GATE refused write (exact/Tier 0): fingerprint match against id=${existing.id}`
+          )
+          return response
+        }
+      } catch (e) {
+        // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
+        // Tier 1 still runs.
+        console.warn(
+          `⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+          `${e instanceof Error ? e.message : String(e)}`
+        )
+      }
     }
 
     // ---------------------------------------------------------------------

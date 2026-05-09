@@ -178,6 +178,15 @@ export interface GraphStorage extends StorageSystem {
   ): Promise<boolean>
   findById?(id: string): { id: string; flag?: KnowledgeFlag | null; flag_date?: string; [k: string]: any } | null
   listFlagged?(): Array<{ id: string; flag?: KnowledgeFlag | null; flag_date?: string; [k: string]: any }>
+  // Tier 0 fingerprint dedup (DG-T0) — returns the first entry whose
+  // metadata.fingerprint matches AND userId matches. Skips flagged entries
+  // by default. Returns null when no match. Optional so backends without an
+  // in-memory index can degrade to "no Tier 0 check".
+  findByFingerprint?(
+    fingerprint: string,
+    userId: string,
+    options?: { includeFlagged?: boolean }
+  ): { id: string; flag?: KnowledgeFlag | null; metadata?: Record<string, any>; [k: string]: any } | null
   // Embedding write (DG-T1-A) — persists a 768-dim vector into the HNSW index
   // for the (Knowledge, embedding) tuple. Optional so older bindings degrade.
   storeEmbedding?(id: string, embedding: Float32Array, embedderId: string): Promise<boolean>
