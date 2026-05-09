@@ -120,7 +120,12 @@ export class Mem0Storage implements StorageSystem {
       // Previous implementation passed user_id at top level → SDK threw →
       // outer try/catch swallowed → returned [] → Mem0 dimension of dedup
       // gate has been silently dark since the 1.x→3.x cutover.
+      // `api_version: 'v2'` pins the search to /v2/memories/search/ for
+      // consistency with getAll() (which REQUIRES v2 — the v1 getAll path
+      // serializes options via URLSearchParams and stringifies nested
+      // `filters` to "[object Object]", causing a 400 from the server).
       const searchOptions = {
+        api_version: 'v2' as const,
         topK: query.options?.maxResults || 10,
         filters: { user_id: userId, ...this.buildMem0Filters(query.filters) }
       }
@@ -159,9 +164,17 @@ export class Mem0Storage implements StorageSystem {
       // v3 SDK: use getAll() with filters.user_id and page_size=1 to get the count.
       // user_id MUST be inside filters — getAll() throws via rejectTopLevelEntityParams
       // if it appears at top level (verified against mem0ai@3.0.2 source).
+      // `api_version: 'v2'` is REQUIRED here: the SDK's getAll() (mem0ai
+      // dist/index.js:249-281) defaults to /v1/memories/?<URLSearchParams>
+      // when api_version is unset. URLSearchParams stringifies nested
+      // `filters` to "[object Object]", so the v1 endpoint sees no entity
+      // param and returns 400 with "One of the filters: app_id, user_id,
+      // agent_id, run_id is required!". Only the v2 endpoint POSTs the
+      // options as JSON, preserving the nested filters object.
       const userId = this.config.defaultUserId || 'personal'
       type Mem0GetAllResponse = any[] | { count?: number; results?: any[]; next?: string | null; previous?: string | null }
       const page = await this.client.getAll({
+        api_version: 'v2',
         page: 1,
         page_size: 1,
         filters: { user_id: userId }
@@ -187,9 +200,11 @@ export class Mem0Storage implements StorageSystem {
   async getMemoriesForUser(userId: string, limit = 50): Promise<any[]> {
     try {
       // v3 SDK contract: user_id inside filters, NOT top level.
-      // (See getStats above for the SDK-source rationale.)
+      // `api_version: 'v2'` REQUIRED — see getStats() above for the
+      // URLSearchParams flattening bug on the v1 path.
       type Mem0GetAllResponse = any[] | { count?: number; results?: any[] }
       const page = await this.client.getAll({
+        api_version: 'v2',
         page: 1,
         page_size: limit,
         filters: { user_id: userId }
@@ -325,7 +340,10 @@ export class Mem0Storage implements StorageSystem {
         // camelCase `topK` — which it converts to snake_case at the wire —
         // is accepted. The SDK's published .d.ts only lists `top_k`; the
         // runtime accepts both.
+        // `api_version: 'v2'` for consistency with getStats/getMemoriesForUser
+        // and to prevent the same regression class as the v1 URLSearchParams bug.
         const searchOptions = {
+          api_version: 'v2' as const,
           topK: 50,
           filters: { user_id: resolvedUserId }
         }
@@ -448,7 +466,9 @@ export class Mem0Storage implements StorageSystem {
 
       const searchQuery = query
       // v3 SDK contract: user_id inside filters (see Mem0Storage.search above).
+      // `api_version: 'v2'` for consistency with the rest of this file.
       const searchOptions = {
+        api_version: 'v2' as const,
         topK: 10,
         filters: { user_id: userId }
       }

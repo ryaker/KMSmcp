@@ -61,9 +61,13 @@ describe('Mem0Storage.update — kms_update propagation', () => {
       const result = await storage.update('kms-abc', 'corrected content')
 
       // Search was scoped to user_id and used the kms id as the query.
+      // api_version: 'v2' is REQUIRED — see Mem0Storage.getStats() comments
+      // for the v1 URLSearchParams flattening bug. Asserting it here keeps
+      // any future regression that drops the flag visible at test time.
       expect(mockClient.search).toHaveBeenCalledWith(
         'kms-abc',
         expect.objectContaining({
+          api_version: 'v2',
           topK: 50,
           filters: expect.objectContaining({ user_id: 'test-user' })
         })
