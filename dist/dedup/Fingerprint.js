@@ -31,15 +31,34 @@
  * subsequent Tier 0 lookups can match against it directly.
  */
 import crypto from 'crypto';
+// Horizontal whitespace character class — used by normalize() to identify
+// non-newline whitespace. Enumerates space, tab, form-feed, vertical-tab,
+// and U+00A0 non-breaking space. NBSP is included because it commonly
+// appears in copy-pasted content from rich-text sources (Word, Google
+// Docs) and would otherwise fork the fingerprint vs the plain-space
+// version of the same content. Newlines are deliberately excluded so
+// paragraph structure is preserved at the higher level.
+const HWS_CHAR = /[ \t\f\v ]/;
+const HWS_RUN_GLOBAL = /[ \t\f\v ]+/g;
+const HWS_TRAILING = /[ \t\f\v ]+$/;
 /**
  * Normalize content for fingerprinting. Two strings that differ only in
- * whitespace produce the same fingerprint.
+ * trailing whitespace, internal whitespace runs, or line-ending style
+ * produce the same fingerprint.
  *
  * Rules:
- *   - Strip trailing whitespace from each line
- *   - Collapse runs of horizontal whitespace WITHIN a line to a single space
  *   - Normalize line endings (CRLF / CR → LF)
+ *   - Strip TRAILING horizontal whitespace from each line
+ *   - Collapse runs of horizontal whitespace WITHIN a line to a single space
+ *     (but preserve a single leading-indent block intact)
  *   - Strip leading/trailing blank lines from the whole content
+ *
+ * Why leading indentation is preserved: indentation is semantically
+ * meaningful in code blocks, nested lists, and structured prose. Collapsing
+ * `"    code()"` and `"code()"` to the same fingerprint would let Tier 0
+ * declare two non-equivalent entries identical. We collapse internal runs
+ * (so `"foo    bar"` and `"foo bar"` match) but keep the first leading-
+ * whitespace block of each line verbatim.
  *
  * We deliberately preserve internal blank lines (between paragraphs) so
  * structurally distinct content stays distinct after normalization.
@@ -50,20 +69,23 @@ export function normalize(content) {
     // Normalize line endings first so per-line operations work uniformly.
     const unifiedNewlines = content.replace(/\r\n?/g, '\n');
     const lines = unifiedNewlines.split('\n').map(line => {
-        // Collapse runs of horizontal whitespace within the line to a single
-        // space. We explicitly enumerate horizontal whitespace (space, tab,
-        // form-feed, vertical-tab, U+00A0 non-breaking space) instead of \s
-        // so paragraph structure (newlines) is preserved. NBSP is included
-        // because it commonly appears in copy-pasted content from rich-text
-        // sources and would otherwise fork the fingerprint vs the plain-space
-        // version of the same content.
-        const collapsed = line.replace(/[ \t\f\v ]+/g, ' ');
-        // Strip leading + trailing whitespace per-line (line-internal already
-        // collapsed; this drops the leading/trailing single-space residue).
-        return collapsed.trim();
+        // 1) Capture leading indentation (the contiguous block of horizontal
+        //    whitespace at the start of the line). Preserved verbatim —
+        //    collapsing it would erase code/list semantics.
+        let leadingEnd = 0;
+        while (leadingEnd < line.length && HWS_CHAR.test(line.charAt(leadingEnd))) {
+            leadingEnd++;
+        }
+        const leading = line.slice(0, leadingEnd);
+        const rest = line.slice(leadingEnd);
+        // 2) Collapse internal whitespace runs in the rest of the line.
+        const collapsedRest = rest.replace(HWS_RUN_GLOBAL, ' ');
+        // 3) Strip trailing horizontal whitespace only — leading indent kept.
+        return (leading + collapsedRest).replace(HWS_TRAILING, '');
     });
-    // Drop leading + trailing blank lines so wrapping noise doesn't fork the
-    // fingerprint. Internal blank lines preserved (paragraph structure).
+    // Drop leading + trailing fully-blank lines so wrapping noise doesn't
+    // fork the fingerprint. (After the per-line trailing strip, lines that
+    // were pure-whitespace have become empty strings and qualify as blank.)
     let start = 0;
     let end = lines.length;
     while (start < end && lines[start] === '')

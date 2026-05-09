@@ -39,12 +39,33 @@ describe('DG-T0 — Fingerprint module (computeFingerprint / normalize)', () => 
       expect(normalize('foo    bar\t\tbaz')).toBe('foo bar baz')
     })
 
+    it('preserves leading indentation (code blocks / nested lists)', () => {
+      // Leading indent kept verbatim — collapsing it would erase code/list
+      // semantics. Internal runs still collapse; trailing still stripped.
+      expect(normalize('    code()   ')).toBe('    code()')
+      expect(normalize('  - item one\n  - item two   ')).toBe('  - item one\n  - item two')
+    })
+
+    it('does not collapse leading-indent into adjacent internal whitespace', () => {
+      // The leading indent block ends at the first non-HWS character. The
+      // collapse pass operates only on the rest of the line.
+      expect(normalize('    foo    bar')).toBe('    foo bar')
+    })
+
     it('preserves internal blank lines (paragraph structure)', () => {
       expect(normalize('para 1\n\npara 2')).toBe('para 1\n\npara 2')
     })
 
     it('drops leading and trailing blank lines from the whole content', () => {
       expect(normalize('\n\nhello\n\n')).toBe('hello')
+    })
+
+    it('treats lines with only whitespace as blank for leading/trailing trimming', () => {
+      // Pure-whitespace lines collapse to empty after trailing strip, then
+      // qualify for the leading/trailing blank-line removal. The middle
+      // line preserves its leading indent (a single tab) — that's
+      // semantic content, not wrapping noise.
+      expect(normalize('   \n\thello   \n   ')).toBe('\thello')
     })
 
     it('normalizes CRLF / CR line endings to LF', () => {
@@ -74,10 +95,19 @@ describe('DG-T0 — Fingerprint module (computeFingerprint / normalize)', () => 
       expect(a).toBe(b)
     })
 
-    it('returns the same fingerprint for whitespace-equivalent inputs', () => {
+    it('returns the same fingerprint for trailing-whitespace + internal-run differences', () => {
+      // Same leading indent (none); only trailing + internal-run differ.
       const a = computeFingerprint({ content: 'foo bar', userId: 'u', contentType: 'fact' })
-      const b = computeFingerprint({ content: '  foo    bar  \t', userId: 'u', contentType: 'fact' })
+      const b = computeFingerprint({ content: 'foo    bar  \t', userId: 'u', contentType: 'fact' })
       expect(a).toBe(b)
+    })
+
+    it('produces DIFFERENT fingerprints when leading indentation differs', () => {
+      // Leading indent is semantic (code / nested lists). Two writes that
+      // differ ONLY in their leading indent are NOT equivalent.
+      const a = computeFingerprint({ content: 'foo bar', userId: 'u', contentType: 'fact' })
+      const b = computeFingerprint({ content: '    foo bar', userId: 'u', contentType: 'fact' })
+      expect(a).not.toBe(b)
     })
 
     it('changes when userId differs', () => {
@@ -248,15 +278,18 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
   // 2. Whitespace-only differences still trigger Tier 0
   // -------------------------------------------------------------------------
 
-  it('catches whitespace-only differences (normalize() collapses them)', async () => {
-    // The fingerprint for the original write
+  it('catches trailing-whitespace + internal-run-only differences (Tier 0 hit)', async () => {
+    // Both inputs share the same leading indent (none); only trailing
+    // whitespace and internal-run length differ. Leading indent is
+    // semantic and preserved by normalize() — see Fingerprint module
+    // contract — so we don't vary it across these two writes.
     const fpOriginal = computeFingerprint({
       content: 'foo bar baz',
       userId: 'u',
       contentType: 'fact'
     })
     const fpWhitespaceVariant = computeFingerprint({
-      content: '  foo    bar\t\tbaz  ',
+      content: 'foo    bar\t\tbaz  ',
       userId: 'u',
       contentType: 'fact'
     })
@@ -283,9 +316,9 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
     )
 
     const tool = makeTool()
-    // Now write with extra whitespace. Should hit Tier 0.
+    // Now write with extra trailing/internal whitespace. Should hit Tier 0.
     const result = await tool.store({
-      content: '  foo    bar\t\tbaz  ',
+      content: 'foo    bar\t\tbaz  ',
       contentType: 'fact',
       userId: 'u'
     })
@@ -705,5 +738,159 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
     if (!isDedupRequired(result)) return
     expect(result.band).toBe('refuse')
     expect(result.candidates[0].id).toBe('tier1-near-dup')
+  })
+
+  // -------------------------------------------------------------------------
+  // Update path: fingerprint recomputation
+  //
+  // When UnifiedStoreTool.update() mutates content / metadata / subject, the
+  // stored entry's metadata.fingerprint must be recomputed — otherwise the
+  // entry keeps a stale fingerprint that would mis-route the next Tier 0
+  // lookup of either the old or new content.
+  // -------------------------------------------------------------------------
+
+  it('update() recomputes metadata.fingerprint when content changes', async () => {
+    // Pre-existing entry the update path will fetch.
+    const oldContent = 'phoenix camera count is 6'
+    const newContent = 'phoenix camera count is UNKNOWN'
+    const oldFp = computeFingerprint({
+      content: oldContent,
+      userId: 'u',
+      contentType: 'fact'
+    })
+    ;(graph as any).findById = jest.fn().mockReturnValue({
+      id: 'entry-1',
+      content: oldContent,
+      contentType: 'fact',
+      source: 'technical',
+      userId: 'u',
+      metadata: { fingerprint: oldFp, subject: 'Phoenix.cam' }
+    })
+    mongo.findById = jest.fn().mockResolvedValue(null)
+    ;(graph as any).update = jest.fn().mockResolvedValue(true)
+    mongo.update = jest.fn().mockResolvedValue(true)
+
+    const tool = makeTool()
+    const result = await tool.update({
+      id: 'entry-1',
+      content: newContent,
+      reason: 'discovered the prior count was wrong'
+    })
+
+    expect(result.success).toBe(true)
+    // Inspect the metadata that was passed to the backend update.
+    const sentToGraph = ((graph as any).update as jest.Mock).mock.calls[0][1]
+    const newFp = computeFingerprint({
+      content: newContent,
+      userId: 'u',
+      contentType: 'fact',
+      subject: 'Phoenix.cam'
+    })
+    expect(sentToGraph.metadata.fingerprint).toBe(newFp)
+    expect(sentToGraph.metadata.fingerprint).not.toBe(oldFp)
+  })
+
+  it('update() recomputes fingerprint when metadata.subject changes', async () => {
+    const content = 'shared content'
+    const oldFp = computeFingerprint({
+      content,
+      userId: 'u',
+      contentType: 'fact',
+      subject: 'A'
+    })
+    ;(graph as any).findById = jest.fn().mockReturnValue({
+      id: 'entry-2',
+      content,
+      contentType: 'fact',
+      source: 'technical',
+      userId: 'u',
+      metadata: { fingerprint: oldFp, subject: 'A' }
+    })
+    mongo.findById = jest.fn().mockResolvedValue(null)
+    ;(graph as any).update = jest.fn().mockResolvedValue(true)
+    mongo.update = jest.fn().mockResolvedValue(true)
+
+    const tool = makeTool()
+    await tool.update({
+      id: 'entry-2',
+      metadata: { subject: 'B' },
+      reason: 'fact moved to a new subject facet'
+    })
+
+    const sentToGraph = ((graph as any).update as jest.Mock).mock.calls[0][1]
+    const newFp = computeFingerprint({
+      content,
+      userId: 'u',
+      contentType: 'fact',
+      subject: 'B'
+    })
+    expect(sentToGraph.metadata.fingerprint).toBe(newFp)
+    expect(sentToGraph.metadata.fingerprint).not.toBe(oldFp)
+  })
+
+  it('update() preserves existing fingerprint when content + scope unchanged', async () => {
+    // Pure metadata-edit (e.g. confidence bump) should still recompute the
+    // fingerprint, but the result equals the existing one because the
+    // tuple inputs haven't changed.
+    const content = 'stable content'
+    const fp = computeFingerprint({
+      content,
+      userId: 'u',
+      contentType: 'fact'
+    })
+    ;(graph as any).findById = jest.fn().mockReturnValue({
+      id: 'entry-3',
+      content,
+      contentType: 'fact',
+      source: 'technical',
+      userId: 'u',
+      metadata: { fingerprint: fp }
+    })
+    mongo.findById = jest.fn().mockResolvedValue(null)
+    ;(graph as any).update = jest.fn().mockResolvedValue(true)
+    mongo.update = jest.fn().mockResolvedValue(true)
+
+    const tool = makeTool()
+    await tool.update({
+      id: 'entry-3',
+      confidence: 0.95,
+      reason: 'higher confidence after follow-up'
+    })
+
+    const sentToGraph = ((graph as any).update as jest.Mock).mock.calls[0][1]
+    expect(sentToGraph.metadata.fingerprint).toBe(fp)
+  })
+
+  it('update() falls back to MongoDB findById when graph entry not found', async () => {
+    // Procedure-routed entries live in MongoDB only. Update must still be
+    // able to recompute the fingerprint from the MongoDB-side metadata.
+    const content = 'procedure content'
+    ;(graph as any).findById = jest.fn().mockReturnValue(null)
+    mongo.findById = jest.fn().mockResolvedValue({
+      id: 'proc-1',
+      content,
+      contentType: 'procedure',
+      source: 'technical',
+      userId: 'u',
+      metadata: { fingerprint: 'old-stale-fp' }
+    })
+    ;(graph as any).update = jest.fn().mockResolvedValue(false)
+    mongo.update = jest.fn().mockResolvedValue(true)
+
+    const tool = makeTool()
+    const result = await tool.update({
+      id: 'proc-1',
+      content: 'updated procedure body',
+      reason: 'cleaned up step ordering'
+    })
+
+    expect(result.success).toBe(true)
+    const sentToMongo = (mongo.update as jest.Mock).mock.calls[0][1]
+    const expectedFp = computeFingerprint({
+      content: 'updated procedure body',
+      userId: 'u',
+      contentType: 'procedure'
+    })
+    expect(sentToMongo.metadata.fingerprint).toBe(expectedFp)
   })
 })

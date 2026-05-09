@@ -883,17 +883,54 @@ export class UnifiedStoreTool {
             updates.content = args.content;
         if (args.confidence !== undefined)
             updates.confidence = args.confidence;
-        // Fetch existing record so we can merge metadata instead of overwriting it.
-        // This prevents $set from dropping existing metadata keys and prior
-        // update_history entries that the caller did not include in args.metadata.
+        // Fetch existing record so we can:
+        //   1. Merge metadata instead of overwriting it (preserves existing keys
+        //      + prior update_history that the caller didn't include in args).
+        //   2. Recompute the Tier 0 fingerprint (DG-T0) when content or
+        //      metadata.subject changes — userId + contentType come from the
+        //      existing entry (caller can't change them via update()). Without
+        //      this, an updated entry would keep its OLD fingerprint and Tier 0
+        //      would mis-match the next write of the OLD content.
+        //
+        // Prefer the graph's findById since the sidecar holds full content + the
+        // current fingerprint authoritative metadata; fall back to MongoDB for
+        // procedure-routed entries that don't live in the graph.
         let existingMetadata = {};
+        let existingContent;
+        let existingContentType;
+        let existingUserId;
         try {
-            const existing = await this.storage.mongodb.findById(args.id);
-            if (existing?.metadata)
-                existingMetadata = existing.metadata;
+            const graphAny = this.storage.graph;
+            if (typeof graphAny.findById === 'function') {
+                const e = await graphAny.findById(args.id);
+                if (e) {
+                    if (e.metadata)
+                        existingMetadata = e.metadata;
+                    if (typeof e.content === 'string')
+                        existingContent = e.content;
+                    if (typeof e.contentType === 'string')
+                        existingContentType = e.contentType;
+                    if (typeof e.userId === 'string')
+                        existingUserId = e.userId;
+                }
+            }
+            if (existingContent === undefined || existingContentType === undefined || existingUserId === undefined) {
+                const e = await this.storage.mongodb.findById(args.id);
+                if (e) {
+                    if (e.metadata && Object.keys(existingMetadata).length === 0) {
+                        existingMetadata = e.metadata;
+                    }
+                    if (existingContent === undefined && typeof e.content === 'string')
+                        existingContent = e.content;
+                    if (existingContentType === undefined && typeof e.contentType === 'string')
+                        existingContentType = e.contentType;
+                    if (existingUserId === undefined && typeof e.userId === 'string')
+                        existingUserId = e.userId;
+                }
+            }
         }
         catch (e) {
-            console.warn('⚠️  unified_update: could not fetch existing metadata for merge (non-fatal):', e);
+            console.warn('⚠️  unified_update: could not fetch existing entry for merge (non-fatal):', e);
         }
         // Merge: existing metadata base, then caller-supplied overrides, then
         // append the new audit entry to update_history (preserving prior entries).
@@ -904,6 +941,27 @@ export class UnifiedStoreTool {
         if (args.reason) {
             const prior = Array.isArray(mergedMetadata.update_history) ? mergedMetadata.update_history : [];
             mergedMetadata.update_history = [...prior, { at: new Date().toISOString(), reason: args.reason }];
+        }
+        // Recompute Tier 0 fingerprint (DG-T0) when we have enough context to do
+        // it correctly. The fingerprint covers (content, userId, contentType,
+        // subject) — any of those changing means the cached fingerprint is stale
+        // and Tier 0 would mis-route subsequent writes against this entry.
+        //
+        // We unconditionally recompute when we know userId + contentType (cheap;
+        // bytes-of-content + sha256 over a few hundred chars). The new content
+        // is args.content if provided, else the existing content. Same for
+        // metadata.subject (caller override > existing).
+        if (existingUserId !== undefined && existingContentType !== undefined) {
+            const newContent = args.content !== undefined ? args.content : (existingContent ?? '');
+            const newSubject = typeof mergedMetadata.subject === 'string'
+                ? mergedMetadata.subject
+                : undefined;
+            mergedMetadata.fingerprint = computeFingerprint({
+                content: newContent,
+                userId: existingUserId,
+                contentType: existingContentType,
+                subject: newSubject
+            });
         }
         updates.metadata = mergedMetadata;
         const backends = [];
