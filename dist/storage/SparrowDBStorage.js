@@ -46,6 +46,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // ---------------------------------------------------------------------------
 // Load the native .node module
@@ -193,13 +194,11 @@ export class SparrowDBStorage {
         // attached one. This is the inline-MERGE path for HNSW population — see
         // storeEmbedding() for the architectural rationale (SparrowDB 0.1.22's
         // MATCH+SET silently no-ops for vector params; only MERGE/CREATE pattern's
-        // literal property dict triggers idx.insert). The payload uses a
-        // double-underscored key to mark it transient — we strip it before the
-        // sidecar write so it never persists.
-        const META_EMB_KEY = '__pending_embedding';
-        const META_EMB_ID_KEY = '__pending_embedder_id';
-        const inlineEmb = knowledge.metadata?.[META_EMB_KEY];
-        const inlineEmbId = knowledge.metadata?.[META_EMB_ID_KEY];
+        // literal property dict triggers idx.insert). Keys are exported from
+        // ../embedding/EmbeddingService.ts so the producer (UnifiedStoreTool) and
+        // consumer (here) share a single source of truth — see PR #69 review.
+        const inlineEmb = knowledge.metadata?.[PENDING_EMBEDDING_KEY];
+        const inlineEmbId = knowledge.metadata?.[PENDING_EMBEDDER_ID_KEY];
         const hasInlineEmb = inlineEmb !== undefined &&
             inlineEmbId !== undefined &&
             this.vectorIndexAvailable &&
@@ -261,8 +260,8 @@ export class SparrowDBStorage {
         // Strip the transient embedding payload before persisting so it never
         // serializes into the JSON sidecar (would balloon the file by ~6KB/entry).
         const cleanMetadata = { ...(knowledge.metadata ?? {}) };
-        delete cleanMetadata[META_EMB_KEY];
-        delete cleanMetadata[META_EMB_ID_KEY];
+        delete cleanMetadata[PENDING_EMBEDDING_KEY];
+        delete cleanMetadata[PENDING_EMBEDDER_ID_KEY];
         const entry = {
             id: knowledge.id,
             content: knowledge.content,
@@ -663,6 +662,42 @@ export class SparrowDBStorage {
                 out.push(e);
         }
         return out;
+    }
+    /**
+     * Tier 0 fingerprint dedup lookup (DG-T0).
+     *
+     * Returns the first entry whose `metadata.fingerprint === fingerprint` AND
+     * `userId === userId`. Scans the in-memory contentIndex (~1200 entries on
+     * the production corpus → ~0.1 ms typical). Skips flagged entries by
+     * default — the gate should not refuse a write because of a previously
+     * deleted/superseded/retracted match. Pass `includeFlagged: true` for
+     * audit / reaper paths.
+     *
+     * Returns `null` when no match is found (no entry has the fingerprint, or
+     * the only matches are flagged when `includeFlagged` is false).
+     *
+     * Why a linear scan rather than a fingerprint→id index: the contentIndex
+     * is an in-memory Map already holding every entry; scanning is bounded
+     * and the cost is well below the Tier 1 latency floor. A separate index
+     * would be a maintenance burden (load/save sidecar, dedup eviction on
+     * delete/update, etc.) for negligible gain at current corpus size. If
+     * the corpus grows past ~10k entries we can revisit.
+     */
+    findByFingerprint(fingerprint, userId, options) {
+        const includeFlagged = options?.includeFlagged === true;
+        if (!fingerprint || !userId)
+            return null;
+        for (const entry of this.contentIndex.values()) {
+            if (entry.userId !== userId)
+                continue;
+            if (!includeFlagged && entry.flag)
+                continue;
+            const fp = entry.metadata?.fingerprint;
+            if (typeof fp === 'string' && fp === fingerprint) {
+                return entry;
+            }
+        }
+        return null;
     }
     // -------------------------------------------------------------------------
     // StorageSystem.search

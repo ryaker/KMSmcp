@@ -4,6 +4,8 @@
 import crypto from 'crypto';
 import { FACTCache } from '../cache/FACTCache.js';
 import { ContentInference } from '../inference/ContentInference.js';
+import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js';
+import { computeFingerprint } from '../dedup/Fingerprint.js';
 import { logger } from '../logger.js';
 const debug = (...args) => { if (process.env.KMS_DEBUG)
     console.error(...args); };
@@ -148,6 +150,95 @@ export class UnifiedStoreTool {
             confidence: enrichedArgs.confidence || 0.8,
             relationships: enrichedArgs.relationships || []
         };
+        // ---------------------------------------------------------------------
+        // Dedup gate — Tier 0 (DG-T0) fingerprint check (PREPENDS Tier 1)
+        //
+        // Cheap O(n) scan of the in-memory sidecar against a SHA-256 fingerprint
+        // of (normalized_content, userId, contentType, subject ?? ''). Catches:
+        //   - Whitespace-only differences that the embedder may not score above
+        //     the cosine refuse threshold.
+        //   - Repeated submits / batch importer re-runs.
+        //   - Anything identical when the embedder or LLM judge is down.
+        //
+        // Skipped when:
+        //   - options.skip_dedup === true (admin escape hatch; same path the
+        //     DG-T1-C dispatcher uses for action=complement / action=force-new).
+        //   - The graph backend doesn't expose findByFingerprint (older builds).
+        //
+        // The fingerprint is also stamped into knowledge.metadata so subsequent
+        // Tier 0 lookups match against it directly.
+        // ---------------------------------------------------------------------
+        const tier0SubjectFacet = typeof knowledge.metadata?.subject === 'string'
+            ? knowledge.metadata.subject
+            : undefined;
+        const fingerprint = computeFingerprint({
+            content: knowledge.content,
+            userId: knowledge.userId,
+            contentType: knowledge.contentType,
+            subject: tier0SubjectFacet
+        });
+        // Stamp fingerprint into metadata for future Tier 0 hits. We do this
+        // unconditionally (regardless of whether Tier 0 finds a match this call)
+        // so the next write of identical content lands a fingerprint match. Set
+        // BEFORE the Tier 0 check so the in-memory metadata clone propagates
+        // through embedding, routing, and storage fan-out.
+        knowledge.metadata = {
+            ...knowledge.metadata,
+            fingerprint
+        };
+        if (args.options?.skip_dedup !== true &&
+            typeof this.storage.graph.findByFingerprint === 'function') {
+            try {
+                const existing = this.storage.graph.findByFingerprint(fingerprint, knowledge.userId);
+                if (existing && !existing.flag) {
+                    const subject = typeof existing.metadata?.subject === 'string'
+                        ? existing.metadata.subject
+                        : undefined;
+                    const preview = (existing.content ?? '').slice(0, 200);
+                    // Reuse the resolved Tier 1 thresholds for the response echo so the
+                    // caller sees the *same* threshold context across tiers (Tier 0 is
+                    // additive, not a replacement). The thresholds aren't actually used
+                    // to make the Tier 0 decision — fingerprint identity is binary.
+                    const { refuse: refuseThreshold, confirm: confirmThreshold } = resolveDedupThresholds(knowledge.contentType, args.options?.dedup_threshold_override);
+                    const response = {
+                        status: 'dedup_required',
+                        candidates: [{
+                                id: existing.id,
+                                similarity: 1.0,
+                                content_preview: preview,
+                                contentType: existing.contentType ?? knowledge.contentType,
+                                source: existing.source ?? knowledge.source,
+                                subject,
+                                created: existing.timestamp ?? '',
+                                flag: existing.flag ?? null,
+                                // Fingerprint match is a stronger signal than any embedder
+                                // similarity, so we tag 'duplicate' inline without invoking
+                                // the Tier 2 LLM judge.
+                                llm_relation: 'duplicate'
+                            }],
+                        message: `Exact-match duplicate found via Tier 0 fingerprint (sha256). ` +
+                            `Identical normalized content for the same userId+contentType+subject scope. ` +
+                            `Retry with action.`,
+                        retry_with: [
+                            `action=supersede&old_id=${existing.id}&reason=<...>`,
+                            `action=update&old_id=${existing.id}&reason=<...>`,
+                            `action=complement&related_to=${existing.id}`,
+                            `action=force-new&reason=<justification>`
+                        ],
+                        band: 'exact',
+                        thresholds: { refuse: refuseThreshold, confirm: confirmThreshold }
+                    };
+                    debug(`🛑 DEDUP GATE refused write (exact/Tier 0): fingerprint match against id=${existing.id}`);
+                    return response;
+                }
+            }
+            catch (e) {
+                // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
+                // Tier 1 still runs.
+                console.warn(`⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+                    `${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
         // ---------------------------------------------------------------------
         // Pre-store: generate embedding (DG-T1-A)
         //
@@ -412,8 +503,9 @@ export class UnifiedStoreTool {
         // a noisy metadata field. Restored after fan-out so non-graph backends
         // see clean metadata.
         // -----------------------------------------------------------------
-        const META_EMB_KEY = '__pending_embedding';
-        const META_EMB_ID_KEY = '__pending_embedder_id';
+        // Transient handoff keys live in ../embedding/EmbeddingService.ts so the
+        // producer (here) and consumer (SparrowDBStorage.store) share one source
+        // of truth — see PR #69 review feedback.
         // Helper: clone knowledge with the embedding payload spliced into metadata.
         // We use a clone (not in-place mutation) so non-graph backends see clean
         // metadata without needing finally-block scrubbing — and so any later
@@ -423,8 +515,8 @@ export class UnifiedStoreTool {
             ...k,
             metadata: {
                 ...k.metadata,
-                [META_EMB_KEY]: pendingEmbedding,
-                [META_EMB_ID_KEY]: pendingEmbedderId
+                [PENDING_EMBEDDING_KEY]: pendingEmbedding,
+                [PENDING_EMBEDDER_ID_KEY]: pendingEmbedderId
             }
         });
         try {
