@@ -13,6 +13,24 @@
  *     just without an embedding. A backfill job can re-embed later.
  */
 import { logger } from '../logger.js';
+/**
+ * Transient metadata keys for the embedding-handoff pattern (PR #69).
+ *
+ * UnifiedStoreTool clones the knowledge object before the graph fan-out and
+ * splices the freshly-computed vector + embedderId into metadata under these
+ * keys. SparrowDBStorage.store() plucks them off and feeds them into a single
+ * MERGE-with-all-props-inline executeWithParams call — the only Cypher
+ * pattern SparrowDB 0.1.22 honours for HNSW population (see channel msg #202
+ * for the SET-silent-failure repro).
+ *
+ * Both the producer (UnifiedStoreTool) and consumer (SparrowDBStorage) MUST
+ * import these — duplicating the literal strings would silently break the
+ * handoff if one side renamed and the other didn't. The double-underscore
+ * prefix marks them internal/transient; SparrowDBStorage strips them before
+ * the sidecar JSON write so they never persist.
+ */
+export const PENDING_EMBEDDING_KEY = '__pending_embedding';
+export const PENDING_EMBEDDER_ID_KEY = '__pending_embedder_id';
 // ---------------------------------------------------------------------------
 const DEFAULT_BASE_URL = 'http://localhost:11434';
 const DEFAULT_MODEL = 'nomic-embed-text';

@@ -17,7 +17,8 @@ import {
   PENDING_EMBEDDER_ID_KEY
 } from '../embedding/EmbeddingService.js'
 import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js'
-import { logger } from '../logger.js' 
+import { computeFingerprint } from '../dedup/Fingerprint.js'
+import { logger } from '../logger.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -97,8 +98,17 @@ export interface DedupRequiredResponse {
   candidates: DedupCandidate[]
   message: string
   retry_with: string[]
-  /** Threshold band for the highest-similarity candidate ('refuse' | 'confirm'). */
-  band: 'refuse' | 'confirm'
+  /**
+   * Threshold band for the highest-similarity candidate.
+   *  - 'exact'   — Tier 0 fingerprint match (DG-T0). Identical normalized
+   *    content for the same userId / contentType / subject scope. similarity
+   *    is reported as 1.0 and llm_relation is 'duplicate' inline (no LLM
+   *    call — the fingerprint is a stronger signal than any embedder).
+   *  - 'refuse'  — Tier 1 cosine similarity ≥ refuseThreshold (default 0.88,
+   *    or per-contentType override).
+   *  - 'confirm' — Tier 1 cosine similarity ∈ [confirmThreshold, refuseThreshold).
+   */
+  band: 'exact' | 'refuse' | 'confirm'
   /** Echo of the thresholds applied to this call (for caller diagnostics). */
   thresholds: { refuse: number; confirm: number }
 }
@@ -335,6 +345,116 @@ export class UnifiedStoreTool {
       timestamp: new Date(),
       confidence: enrichedArgs.confidence || 0.8,
       relationships: enrichedArgs.relationships || []
+    }
+
+    // ---------------------------------------------------------------------
+    // Dedup gate — Tier 0 (DG-T0) fingerprint check (PREPENDS Tier 1)
+    //
+    // Cheap O(n) scan of the in-memory sidecar against a SHA-256 fingerprint
+    // of (normalized_content, userId, contentType, subject ?? ''). Catches:
+    //   - Whitespace-only differences that the embedder may not score above
+    //     the cosine refuse threshold.
+    //   - Repeated submits / batch importer re-runs.
+    //   - Anything identical when the embedder or LLM judge is down.
+    //
+    // Skipped when:
+    //   - options.skip_dedup === true (admin escape hatch; same path the
+    //     DG-T1-C dispatcher uses for action=complement / action=force-new).
+    //   - The graph backend doesn't expose findByFingerprint (older builds).
+    //
+    // The fingerprint is also stamped into knowledge.metadata so subsequent
+    // Tier 0 lookups match against it directly.
+    // ---------------------------------------------------------------------
+    const tier0SubjectFacet = typeof knowledge.metadata?.subject === 'string'
+      ? (knowledge.metadata.subject as string)
+      : undefined
+
+    const fingerprint = computeFingerprint({
+      content: knowledge.content,
+      userId: knowledge.userId,
+      contentType: knowledge.contentType,
+      subject: tier0SubjectFacet
+    })
+
+    // Stamp fingerprint into metadata for future Tier 0 hits. We do this
+    // unconditionally (regardless of whether Tier 0 finds a match this call)
+    // so the next write of identical content lands a fingerprint match. Set
+    // BEFORE the Tier 0 check so the in-memory metadata clone propagates
+    // through embedding, routing, and storage fan-out.
+    knowledge.metadata = {
+      ...knowledge.metadata,
+      fingerprint
+    }
+
+    if (
+      args.options?.skip_dedup !== true &&
+      typeof this.storage.graph.findByFingerprint === 'function'
+    ) {
+      try {
+        const existing = this.storage.graph.findByFingerprint(
+          fingerprint,
+          knowledge.userId
+        )
+
+        if (existing && !existing.flag) {
+          const subject = typeof existing.metadata?.subject === 'string'
+            ? (existing.metadata.subject as string)
+            : undefined
+          const preview = (existing.content ?? '').slice(0, 200)
+
+          // Reuse the resolved Tier 1 thresholds for the response echo so the
+          // caller sees the *same* threshold context across tiers (Tier 0 is
+          // additive, not a replacement). The thresholds aren't actually used
+          // to make the Tier 0 decision — fingerprint identity is binary.
+          const { refuse: refuseThreshold, confirm: confirmThreshold } = resolveDedupThresholds(
+            knowledge.contentType,
+            args.options?.dedup_threshold_override
+          )
+
+          const response: DedupRequiredResponse = {
+            status: 'dedup_required',
+            candidates: [{
+              id: existing.id,
+              similarity: 1.0,
+              content_preview: preview,
+              contentType: existing.contentType ?? knowledge.contentType,
+              source: existing.source ?? knowledge.source,
+              subject,
+              created: existing.timestamp ?? '',
+              flag: existing.flag ?? null,
+              // Fingerprint match is a stronger signal than any embedder
+              // similarity, so we tag 'duplicate' inline without invoking
+              // the Tier 2 LLM judge.
+              llm_relation: 'duplicate'
+            }],
+            message:
+              `Exact-match duplicate found via Tier 0 fingerprint (sha256). ` +
+              `Identical normalized content for the same userId+contentType+subject scope. ` +
+              `Retry with action.`,
+            retry_with: [
+              `action=supersede&old_id=${existing.id}&reason=<...>`,
+              `action=update&old_id=${existing.id}&reason=<...>`,
+              `action=complement&related_to=${existing.id}`,
+              `action=force-new&reason=<justification>`
+            ],
+            band: 'exact',
+            thresholds: { refuse: refuseThreshold, confirm: confirmThreshold }
+          }
+          debug(
+            `🛑 DEDUP GATE refused write (exact/Tier 0): fingerprint match against id=${existing.id}`
+          )
+          return response
+        }
+      } catch (e) {
+        // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
+        // Tier 1 still runs. Use the project logger for consistency with the
+        // rest of the dedup-gate code path (Tier 1 / Tier 2 also log via
+        // logger.warn — see the findSimilar guard below).
+        logger.warn(
+          `⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+          `${e instanceof Error ? e.message : String(e)}`
+        )
+      }
     }
 
     // ---------------------------------------------------------------------
@@ -1105,19 +1225,48 @@ export class UnifiedStoreTool {
     if (args.content !== undefined) updates.content = args.content
     if (args.confidence !== undefined) updates.confidence = args.confidence
 
-    // Fetch existing record so we can merge metadata instead of overwriting it.
-    // This prevents $set from dropping existing metadata keys and prior
-    // update_history entries that the caller did not include in args.metadata.
-    // Also surfaces the existing userId so Mem0 propagation can scope its
-    // search to the right user when the caller didn't supply args.userId.
+    // Fetch existing record so we can:
+    //   1. Merge metadata instead of overwriting it (preserves existing keys
+    //      + prior update_history that the caller didn't include in args).
+    //   2. Recompute the Tier 0 fingerprint (DG-T0) when content or
+    //      metadata.subject changes — userId + contentType come from the
+    //      existing entry (caller can't change them via update()). Without
+    //      this, an updated entry would keep its OLD fingerprint and Tier 0
+    //      would mis-match the next write of the OLD content.
+    //   3. Surface existingUserId so Mem0 propagation (PR #79) can scope its
+    //      search to the right user when the caller didn't supply args.userId.
+    //
+    // Prefer the graph's findById since the sidecar holds full content + the
+    // current fingerprint authoritative metadata; fall back to MongoDB for
+    // procedure-routed entries that don't live in the graph.
     let existingMetadata: Record<string, any> = {}
+    let existingContent: string | undefined
+    let existingContentType: string | undefined
     let existingUserId: string | undefined
     try {
-      const existing = await this.storage.mongodb.findById(args.id)
-      if (existing?.metadata) existingMetadata = existing.metadata as Record<string, any>
-      if (existing?.userId) existingUserId = existing.userId
+      const graphAny = this.storage.graph as any
+      if (typeof graphAny.findById === 'function') {
+        const e = await graphAny.findById(args.id)
+        if (e) {
+          if (e.metadata) existingMetadata = e.metadata as Record<string, any>
+          if (typeof e.content === 'string') existingContent = e.content
+          if (typeof e.contentType === 'string') existingContentType = e.contentType
+          if (typeof e.userId === 'string') existingUserId = e.userId
+        }
+      }
+      if (existingContent === undefined || existingContentType === undefined || existingUserId === undefined) {
+        const e = await this.storage.mongodb.findById(args.id)
+        if (e) {
+          if (e.metadata && Object.keys(existingMetadata).length === 0) {
+            existingMetadata = e.metadata as Record<string, any>
+          }
+          if (existingContent === undefined && typeof e.content === 'string') existingContent = e.content
+          if (existingContentType === undefined && typeof e.contentType === 'string') existingContentType = e.contentType
+          if (existingUserId === undefined && typeof e.userId === 'string') existingUserId = e.userId
+        }
+      }
     } catch (e) {
-      console.warn('⚠️  unified_update: could not fetch existing metadata for merge (non-fatal):', e)
+      console.warn('⚠️  unified_update: could not fetch existing entry for merge (non-fatal):', e)
     }
 
     // Merge: existing metadata base, then caller-supplied overrides, then
@@ -1130,6 +1279,29 @@ export class UnifiedStoreTool {
       const prior = Array.isArray(mergedMetadata.update_history) ? mergedMetadata.update_history : []
       mergedMetadata.update_history = [...prior, { at: new Date().toISOString(), reason: args.reason }]
     }
+
+    // Recompute Tier 0 fingerprint (DG-T0) when we have enough context to do
+    // it correctly. The fingerprint covers (content, userId, contentType,
+    // subject) — any of those changing means the cached fingerprint is stale
+    // and Tier 0 would mis-route subsequent writes against this entry.
+    //
+    // We unconditionally recompute when we know userId + contentType (cheap;
+    // bytes-of-content + sha256 over a few hundred chars). The new content
+    // is args.content if provided, else the existing content. Same for
+    // metadata.subject (caller override > existing).
+    if (existingUserId !== undefined && existingContentType !== undefined) {
+      const newContent = args.content !== undefined ? args.content : (existingContent ?? '')
+      const newSubject = typeof mergedMetadata.subject === 'string'
+        ? (mergedMetadata.subject as string)
+        : undefined
+      mergedMetadata.fingerprint = computeFingerprint({
+        content: newContent,
+        userId: existingUserId,
+        contentType: existingContentType,
+        subject: newSubject
+      })
+    }
+
     updates.metadata = mergedMetadata
 
     const backends: string[] = []

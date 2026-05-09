@@ -4,6 +4,8 @@
 import crypto from 'crypto';
 import { FACTCache } from '../cache/FACTCache.js';
 import { ContentInference } from '../inference/ContentInference.js';
+import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js';
+import { computeFingerprint } from '../dedup/Fingerprint.js';
 import { logger } from '../logger.js';
 const debug = (...args) => { if (process.env.KMS_DEBUG)
     console.error(...args); };
@@ -148,6 +150,97 @@ export class UnifiedStoreTool {
             confidence: enrichedArgs.confidence || 0.8,
             relationships: enrichedArgs.relationships || []
         };
+        // ---------------------------------------------------------------------
+        // Dedup gate — Tier 0 (DG-T0) fingerprint check (PREPENDS Tier 1)
+        //
+        // Cheap O(n) scan of the in-memory sidecar against a SHA-256 fingerprint
+        // of (normalized_content, userId, contentType, subject ?? ''). Catches:
+        //   - Whitespace-only differences that the embedder may not score above
+        //     the cosine refuse threshold.
+        //   - Repeated submits / batch importer re-runs.
+        //   - Anything identical when the embedder or LLM judge is down.
+        //
+        // Skipped when:
+        //   - options.skip_dedup === true (admin escape hatch; same path the
+        //     DG-T1-C dispatcher uses for action=complement / action=force-new).
+        //   - The graph backend doesn't expose findByFingerprint (older builds).
+        //
+        // The fingerprint is also stamped into knowledge.metadata so subsequent
+        // Tier 0 lookups match against it directly.
+        // ---------------------------------------------------------------------
+        const tier0SubjectFacet = typeof knowledge.metadata?.subject === 'string'
+            ? knowledge.metadata.subject
+            : undefined;
+        const fingerprint = computeFingerprint({
+            content: knowledge.content,
+            userId: knowledge.userId,
+            contentType: knowledge.contentType,
+            subject: tier0SubjectFacet
+        });
+        // Stamp fingerprint into metadata for future Tier 0 hits. We do this
+        // unconditionally (regardless of whether Tier 0 finds a match this call)
+        // so the next write of identical content lands a fingerprint match. Set
+        // BEFORE the Tier 0 check so the in-memory metadata clone propagates
+        // through embedding, routing, and storage fan-out.
+        knowledge.metadata = {
+            ...knowledge.metadata,
+            fingerprint
+        };
+        if (args.options?.skip_dedup !== true &&
+            typeof this.storage.graph.findByFingerprint === 'function') {
+            try {
+                const existing = this.storage.graph.findByFingerprint(fingerprint, knowledge.userId);
+                if (existing && !existing.flag) {
+                    const subject = typeof existing.metadata?.subject === 'string'
+                        ? existing.metadata.subject
+                        : undefined;
+                    const preview = (existing.content ?? '').slice(0, 200);
+                    // Reuse the resolved Tier 1 thresholds for the response echo so the
+                    // caller sees the *same* threshold context across tiers (Tier 0 is
+                    // additive, not a replacement). The thresholds aren't actually used
+                    // to make the Tier 0 decision — fingerprint identity is binary.
+                    const { refuse: refuseThreshold, confirm: confirmThreshold } = resolveDedupThresholds(knowledge.contentType, args.options?.dedup_threshold_override);
+                    const response = {
+                        status: 'dedup_required',
+                        candidates: [{
+                                id: existing.id,
+                                similarity: 1.0,
+                                content_preview: preview,
+                                contentType: existing.contentType ?? knowledge.contentType,
+                                source: existing.source ?? knowledge.source,
+                                subject,
+                                created: existing.timestamp ?? '',
+                                flag: existing.flag ?? null,
+                                // Fingerprint match is a stronger signal than any embedder
+                                // similarity, so we tag 'duplicate' inline without invoking
+                                // the Tier 2 LLM judge.
+                                llm_relation: 'duplicate'
+                            }],
+                        message: `Exact-match duplicate found via Tier 0 fingerprint (sha256). ` +
+                            `Identical normalized content for the same userId+contentType+subject scope. ` +
+                            `Retry with action.`,
+                        retry_with: [
+                            `action=supersede&old_id=${existing.id}&reason=<...>`,
+                            `action=update&old_id=${existing.id}&reason=<...>`,
+                            `action=complement&related_to=${existing.id}`,
+                            `action=force-new&reason=<justification>`
+                        ],
+                        band: 'exact',
+                        thresholds: { refuse: refuseThreshold, confirm: confirmThreshold }
+                    };
+                    debug(`🛑 DEDUP GATE refused write (exact/Tier 0): fingerprint match against id=${existing.id}`);
+                    return response;
+                }
+            }
+            catch (e) {
+                // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
+                // Tier 1 still runs. Use the project logger for consistency with the
+                // rest of the dedup-gate code path (Tier 1 / Tier 2 also log via
+                // logger.warn — see the findSimilar guard below).
+                logger.warn(`⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+                    `${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
         // ---------------------------------------------------------------------
         // Pre-store: generate embedding (DG-T1-A)
         //
@@ -412,8 +505,9 @@ export class UnifiedStoreTool {
         // a noisy metadata field. Restored after fan-out so non-graph backends
         // see clean metadata.
         // -----------------------------------------------------------------
-        const META_EMB_KEY = '__pending_embedding';
-        const META_EMB_ID_KEY = '__pending_embedder_id';
+        // Transient handoff keys live in ../embedding/EmbeddingService.ts so the
+        // producer (here) and consumer (SparrowDBStorage.store) share one source
+        // of truth — see PR #69 review feedback.
         // Helper: clone knowledge with the embedding payload spliced into metadata.
         // We use a clone (not in-place mutation) so non-graph backends see clean
         // metadata without needing finally-block scrubbing — and so any later
@@ -423,8 +517,8 @@ export class UnifiedStoreTool {
             ...k,
             metadata: {
                 ...k.metadata,
-                [META_EMB_KEY]: pendingEmbedding,
-                [META_EMB_ID_KEY]: pendingEmbedderId
+                [PENDING_EMBEDDING_KEY]: pendingEmbedding,
+                [PENDING_EMBEDDER_ID_KEY]: pendingEmbedderId
             }
         });
         try {
@@ -590,7 +684,8 @@ export class UnifiedStoreTool {
                     content: args.content,
                     metadata: args.metadata,
                     confidence: args.confidence,
-                    reason: args.reason
+                    reason: args.reason,
+                    userId: args.userId
                 });
                 return {
                     status: 'updated',
@@ -782,8 +877,12 @@ export class UnifiedStoreTool {
      * Use update for genuine edits (typo fix, metadata correction, confidence
      * adjustment).
      *
-     * Calls SparrowDB and MongoDB. Mem0 is skipped — its memories are LLM-managed
-     * and re-extracted on next store, so direct edits don't make sense.
+     * Calls SparrowDB, MongoDB, and Mem0 (best-effort). Mem0 propagation looks
+     * the entry up by kms_id metadata and rewrites its text via Mem0's update
+     * endpoint; if the entry was never routed to Mem0 it's a no-op (probe-and-
+     * skip, same pattern as kms_supersede in PR #65). Without Mem0 propagation,
+     * Mem0's LLM-extracted memories drift from corrected truth and leak stale
+     * content into search + the kms-context-fetch hook.
      */
     async update(args) {
         const updates = {};
@@ -791,17 +890,56 @@ export class UnifiedStoreTool {
             updates.content = args.content;
         if (args.confidence !== undefined)
             updates.confidence = args.confidence;
-        // Fetch existing record so we can merge metadata instead of overwriting it.
-        // This prevents $set from dropping existing metadata keys and prior
-        // update_history entries that the caller did not include in args.metadata.
+        // Fetch existing record so we can:
+        //   1. Merge metadata instead of overwriting it (preserves existing keys
+        //      + prior update_history that the caller didn't include in args).
+        //   2. Recompute the Tier 0 fingerprint (DG-T0) when content or
+        //      metadata.subject changes — userId + contentType come from the
+        //      existing entry (caller can't change them via update()). Without
+        //      this, an updated entry would keep its OLD fingerprint and Tier 0
+        //      would mis-match the next write of the OLD content.
+        //   3. Surface existingUserId so Mem0 propagation (PR #79) can scope its
+        //      search to the right user when the caller didn't supply args.userId.
+        //
+        // Prefer the graph's findById since the sidecar holds full content + the
+        // current fingerprint authoritative metadata; fall back to MongoDB for
+        // procedure-routed entries that don't live in the graph.
         let existingMetadata = {};
+        let existingContent;
+        let existingContentType;
+        let existingUserId;
         try {
-            const existing = await this.storage.mongodb.findById(args.id);
-            if (existing?.metadata)
-                existingMetadata = existing.metadata;
+            const graphAny = this.storage.graph;
+            if (typeof graphAny.findById === 'function') {
+                const e = await graphAny.findById(args.id);
+                if (e) {
+                    if (e.metadata)
+                        existingMetadata = e.metadata;
+                    if (typeof e.content === 'string')
+                        existingContent = e.content;
+                    if (typeof e.contentType === 'string')
+                        existingContentType = e.contentType;
+                    if (typeof e.userId === 'string')
+                        existingUserId = e.userId;
+                }
+            }
+            if (existingContent === undefined || existingContentType === undefined || existingUserId === undefined) {
+                const e = await this.storage.mongodb.findById(args.id);
+                if (e) {
+                    if (e.metadata && Object.keys(existingMetadata).length === 0) {
+                        existingMetadata = e.metadata;
+                    }
+                    if (existingContent === undefined && typeof e.content === 'string')
+                        existingContent = e.content;
+                    if (existingContentType === undefined && typeof e.contentType === 'string')
+                        existingContentType = e.contentType;
+                    if (existingUserId === undefined && typeof e.userId === 'string')
+                        existingUserId = e.userId;
+                }
+            }
         }
         catch (e) {
-            console.warn('⚠️  unified_update: could not fetch existing metadata for merge (non-fatal):', e);
+            console.warn('⚠️  unified_update: could not fetch existing entry for merge (non-fatal):', e);
         }
         // Merge: existing metadata base, then caller-supplied overrides, then
         // append the new audit entry to update_history (preserving prior entries).
@@ -812,6 +950,27 @@ export class UnifiedStoreTool {
         if (args.reason) {
             const prior = Array.isArray(mergedMetadata.update_history) ? mergedMetadata.update_history : [];
             mergedMetadata.update_history = [...prior, { at: new Date().toISOString(), reason: args.reason }];
+        }
+        // Recompute Tier 0 fingerprint (DG-T0) when we have enough context to do
+        // it correctly. The fingerprint covers (content, userId, contentType,
+        // subject) — any of those changing means the cached fingerprint is stale
+        // and Tier 0 would mis-route subsequent writes against this entry.
+        //
+        // We unconditionally recompute when we know userId + contentType (cheap;
+        // bytes-of-content + sha256 over a few hundred chars). The new content
+        // is args.content if provided, else the existing content. Same for
+        // metadata.subject (caller override > existing).
+        if (existingUserId !== undefined && existingContentType !== undefined) {
+            const newContent = args.content !== undefined ? args.content : (existingContent ?? '');
+            const newSubject = typeof mergedMetadata.subject === 'string'
+                ? mergedMetadata.subject
+                : undefined;
+            mergedMetadata.fingerprint = computeFingerprint({
+                content: newContent,
+                userId: existingUserId,
+                contentType: existingContentType,
+                subject: newSubject
+            });
         }
         updates.metadata = mergedMetadata;
         const backends = [];
@@ -832,6 +991,16 @@ export class UnifiedStoreTool {
         }
         catch (e) {
             console.warn('⚠️  unified_update MongoDB error:', e);
+        }
+        // Mem0 propagation (best-effort). Mem0 indexes by its own internal id,
+        // not the KMS id; Mem0Storage.update looks the mem0_id up via search
+        // filtered by metadata.kms_id and skips silently if the entry was never
+        // routed to Mem0 (probe-and-skip). Without this, Mem0's corpus drifts
+        // from corrected truth and stale content leaks into context injection.
+        if (typeof this.storage.mem0.update === 'function') {
+            const ok = await this.storage.mem0.update(args.id, args.content, args.metadata, args.userId ?? existingUserId);
+            if (ok)
+                backends.push('mem0');
         }
         // Invalidate cache after any successful backend update so stale search
         // results and knowledge cache entries don't serve pre-update content.

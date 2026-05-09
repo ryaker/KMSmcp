@@ -48,6 +48,7 @@ import { homedir } from 'os'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js'
+import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -878,6 +879,110 @@ export class SparrowDBStorage implements StorageSystem {
       if (e.flag) out.push(e)
     }
     return out
+  }
+
+  /**
+   * Tier 0 fingerprint dedup lookup (DG-T0).
+   *
+   * Returns the first entry whose `metadata.fingerprint === fingerprint` AND
+   * `userId === userId`. Scans the in-memory contentIndex (~1200 entries on
+   * the production corpus → ~0.1 ms typical). Skips flagged entries by
+   * default — the gate should not refuse a write because of a previously
+   * deleted/superseded/retracted match. Pass `includeFlagged: true` for
+   * audit / reaper paths.
+   *
+   * Returns `null` when no match is found (no entry has the fingerprint, or
+   * the only matches are flagged when `includeFlagged` is false).
+   *
+   * Backfill of pre-rollout entries: entries written before DG-T0 was wired
+   * have no `metadata.fingerprint`. On the first lookup we lazily compute
+   * + stamp fingerprints for those entries (one-shot opportunistic backfill,
+   * gated by `_fingerprintBackfillDone`) so Tier 0 starts catching them
+   * without requiring a separate migration script. The backfill scans the
+   * full corpus once (~1200 entries; a few ms); subsequent calls are pure
+   * O(n) lookups. The stamps are written to the in-memory contentIndex
+   * only — flushed on the next organic _saveSidecar() call (delete /
+   * update / flag / store) so we don't pay a sidecar I/O cost on every
+   * Tier 0 lookup.
+   *
+   * Why a linear scan rather than a fingerprint→id index: the contentIndex
+   * is an in-memory Map already holding every entry; scanning is bounded
+   * and the cost is well below the Tier 1 latency floor. A separate index
+   * would be a maintenance burden (load/save sidecar, dedup eviction on
+   * delete/update, etc.) for negligible gain at current corpus size. If
+   * the corpus grows past ~10k entries we can revisit.
+   */
+  findByFingerprint(
+    fingerprint: string,
+    userId: string,
+    options?: { includeFlagged?: boolean }
+  ): ContentEntry | null {
+    const includeFlagged = options?.includeFlagged === true
+    if (!fingerprint || !userId) return null
+
+    // One-shot backfill of pre-rollout entries that have no
+    // metadata.fingerprint. Idempotent: subsequent calls are a no-op.
+    this._backfillFingerprintsOnce()
+
+    for (const entry of this.contentIndex.values()) {
+      if (entry.userId !== userId) continue
+      if (!includeFlagged && entry.flag) continue
+      const fp = entry.metadata?.fingerprint
+      if (typeof fp === 'string' && fp === fingerprint) {
+        return entry
+      }
+    }
+    return null
+  }
+
+  /**
+   * Tracks whether the lazy fingerprint backfill has run for this process.
+   * Set true after the first findByFingerprint call to avoid re-scanning on
+   * every subsequent lookup. Reset only on a fresh process start (no
+   * persistence — the stamped fingerprints flush to the sidecar through
+   * organic save calls, so they survive restarts naturally).
+   */
+  private _fingerprintBackfillDone = false
+
+  /**
+   * Compute + stamp `metadata.fingerprint` on every contentIndex entry that
+   * doesn't have one. Runs once per process. The fingerprint is computed
+   * over (content, userId, contentType, metadata.subject ?? '') to match
+   * the contract in src/dedup/Fingerprint.ts — UnifiedStoreTool.store()
+   * uses the same tuple for new writes.
+   *
+   * Errors during compute are non-fatal — a single bad entry won't crash
+   * the backfill. The corresponding entry just stays without a fingerprint
+   * and will retry on the next process restart.
+   */
+  private _backfillFingerprintsOnce(): void {
+    if (this._fingerprintBackfillDone) return
+    this._fingerprintBackfillDone = true
+
+    let stamped = 0
+    for (const entry of this.contentIndex.values()) {
+      const meta = entry.metadata ?? {}
+      if (typeof meta.fingerprint === 'string' && meta.fingerprint.length > 0) continue
+      try {
+        const subject = typeof meta.subject === 'string' ? (meta.subject as string) : undefined
+        const fp = computeFingerprint({
+          content: entry.content,
+          userId: entry.userId,
+          contentType: entry.contentType,
+          subject
+        })
+        entry.metadata = { ...meta, fingerprint: fp }
+        stamped++
+      } catch (e) {
+        logger.debug(
+          `findByFingerprint backfill: skipped ${entry.id} ` +
+          `(${e instanceof Error ? e.message : String(e)})`
+        )
+      }
+    }
+    if (stamped > 0) {
+      logger.debug(`✅ Tier 0 fingerprint backfill: stamped ${stamped} pre-rollout entries`)
+    }
   }
 
   // -------------------------------------------------------------------------
