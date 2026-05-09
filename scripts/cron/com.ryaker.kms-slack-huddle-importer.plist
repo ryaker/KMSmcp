@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ryaker.kms-slack-huddle-importer</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ryaker/Dev/KMSmcp/scripts/cron/run-importer.sh</string>
+        <string>slack-huddles</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ryaker/Dev/KMSmcp</string>
+
+    <!-- Fire every 15 min while loaded. Don't fire at boot — wait for the
+         user session and the first scheduled tick (mirrors the existing
+         com.ryaker.neo4j-keepalive pattern). -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Avoid runaway concurrent invocations; the runner has its own PID-file
+         guard, but ThrottleInterval gives launchd a backstop. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/ryaker</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <!-- Tell the runner to wrap with `doppler run` for OAuth / Anthropic /
+             Slack secrets. The runner skips Doppler if KMS_BEARER_TOKEN is set. -->
+        <key>KMS_DOPPLER_PROJECT</key>
+        <string>ry-local</string>
+        <key>KMS_DOPPLER_CONFIG</key>
+        <string>dev_personal</string>
+    </dict>
+
+    <!-- Runner already routes its own per-importer log under
+         ~/Library/Logs/kms-cron/slack-huddles.log. These paths capture only
+         the small wrapper-level launchd noise (process start/exit). -->
+    <key>StandardOutPath</key>
+    <string>/Users/ryaker/Library/Logs/kms-cron/slack-huddles.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ryaker/Library/Logs/kms-cron/slack-huddles.launchd.log</string>
+</dict>
+</plist>
