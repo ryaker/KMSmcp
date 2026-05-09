@@ -146,8 +146,10 @@ describe('UnifiedStoreTool — corrective operations', () => {
       expect(mem0.update).toHaveBeenCalledWith('abc-123', 'corrected', undefined, 'override-user')
     })
 
-    it('does not fail kms_update when Mem0 propagation throws', async () => {
-      mem0.update = jest.fn().mockRejectedValue(new Error('Mem0 unreachable'))
+    it('does not fail kms_update when Mem0 propagation returns false (unreachable / probe-and-skip)', async () => {
+      // Mem0Storage.update() never throws — it returns false for any failure.
+      // This test verifies that a false return (the real contract) is non-fatal.
+      mem0.update = jest.fn().mockResolvedValue(false)
       const result = await tool.update({ id: 'abc-123', content: 'x', reason: 'test' })
       // Mongo + SparrowDB should still have updated successfully.
       expect(result.success).toBe(true)

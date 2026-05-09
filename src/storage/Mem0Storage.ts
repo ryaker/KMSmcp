@@ -24,6 +24,7 @@
 
 import { MemoryClient, Memory } from 'mem0ai'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
+import { logger } from '../logger.js'
 
 export class Mem0Storage implements StorageSystem {
   public name = 'mem0'
@@ -305,7 +306,7 @@ export class Mem0Storage implements StorageSystem {
     // metadata-only or confidence-only kms_update has no Mem0 equivalent
     // (Mem0 re-extracts metadata from content; there's no direct setter).
     if (content === undefined || content === null || content === '') {
-      console.log(`🧠 [Mem0Storage.update] No content provided for ${id} — skipping Mem0 propagation (Mem0 update requires text)`)
+      logger.debug(`[Mem0Storage.update] No content provided for ${id} — skipping Mem0 propagation (Mem0 update requires text)`)
       return false
     }
 
@@ -338,31 +339,31 @@ export class Mem0Storage implements StorageSystem {
         if (matches.length === 0) {
           // Probe-and-skip — entry may never have been routed to Mem0
           // (routing is content-type dependent). Same pattern as PR #65.
-          console.log(`🧠 [Mem0Storage.update] kms_id=${id} not found in Mem0 for user=${resolvedUserId} — skipping (probe-and-skip)`)
+          logger.debug(`[Mem0Storage.update] kms_id=${id} not found in Mem0 for user=${resolvedUserId} — skipping (probe-and-skip)`)
           return false
         }
 
         if (matches.length > 1) {
-          console.warn(`⚠️ [Mem0Storage.update] kms_id=${id} returned ${matches.length} Mem0 matches — using first. This usually means a duplicate kms_id was written to Mem0; investigate.`)
+          logger.warn(`[Mem0Storage.update] kms_id=${id} returned ${matches.length} Mem0 matches — using first. This usually means a duplicate kms_id was written to Mem0; investigate.`)
         }
 
         mem0Id = matches[0].id
         if (!mem0Id) {
-          console.warn(`⚠️ [Mem0Storage.update] Mem0 search match for kms_id=${id} has no id field — skipping`)
+          logger.warn(`[Mem0Storage.update] Mem0 search match for kms_id=${id} has no id field — skipping`)
           return false
         }
       } catch (searchError) {
         // Search failure is non-fatal — log and skip. We don't want a
         // transient Mem0 search error to fail the whole kms_update.
-        console.warn(`⚠️ [Mem0Storage.update] Mem0 search failed while looking up kms_id=${id}:`, searchError)
+        logger.warn(`[Mem0Storage.update] Mem0 search failed while looking up kms_id=${id}:`, searchError)
         return false
       }
 
       // Step 3: call Mem0 update with the resolved internal id.
       try {
-        console.log(`🧠 [Mem0Storage.update] Updating Mem0 entry mem0Id=${mem0Id} for kms_id=${id}`)
+        logger.debug(`[Mem0Storage.update] Updating Mem0 entry mem0Id=${mem0Id} for kms_id=${id}`)
         await this.client.update(mem0Id, content)
-        console.log(`✅ [Mem0Storage.update] Successfully propagated kms_update to Mem0 (kms_id=${id}, mem0Id=${mem0Id})`)
+        logger.debug(`[Mem0Storage.update] Successfully propagated kms_update to Mem0 (kms_id=${id}, mem0Id=${mem0Id})`)
         return true
       } catch (updateError) {
         // 404 = entry was deleted between our search and update (rare
@@ -370,19 +371,18 @@ export class Mem0Storage implements StorageSystem {
         // and we don't want to fail the kms_update for a vanished entry.
         const errMsg = updateError instanceof Error ? updateError.message : String(updateError)
         if (/\b404\b|not found|does not exist/i.test(errMsg)) {
-          console.log(`🧠 [Mem0Storage.update] Mem0 entry mem0Id=${mem0Id} returned 404 on update — skipping (probe-and-skip)`)
+          logger.debug(`[Mem0Storage.update] Mem0 entry mem0Id=${mem0Id} returned 404 on update — skipping (probe-and-skip)`)
           return false
         }
-        // Other errors are unexpected and should bubble up so the unified
-        // layer can log them.
-        console.error(`❌ [Mem0Storage.update] Unexpected Mem0 update error for kms_id=${id}:`, updateError)
+        // Other unexpected errors are swallowed by the outer catch below —
+        // re-throw here so the outer handler can log them and return false.
         throw updateError
       }
     } catch (error) {
       // Outer catch for anything that escaped — keep the same defensive
       // shape as the rest of this class so a Mem0 hiccup never tears down
       // a kms_update call.
-      console.error(`❌ [Mem0Storage.update] Failed to propagate kms_update to Mem0 for kms_id=${id}:`, error)
+      logger.warn(`[Mem0Storage.update] Failed to propagate kms_update to Mem0 for kms_id=${id}:`, error)
       return false
     }
   }

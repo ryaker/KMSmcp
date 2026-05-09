@@ -1156,19 +1156,13 @@ export class UnifiedStoreTool {
     // routed to Mem0 (probe-and-skip). Without this, Mem0's corpus drifts
     // from corrected truth and stale content leaks into context injection.
     if (typeof (this.storage.mem0 as any).update === 'function') {
-      try {
-        const ok = await (this.storage.mem0 as any).update(
-          args.id,
-          args.content,
-          args.metadata,
-          args.userId ?? existingUserId
-        )
-        if (ok) backends.push('mem0')
-      } catch (e) {
-        // Non-fatal — kms_update already mutated Mongo + SparrowDB. A Mem0
-        // propagation failure shouldn't tear down the whole call.
-        console.warn('⚠️  unified_update Mem0 error (non-fatal):', e)
-      }
+      const ok = await (this.storage.mem0 as any).update(
+        args.id,
+        args.content,
+        args.metadata,
+        args.userId ?? existingUserId
+      )
+      if (ok) backends.push('mem0')
     }
 
     // Invalidate cache after any successful backend update so stale search
