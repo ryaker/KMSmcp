@@ -290,9 +290,10 @@ export class Mem0Storage implements StorageSystem {
    * kms_id we wrote at store() time persists.
    *
    * Return value mirrors the boolean shape of MongoStorage.update /
-   * SparrowDBStorage.update: true on successful propagation, false on
-   * skip-or-soft-fail. Throws are reserved for unexpected SDK errors that
-   * are NOT 404 / not-found cases.
+   * SparrowDBStorage.update: true on successful propagation, false on any
+   * skip / soft-fail / unexpected error. We never throw — Mem0 propagation
+   * is best-effort by design (a Mem0 outage must not tear down a kms_update
+   * that already mutated Mongo + SparrowDB).
    */
   async update(
     id: string,
