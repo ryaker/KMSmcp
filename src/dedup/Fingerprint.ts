@@ -51,9 +51,13 @@ export function normalize(content: string): string {
   // Normalize line endings first so per-line operations work uniformly.
   const unifiedNewlines = content.replace(/\r\n?/g, '\n')
   const lines = unifiedNewlines.split('\n').map(line => {
-    // Collapse runs of horizontal whitespace (spaces, tabs) within the line
-    // to a single space. \s would also match newlines — we explicitly use
-    // [ \t\f\v ] so paragraph structure (newlines) is preserved.
+    // Collapse runs of horizontal whitespace within the line to a single
+    // space. We explicitly enumerate horizontal whitespace (space, tab,
+    // form-feed, vertical-tab, U+00A0 non-breaking space) instead of \s
+    // so paragraph structure (newlines) is preserved. NBSP is included
+    // because it commonly appears in copy-pasted content from rich-text
+    // sources and would otherwise fork the fingerprint vs the plain-space
+    // version of the same content.
     const collapsed = line.replace(/[ \t\f\v ]+/g, ' ')
     // Strip leading + trailing whitespace per-line (line-internal already
     // collapsed; this drops the leading/trailing single-space residue).
