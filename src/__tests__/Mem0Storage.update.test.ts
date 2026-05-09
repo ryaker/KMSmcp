@@ -196,11 +196,12 @@ describe('Mem0Storage.update — kms_update propagation', () => {
       expect(result).toBe(false)
     })
 
-    it('does NOT swallow unexpected errors (returns false but logs)', async () => {
-      // 500 / network errors should not be silenced as probe-and-skip — they
-      // surface so the caller can see Mem0 is misbehaving. Implementation:
-      // the inner throw is caught by the outer try/catch, returning false
-      // (the unified layer treats false as a non-fatal skip).
+    it('returns false on non-404 errors (still logged + still non-fatal)', async () => {
+      // 500 / network errors are distinct from probe-and-skip but Mem0
+      // propagation is best-effort by design — the outer catch returns
+      // false so a Mem0 outage never tears down a kms_update that already
+      // succeeded against Mongo + SparrowDB. The error path logs at
+      // console.error so ops can see Mem0 is misbehaving.
       mockClient.update.mockRejectedValue(new Error('500 Internal Server Error'))
 
       const result = await storage.update('kms-abc', 'corrected')
