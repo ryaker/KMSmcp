@@ -1,0 +1,205 @@
+{
+  "cache": {
+    "version": 6,
+    "state": {
+      "documents": {
+        "doc-old-001": {
+          "id": "doc-old-001",
+          "title": "Q1 retro — synthetic test data",
+          "type": "meeting",
+          "created_at": "2026-01-10T15:00:00.000Z",
+          "updated_at": "2026-01-10T15:30:00.000Z",
+          "deleted_at": null,
+          "valid_meeting": true,
+          "transcribe": true,
+          "google_calendar_event": {
+            "summary": "Q1 retro",
+            "start": { "dateTime": "2026-01-10T15:00:00Z", "timeZone": "UTC" },
+            "end":   { "dateTime": "2026-01-10T15:30:00Z", "timeZone": "UTC" }
+          }
+        },
+        "doc-mid-002": {
+          "id": "doc-mid-002",
+          "title": "Mid-quarter sync — synthetic test data",
+          "type": "meeting",
+          "created_at": "2026-03-15T19:00:00.000Z",
+          "updated_at": "2026-03-15T19:25:00.000Z",
+          "deleted_at": null,
+          "valid_meeting": true,
+          "transcribe": true,
+          "google_calendar_event": {
+            "summary": "Mid-quarter sync",
+            "start": { "dateTime": "2026-03-15T19:00:00Z", "timeZone": "UTC" },
+            "end":   { "dateTime": "2026-03-15T19:25:00Z", "timeZone": "UTC" }
+          }
+        },
+        "doc-new-003": {
+          "id": "doc-new-003",
+          "title": "Project sync — synthetic test data",
+          "type": "meeting",
+          "created_at": "2026-05-01T16:00:00.000Z",
+          "updated_at": "2026-05-01T16:30:00.000Z",
+          "deleted_at": null,
+          "valid_meeting": true,
+          "transcribe": true,
+          "google_calendar_event": {
+            "summary": "Project sync",
+            "start": { "dateTime": "2026-05-01T16:00:00Z", "timeZone": "UTC" },
+            "end":   { "dateTime": "2026-05-01T16:30:00Z", "timeZone": "UTC" }
+          }
+        },
+        "doc-deleted-004": {
+          "id": "doc-deleted-004",
+          "title": "Deleted meeting — should be skipped",
+          "type": "meeting",
+          "created_at": "2026-04-01T15:00:00.000Z",
+          "updated_at": "2026-04-01T15:30:00.000Z",
+          "deleted_at": "2026-04-02T12:00:00.000Z",
+          "valid_meeting": true
+        },
+        "doc-no-transcript-005": {
+          "id": "doc-no-transcript-005",
+          "title": "Meeting without transcript — should be skipped",
+          "type": "meeting",
+          "created_at": "2026-04-15T15:00:00.000Z",
+          "updated_at": "2026-04-15T15:30:00.000Z",
+          "deleted_at": null
+        },
+        "doc-scratchpad-006": {
+          "id": "doc-scratchpad-006",
+          "title": "Scratchpad note — wrong type",
+          "type": "scratchpad",
+          "created_at": "2026-04-20T15:00:00.000Z",
+          "deleted_at": null
+        },
+        "doc-malformed-007": {
+          "id": "doc-malformed-007",
+          "type": "meeting",
+          "created_at": "not-a-date",
+          "deleted_at": null
+        }
+      },
+      "transcripts": {
+        "doc-old-001": [
+          {
+            "id": "seg-old-001",
+            "document_id": "doc-old-001",
+            "start_timestamp": "2026-01-10T15:00:01.000Z",
+            "end_timestamp":   "2026-01-10T15:00:05.000Z",
+            "text": "Welcome everyone to the Q1 retro.",
+            "source": "microphone",
+            "is_final": true
+          },
+          {
+            "id": "seg-old-002",
+            "document_id": "doc-old-001",
+            "start_timestamp": "2026-01-10T15:00:06.000Z",
+            "end_timestamp":   "2026-01-10T15:00:09.000Z",
+            "text": "Lets review what shipped.",
+            "source": "microphone",
+            "is_final": true
+          },
+          {
+            "id": "seg-old-003",
+            "document_id": "doc-old-001",
+            "start_timestamp": "2026-01-10T15:00:10.000Z",
+            "end_timestamp":   "2026-01-10T15:00:15.000Z",
+            "text": "We launched the new dashboard last week.",
+            "source": "system",
+            "is_final": true
+          },
+          {
+            "id": "seg-old-004",
+            "document_id": "doc-old-001",
+            "start_timestamp": "2026-01-10T15:00:16.000Z",
+            "end_timestamp":   "2026-01-10T15:00:18.000Z",
+            "text": "User feedback has been positive.",
+            "source": "system",
+            "is_final": true
+          },
+          {
+            "id": "seg-old-005-partial",
+            "document_id": "doc-old-001",
+            "start_timestamp": "2026-01-10T15:00:19.000Z",
+            "end_timestamp":   "2026-01-10T15:00:20.000Z",
+            "text": "this should be skipped non-final",
+            "source": "system",
+            "is_final": false
+          },
+          {
+            "id": "seg-old-006-empty",
+            "document_id": "doc-old-001",
+            "start_timestamp": "2026-01-10T15:00:21.000Z",
+            "end_timestamp":   "2026-01-10T15:00:22.000Z",
+            "text": "   ",
+            "source": "microphone",
+            "is_final": true
+          }
+        ],
+        "doc-mid-002": [
+          {
+            "id": "seg-mid-001",
+            "document_id": "doc-mid-002",
+            "start_timestamp": "2026-03-15T19:00:01.000Z",
+            "end_timestamp":   "2026-03-15T19:00:03.000Z",
+            "text": "Mid-quarter check-in.",
+            "source": "microphone",
+            "is_final": true
+          },
+          {
+            "id": "seg-mid-002",
+            "document_id": "doc-mid-002",
+            "start_timestamp": "2026-03-15T19:00:04.000Z",
+            "end_timestamp":   "2026-03-15T19:00:08.000Z",
+            "text": "All projects on track for the next milestone.",
+            "source": "system",
+            "is_final": true
+          }
+        ],
+        "doc-new-003": [
+          {
+            "id": "seg-new-001",
+            "document_id": "doc-new-003",
+            "start_timestamp": "2026-05-01T16:00:01.000Z",
+            "end_timestamp":   "2026-05-01T16:00:04.000Z",
+            "text": "Quick project sync.",
+            "source": "microphone",
+            "is_final": true
+          },
+          {
+            "id": "seg-new-002",
+            "document_id": "doc-new-003",
+            "start_timestamp": "2026-05-01T16:00:05.000Z",
+            "end_timestamp":   "2026-05-01T16:00:09.000Z",
+            "text": "Decisions captured in the shared doc.",
+            "source": "system",
+            "is_final": true
+          }
+        ],
+        "doc-deleted-004": [
+          {
+            "id": "seg-deleted-001",
+            "document_id": "doc-deleted-004",
+            "start_timestamp": "2026-04-01T15:00:01.000Z",
+            "end_timestamp":   "2026-04-01T15:00:03.000Z",
+            "text": "This transcript should never surface.",
+            "source": "microphone",
+            "is_final": true
+          }
+        ],
+        "doc-malformed-007": [
+          {
+            "id": "seg-mal-001",
+            "document_id": "doc-malformed-007",
+            "start_timestamp": "2026-04-25T15:00:01.000Z",
+            "end_timestamp":   "2026-04-25T15:00:03.000Z",
+            "text": "transcript exists but document is malformed",
+            "source": "microphone",
+            "is_final": true
+          }
+        ]
+      },
+      "meetingsMetadata": {}
+    }
+  }
+}
