@@ -234,8 +234,10 @@ export class UnifiedStoreTool {
             }
             catch (e) {
                 // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
-                // Tier 1 still runs.
-                console.warn(`⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+                // Tier 1 still runs. Use the project logger for consistency with the
+                // rest of the dedup-gate code path (Tier 1 / Tier 2 also log via
+                // logger.warn — see the findSimilar guard below).
+                logger.warn(`⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
                     `${e instanceof Error ? e.message : String(e)}`);
             }
         }
