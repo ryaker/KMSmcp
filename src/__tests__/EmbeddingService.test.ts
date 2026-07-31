@@ -198,4 +198,63 @@ describe('OllamaEmbeddingService', () => {
     // Single underlying call — cache hits avoid extra HTTP traffic.
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
+
+  it('isAvailable: probe budget is well above LAN round-trip, not the old 500ms', async () => {
+    // Regression guard. The probe was hardcoded to 500 ms, which is 10x stricter than
+    // DEFAULT_TIMEOUT_MS and fails against an Ollama on another host. We assert the
+    // AbortSignal handed to fetch has not already fired after a LAN-typical delay.
+    let captured: AbortSignal | undefined
+    fetchMock.mockImplementationOnce(async (_url: unknown, init: unknown) => {
+      captured = (init as { signal?: AbortSignal } | undefined)?.signal
+      await new Promise(r => setTimeout(r, 600))
+      return { ok: true } as unknown as Response
+    })
+    const svc = new OllamaEmbeddingService()
+    expect(await svc.isAvailable()).toBe(true)
+    expect(captured?.aborted).toBe(false)
+  })
+
+  it('isAvailable: a failure expires fast so one slow probe does not disable embedding', async () => {
+    // Previously a negative result was cached for the full 30 s, meaning a single
+    // transient blip suppressed embedding for every write in the next half-minute.
+    fetchMock.mockRejectedValueOnce(new Error('connection refused'))
+    const svc = new OllamaEmbeddingService()
+    expect(await svc.isAvailable()).toBe(false)
+
+    // Advance past the short failure TTL (5 s) but well inside the 30 s success TTL.
+    const realNow = Date.now
+    Date.now = () => realNow() + 6_000
+    try {
+      fetchMock.mockResolvedValueOnce({ ok: true } as unknown as Response)
+      expect(await svc.isAvailable()).toBe(true)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      Date.now = realNow
+    }
+  })
+
+  it('isAvailable: failure TTL is measured from when the probe finished, not when it started', async () => {
+    // A slow probe must still get its full failure TTL. If expiresAt is computed from a
+    // timestamp captured before fetch, a probe that burns 2s of its budget caches the
+    // failure for only ~3s instead of 5s — and re-probes a slow/dead host too eagerly.
+    fetchMock.mockImplementationOnce(async () => {
+      await new Promise(r => setTimeout(r, 400))
+      throw new Error('connection refused')
+    })
+    const svc = new OllamaEmbeddingService()
+    expect(await svc.isAvailable()).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    // 4.7s after the probe *returned*. Still inside the 5s failure TTL, so the cached
+    // negative must hold. With the old start-time arithmetic the 400ms spent probing
+    // would have pushed this past expiry and triggered a second fetch.
+    const realNow = Date.now
+    Date.now = () => realNow() + 4_700
+    try {
+      expect(await svc.isAvailable()).toBe(false)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    } finally {
+      Date.now = realNow
+    }
+  })
 })

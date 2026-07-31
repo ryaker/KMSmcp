@@ -10,6 +10,35 @@ export interface EntityMention {
   aliases?: string[]
 }
 
+/**
+ * Timeout budgets. These were originally tuned for an Ollama running on loopback,
+ * where a reachability probe completes in ~1 ms and a model is always resident.
+ * Once Ollama moves to another host on the LAN, every one of them is too tight:
+ * a probe costs 100-150 ms, and the FIRST inference after a model is evicted pays
+ * a multi-second load. Each is overridable by env var so a slower host does not
+ * require a code change.
+ */
+const envMs = (name: string, fallback: number): number => {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+/** Reachability probe. LAN round-trip measured at 115-133 ms; 200 ms left no margin. */
+const AVAILABILITY_TIMEOUT_MS = envMs('OLLAMA_AVAILABILITY_TIMEOUT_MS', 2_000)
+/** Storage classification. Cold qwen3:8b measured 5.2 s, warm ~1.7 s; 3 s truncated every cold call. */
+const CLASSIFY_TIMEOUT_MS = envMs('OLLAMA_CLASSIFY_TIMEOUT_MS', 8_000)
+/** Entity extraction — same cold-load exposure as classification. */
+const ENTITY_TIMEOUT_MS = envMs('OLLAMA_ENTITY_TIMEOUT_MS', 8_000)
+/**
+ * A positive result is stable and worth caching. A negative one must expire quickly:
+ * caching it for 30 s meant a single slow probe disabled LLM routing for every write
+ * in the following half-minute.
+ */
+const AVAILABILITY_CACHE_TTL_OK_MS = envMs('OLLAMA_AVAILABILITY_CACHE_OK_MS', 30_000)
+const AVAILABILITY_CACHE_TTL_FAIL_MS = envMs('OLLAMA_AVAILABILITY_CACHE_FAIL_MS', 5_000)
+
 export class OllamaInference {
   private availableCache: { value: boolean; expiresAt: number } | null = null
 
@@ -25,19 +54,28 @@ export class OllamaInference {
     }
 
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 200)
+    const timer = setTimeout(() => controller.abort(), AVAILABILITY_TIMEOUT_MS)
 
     try {
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         signal: controller.signal,
       })
       const value = response.ok
-      this.availableCache = { value, expiresAt: now + 30_000 }
+      // TTL starts when the probe COMPLETES, not when it started. A probe that
+      // consumes the full timeout would otherwise get a TTL shortened by however
+      // long it took — a 2s failed probe would cache for 3s instead of 5s.
+      this.availableCache = {
+        value,
+        expiresAt: Date.now() + (value ? AVAILABILITY_CACHE_TTL_OK_MS : AVAILABILITY_CACHE_TTL_FAIL_MS),
+      }
       console.log(`[OllamaInference] availability check: ${value}`)
       return value
     } catch {
-      this.availableCache = { value: false, expiresAt: now + 30_000 }
-      console.warn('[OllamaInference] availability check failed — Ollama not reachable')
+      this.availableCache = { value: false, expiresAt: Date.now() + AVAILABILITY_CACHE_TTL_FAIL_MS }
+      console.warn(
+        `[OllamaInference] availability check failed — Ollama not reachable at ${this.baseUrl} ` +
+        `(timeout ${AVAILABILITY_TIMEOUT_MS}ms)`
+      )
       return false
     } finally {
       clearTimeout(timer)
@@ -58,7 +96,7 @@ Rules:
 
 Text: "${content.slice(0, 500)}"`
 
-    const raw = await this.callOllama(prompt, 3000)
+    const raw = await this.callOllama(prompt, CLASSIFY_TIMEOUT_MS)
     if (raw === null) {
       return null
     }
@@ -122,7 +160,7 @@ Candidates: ${JSON.stringify(candidates.slice(0, 30))}
 
 Text: "${content.slice(0, 600)}"`
 
-    const raw = await this.callOllama(prompt, 4000)
+    const raw = await this.callOllama(prompt, ENTITY_TIMEOUT_MS)
     if (raw === null) {
       return []
     }
