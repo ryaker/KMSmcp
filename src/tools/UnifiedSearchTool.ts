@@ -428,46 +428,105 @@ export class UnifiedSearchTool {
   }
 
   /**
-   * Rank results by relevance and confidence
+   * Rank results by a composite relevance score.
+   *
+   * The previous implementation sorted by `confidence` FIRST and only fell through
+   * to text relevance when two results differed by more than 0.1. Every stored entry
+   * carries confidence 1 (it is the author's stated confidence in the fact, not a
+   * retrieval score), so that branch never fired and the tie-breaker did all the work
+   * unaided — while genuinely irrelevant entries that happened to share a word with
+   * the query ranked alongside exact topical matches.
+   *
+   * Scoring is now explicit and inspectable: lexical relevance, recency, and a small
+   * confidence contribution, combined into `_score` and attached to each result so a
+   * caller can see WHY something ranked where it did.
    */
   private rankResults(results: any[], query: string): any[] {
-    return results.sort((a, b) => {
-      // Primary sort by confidence
-      const confidenceDiff = (b.confidence || 0) - (a.confidence || 0)
-      if (Math.abs(confidenceDiff) > 0.1) {
-        return confidenceDiff
-      }
-
-      // Secondary sort by content relevance
-      const aRelevance = this.calculateRelevance(a.content, query)
-      const bRelevance = this.calculateRelevance(b.content, query)
-      
-      return bRelevance - aRelevance
+    const scored = results.map(r => {
+      const relevance = this.calculateRelevance(r.content, query)
+      const recency = this.calculateRecency(r.timestamp)
+      // Relevance dominates; recency breaks ties between comparably relevant hits
+      // (memory is corrected over time, so newer entries about the same topic usually
+      // supersede older ones). Confidence contributes only marginally — it is nearly
+      // always 1 and carries almost no ranking signal.
+      const score = relevance * 0.70 + recency * 0.25 + (r.confidence ?? 0) * 0.05
+      return { ...r, _score: Number(score.toFixed(4)), _relevance: Number(relevance.toFixed(4)), _recency: Number(recency.toFixed(4)) }
     })
+    return scored.sort((a, b) => b._score - a._score)
   }
 
   /**
-   * Calculate content relevance to query
+   * Lexical relevance of content to the query, in [0, 1].
+   *
+   * Word-boundary matched rather than substring matched: the old `includes(term)`
+   * scored an insurance doc about a *session* timeout as relevant to a query about
+   * an *Ollama* timeout, because "timeout" appeared somewhere in the text. Coverage
+   * (what fraction of query terms appear at all) is the dominant signal, with bounded
+   * bonuses for repetition and for the full query appearing as a phrase.
    */
   private calculateRelevance(content: string, query: string): number {
     if (!content || !query) return 0
-    
-    const contentLower = content.toLowerCase()
-    const queryLower = query.toLowerCase()
-    const queryTerms = queryLower.split(/\s+/)
-    
-    let score = 0
-    queryTerms.forEach(term => {
-      if (contentLower.includes(term)) {
-        score += 1
-        // Bonus for exact matches
-        if (contentLower.includes(queryLower)) {
-          score += 0.5
-        }
-      }
-    })
 
-    return score / queryTerms.length
+    const contentLower = content.toLowerCase()
+    const queryLower = query.trim().toLowerCase()
+    // Drop stopwords and 1-char fragments so common filler does not inflate coverage.
+    const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'is', 'it'])
+    const terms = Array.from(new Set(
+      queryLower.split(/[^a-z0-9_.-]+/).filter(t => t.length > 1 && !STOP.has(t))
+    ))
+    if (terms.length === 0) return 0
+
+    let matched = 0
+    let density = 0
+    for (const term of terms) {
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      // Bounded on BOTH sides. A leading \b alone still prefix-matches, so "timeout"
+      // would score against "timeoutvalue" — the substring defect this function exists
+      // to remove, in its prefix form.
+      //
+      // A short inflectional suffix is allowed so "timeout" matches "timeouts" and
+      // "abort" matches "aborted"; that is real recall, not accidental overlap. Terms
+      // ending in "e" get that "e" made optional so "route" also reaches "routing"
+      // (rout + ing). Anything beyond these suffixes must clear its own word boundary.
+      const stem = escaped.endsWith('e') ? `${escaped.slice(0, -1)}e?` : escaped
+      const occurrences = (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length
+      if (occurrences > 0) {
+        matched++
+        // Diminishing returns — a term repeated 20x is not 20x more relevant.
+        density += Math.min(occurrences, 5) / 5
+      }
+    }
+
+    const coverage = matched / terms.length          // how much of the query is present
+    const densityScore = density / terms.length      // how emphatically
+
+    // Phrase bonus must be word-boundary matched too. A plain includes() would fire on
+    // "value" inside "timeoutvalue" — the same substring bug this rewrite exists to fix,
+    // reintroduced one line lower.
+    let phraseBonus = 0
+    if (queryLower.length > 3) {
+      const escapedPhrase = queryLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      if (new RegExp(`\\b${escapedPhrase}\\b`).test(contentLower)) phraseBonus = 0.15
+    }
+
+    return Math.min(1, coverage * 0.7 + densityScore * 0.15 + phraseBonus)
+  }
+
+  /**
+   * Recency weight in [0, 1] with a 90-day half-life.
+   *
+   * Stored knowledge is corrected over time — today's entry about a subject usually
+   * supersedes April's. Ranking previously ignored timestamps entirely, so stale
+   * entries interleaved with current ones on the same topic.
+   */
+  private calculateRecency(timestamp?: string | number | Date): number {
+    if (!timestamp) return 0.5   // unknown age — neutral, neither boosted nor buried
+    const t = new Date(timestamp).getTime()
+    if (!Number.isFinite(t)) return 0.5
+    const ageDays = (Date.now() - t) / 86_400_000
+    if (ageDays < 0) return 1    // clock skew / future-dated
+    const HALF_LIFE_DAYS = 90
+    return Math.pow(0.5, ageDays / HALF_LIFE_DAYS)
   }
 
   /**
