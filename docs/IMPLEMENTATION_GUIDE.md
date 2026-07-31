@@ -93,10 +93,20 @@ class EnhancedFACTCache extends FACTCache {
 
 #### 2.1 Pattern-Based Router Enhancement
 
+> **STATUS: PROPOSAL — NOT IMPLEMENTED.** `src/routing/PatternBasedRouter.ts` does not
+> exist and never has. The code below is a design sketch, not a description of the
+> codebase. What actually ships is `OllamaStorageRouter` (LLM classification) wrapping
+> `IntelligentStorageRouter` (rule-based) as its fallback — see `src/routing/`.
+>
+> Worth revisiting: measurements on 2026-07-31 put the LLM classification path at
+> ~3s per write, and it returns `graph+mem0+mongodb` for nearly all content, so the
+> declarative-pattern approach sketched here may be the better design. But it is a
+> proposal to evaluate, not existing behaviour to rely on.
+
 Enhance the intelligent router with declarative patterns + AI override:
 
 ```typescript
-// src/routing/PatternBasedRouter.ts
+// PROPOSED (does not exist): src/routing/PatternBasedRouter.ts
 interface MemoryPattern {
   name: string;
   pattern: RegExp;
