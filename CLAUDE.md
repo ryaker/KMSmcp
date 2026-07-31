@@ -237,7 +237,42 @@ Each candidate in a `dedup_required` response now carries an `llm_relation` fiel
 
 **Cost & latency budget:** Haiku 4.5 with 5 s per-candidate timeout, single-word forced response (~12 tokens). LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
 
-**Known limitation (upstream)**: As of sparrowdb 0.1.22, the Node.js binding does NOT expose parameter-binding for `execute()` (no `execute_with_params`), and the Cypher parser rejects list literals in `SET` / `CREATE`. This means `storeEmbedding`'s `SET k.embedding = [...]` write path silently fails — the HNSW index stays empty, and the dedup gate is inert in practice (it always finds 0 candidates and proceeds to a normal store). The gate logic, type guards, and threshold dispatch are all correct and will activate the moment the upstream binding gains either (a) `execute_with_params` for vector inserts, or (b) parser support for f32-list literals in SET. Tracked separately from DG-T1-B.
+**Embedding writes work — the gate is live.** (Re-verified 2026-07-31.) An earlier
+revision of this file claimed the opposite: that the Node binding had no
+`execute_with_params`, that `SET k.embedding = [...]` silently failed, that the HNSW
+index stayed empty and the dedup gate was inert. **Every part of that is now false**, and
+it was quoted as a live blocker for months after it stopped being true. Current state:
+
+- The binding exposes `executeWithParams`, `createVectorIndex`, `vectorSearch`,
+  `addToVectorIndex`, `hybridSearch`, `fulltextSearch`.
+- `storeEmbedding` (`src/storage/SparrowDBStorage.ts:481-489`) was migrated off the
+  list-literal path to parameter binding in `30285ef8` (PR #69).
+- The live store at `$SPARROWDB_PATH` (`~/.kms-sparrowdb-v2`) has a populated HNSW
+  index — hundreds of vectors against real `nomic-embed-text:v1` embedder IDs.
+
+Only the *legacy* literal form still fails, and nothing calls it any more:
+`SET k.embedding = [0.1, 0.2]` → `invalid argument: SET property value must be a
+literal or $parameter`. Use `executeWithParams` with `$emb`.
+
+**Two real caveats that DO apply:**
+
+1. **`package.json` declares `sparrowdb: ^0.1.20`, and that is fiction.** The npm
+   tarball ships a Linux ELF that cannot `dlopen` on darwin-arm64, and published
+   0.1.20/0.1.21 have *no vector API at all* — upgrading to them is a severe
+   regression. The working artifact is a local build produced by
+   `scripts/build-sparrowdb-node.sh` from `~/Dev/SparrowDB/npm/sparrowdb` (0.1.22,
+   unpublished), which overwrites `node_modules/sparrowdb/sparrowdb.node`. **A plain
+   `npm ci` silently breaks vector support** until someone re-runs the build script.
+
+2. **Reads return `null` unless `id(k)` is projected first.** `MATCH (k) RETURN k.id`
+   yields `null`; `MATCH (k) RETURN id(k), k.id` yields the value. `_ensureInternalIdMap`
+   is accidentally immune because it happens to project `id(k)` first — any new query
+   that doesn't will silently read nulls. (Relatedly, the "SparrowDB truncates strings
+   to 7 chars" comment near `SparrowDBStorage.ts:586` is a misdiagnosis: full UUIDs
+   round-trip intact.)
+
+Before repeating any claim in this section, verify it — that is exactly how the
+superseded version above survived so long.
 
 ## Best Practices
 
