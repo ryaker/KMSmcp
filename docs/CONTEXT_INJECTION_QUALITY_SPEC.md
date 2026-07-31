@@ -30,7 +30,7 @@ The spec is the contract the implementation will be judged against. **Sign-off o
 
 A single markdown spec at:
 
-```
+```text
 docs/CONTEXT_INJECTION_QUALITY_SPEC.md
 ```
 
@@ -42,7 +42,7 @@ This is the only file created by this plan. No code, no hooks, no schema migrati
 
 ## Shape of the change
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │  This plan                                                  │
 │  ─────────                                                  │
@@ -121,9 +121,26 @@ Each metric needs: name, formula, who computes it, baseline (if known), target, 
 | **On-topic injection rate** | `(# injected items judged relevant to user prompt) / (# injected items)` | Stop-hook scorer (LLM judge over `{prompt, injected_item}`) | ~22% (anecdotal) | ≥80% | rolling 7d |
 | **Usage rate** | `(# injected items the next assistant turn referenced or acted on) / (# injected items)` | Stop-hook scorer (LLM judge over `{injected_item, assistant_response}`) | unknown | ≥50% | rolling 7d |
 | **Contradiction rate** | `(# injected items the assistant explicitly contradicted) / (# injected items)` | Stop-hook scorer; auto-stages a `kms_supersede` suggestion | unknown | ≤5% | rolling 7d |
-| **Discovery rate** | `(# turns where supersede/flag was warranted AND happened) / (# turns where it was warranted)` | Stop-hook scorer (judges from contradiction signal) | ~0% | ≥70% | rolling 7d |
+| **Discovery rate** | `(# warranted corrections subsequently resolved via a corrective tool) / (# warranted corrections raised)` | Stop-hook scorer (judges from contradiction signal); resolution matched by `item_id`, not by turn | ~0% | ≥70% | rolling 7d |
 
 Each metric definition spells out: what counts as a "use," what counts as a "contradiction" (explicit only, not omission), and what counts as "warranted" for discovery. **The judge prompts go in an appendix so they're version-controlled.**
+
+**Discovery rate spans sessions — measure it per item, never per turn.** §5 surfaces
+correction suggestions in the *next* session, so the turn that raises a warranted
+correction and the turn that resolves it are different turns, usually in different
+sessions. A same-turn numerator would therefore read ~0% forever regardless of how
+well the loop works. Concretely:
+
+- When the scorer judges a correction warranted, it writes an open record keyed by
+  the offending `item_id` (not `turn_id`), with the raising `session_id`/`turn_id`.
+- Any later `kms_supersede` / `kms_flag` / `kms_update` naming that `item_id` closes
+  the record, whenever and wherever it happens.
+- The rolling-7d window is applied to the **raising** timestamp, and a record is
+  counted resolved if it closes within **14 days** of being raised. Corrections
+  resolved after that lapse count as misses, so the metric cannot be gamed by an
+  unbounded tail.
+- An `item_id` with an already-open record does not raise a second one; repeated
+  contradictions of the same item increment a counter on the existing record.
 
 **Why these four**: they're orthogonal. On-topic rate measures retrieval quality, usage rate measures whether on-topic results were actually load-bearing, contradiction rate flags wrong stored facts, discovery rate measures whether the corrective tools are reaching daily flow. You can't game one without moving another.
 
@@ -135,7 +152,7 @@ Each metric definition spells out: what counts as a "use," what counts as a "con
 - **What it captures per turn**:
   - `session_id`, `turn_id`, `timestamp`
   - `user_prompt` (truncated)
-  - `injected_items[]` — id, source backend, **content excerpt (full text, first 500 chars)**, confidence at time of injection
+  - `injected_items[]` — id, source backend, **`excerpt`: the first 500 characters of the item's content, truncated (never the full text)**, plus `content_length` so truncation is detectable, and confidence at time of injection. The log stores the excerpt only; the full content is retrievable from the source backend by `id` when a scorer or auditor needs it. Storing full text here would duplicate the corpus into the log and blow past the TTL collection's size budget.
   - `assistant_response` (truncated)
   - `tool_calls[]` (especially `kms_supersede`/`kms_flag`/`kms_update`)
 - **Where it lands**: a new collection `kms_quality_log` **in the existing KMS MongoDB database** (the connection in `src/storage/MongoDBStorage.ts:23-44` is reused — no new infra, no new database). One document per turn. TTL index at 90 days for raw turns; rollups stay forever.
@@ -151,12 +168,23 @@ The spec includes the JSON schema for both collections and the judge prompt. *(D
 
 The structural fix. Today `UnifiedSearchTool.rankResults` (`src/tools/UnifiedSearchTool.ts:430-444`) sorts purely on `result.confidence`. The spec defines an **effective confidence** that combines stored confidence with usage signal:
 
-```
-effective_confidence = stored_confidence × (1 + α·usage_score − β·contradiction_score)
+```text
+effective_confidence = max(0, stored_confidence × (1 + α·usage_score − β·contradiction_score))
 ```
 
-- `usage_score`: rolling EMA over the item's `(uses) / (injections)` from `kms_quality_rollup`.
-- `contradiction_score`: rolling EMA over the item's `(contradictions) / (injections)`.
+- The `max(0, …)` clamp is required, not cosmetic. At the default **β=2.0** any
+  `contradiction_score > 0.5` drives the multiplier negative, and a negative
+  effective confidence would sort *above* a legitimate low-confidence item under a
+  descending sort — inverting the penalty into a reward. Clamped, a heavily
+  contradicted item floors at 0 and ranks last, which is the intent.
+- `usage_score`: rolling EMA (smoothing factor **γ=0.3**) over the item's
+  `(uses) / (injections)` from `kms_quality_rollup`.
+- `contradiction_score`: rolling EMA (smoothing factor **γ=0.3**) over the item's
+  `(contradictions) / (injections)`.
+- γ is shared by both EMAs so responsiveness is symmetric: at 0.3 an item's score is
+  dominated by roughly its last 5–6 injections, fast enough to react to a correction
+  without thrashing on a single anomalous turn. Any implementation must read γ from
+  one shared constant rather than redeclaring it per-metric.
 - `α`, `β` are constants set in the spec (start: **α=0.5, β=2.0** — contradictions punish harder than uses reward).
 - An item with no injection history falls back to stored confidence (no penalty for being new).
 
