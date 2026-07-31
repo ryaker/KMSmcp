@@ -61,14 +61,17 @@ export class OllamaInference {
         signal: controller.signal,
       })
       const value = response.ok
+      // TTL starts when the probe COMPLETES, not when it started. A probe that
+      // consumes the full timeout would otherwise get a TTL shortened by however
+      // long it took — a 2s failed probe would cache for 3s instead of 5s.
       this.availableCache = {
         value,
-        expiresAt: now + (value ? AVAILABILITY_CACHE_TTL_OK_MS : AVAILABILITY_CACHE_TTL_FAIL_MS),
+        expiresAt: Date.now() + (value ? AVAILABILITY_CACHE_TTL_OK_MS : AVAILABILITY_CACHE_TTL_FAIL_MS),
       }
       console.log(`[OllamaInference] availability check: ${value}`)
       return value
     } catch {
-      this.availableCache = { value: false, expiresAt: now + AVAILABILITY_CACHE_TTL_FAIL_MS }
+      this.availableCache = { value: false, expiresAt: Date.now() + AVAILABILITY_CACHE_TTL_FAIL_MS }
       console.warn(
         `[OllamaInference] availability check failed — Ollama not reachable at ${this.baseUrl} ` +
         `(timeout ${AVAILABILITY_TIMEOUT_MS}ms)`

@@ -168,13 +168,15 @@ export class OllamaEmbeddingService implements EmbeddingService {
         signal: controller.signal,
       })
       const value = response.ok
+      // TTL starts when the probe COMPLETES, not when it started — otherwise a probe
+      // that consumes its full timeout gets a correspondingly shortened TTL.
       this.availableCache = {
         value,
-        expiresAt: now + (value ? AVAILABILITY_CACHE_TTL_MS : AVAILABILITY_CACHE_TTL_FAIL_MS),
+        expiresAt: Date.now() + (value ? AVAILABILITY_CACHE_TTL_MS : AVAILABILITY_CACHE_TTL_FAIL_MS),
       }
       return value
     } catch {
-      this.availableCache = { value: false, expiresAt: now + AVAILABILITY_CACHE_TTL_FAIL_MS }
+      this.availableCache = { value: false, expiresAt: Date.now() + AVAILABILITY_CACHE_TTL_FAIL_MS }
       return false
     } finally {
       clearTimeout(timer)
