@@ -1,8 +1,16 @@
 # Unified KMS MCP Server - Implementation Guide
 
-## Overview
-
-This document provides implementation instructions for building a Unified Knowledge Management System (KMS) MCP Server that treats data as evolving AI memory rather than static database queries. The system intelligently routes knowledge to optimal storage systems (Mem0, Neo4j, MongoDB) while maintaining sub-100ms response times through FACT caching.
+> **HISTORICAL DOCUMENT — verify against `src/` before relying on any detail here.**
+>
+> **`neo4j` is retired.** Every `neo4j` reference below (storage targets, connection
+> pools, metrics gauges, test assertions) predates the SparrowDB cutover and is kept
+> only as a record of the original design. The live storage target is **`graph`** —
+> see `src/types/index.ts`, where the type is `'mem0' | 'graph' | 'mongodb'`. There is
+> no `neo4j` member. Read `neo4j` here as "the graph backend, then Neo4j Aura, now
+> SparrowDB".
+>
+> Sections in this guide describe intended design, not necessarily shipped code.
+> Section 2.1's `PatternBasedRouter` for instance was never built.
 
 ## Core Philosophy
 
@@ -97,6 +105,9 @@ class EnhancedFACTCache extends FACTCache {
 > exist and never has. The code below is a design sketch, not a description of the
 > codebase. What actually ships is `OllamaStorageRouter` (LLM classification) wrapping
 > `IntelligentStorageRouter` (rule-based) as its fallback — see `src/routing/`.
+>
+> The `neo4j` storage targets in the snippets below are also retired; the live target
+> is `graph`. Any implementation of this proposal must use `'mem0' | 'graph' | 'mongodb'`.
 >
 > Worth revisiting: measurements on 2026-07-31 put the LLM classification path at
 > ~3s per write, and it returns `graph+mem0+mongodb` for nearly all content, so the

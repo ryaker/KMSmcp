@@ -480,7 +480,16 @@ export class UnifiedSearchTool {
     let density = 0
     for (const term of terms) {
       const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const occurrences = (contentLower.match(new RegExp(`\\b${escaped}`, 'g')) || []).length
+      // Bounded on BOTH sides. A leading \b alone still prefix-matches, so "timeout"
+      // would score against "timeoutvalue" — the substring defect this function exists
+      // to remove, in its prefix form.
+      //
+      // A short inflectional suffix is allowed so "timeout" matches "timeouts" and
+      // "abort" matches "aborted"; that is real recall, not accidental overlap. Terms
+      // ending in "e" get that "e" made optional so "route" also reaches "routing"
+      // (rout + ing). Anything beyond these suffixes must clear its own word boundary.
+      const stem = escaped.endsWith('e') ? `${escaped.slice(0, -1)}e?` : escaped
+      const occurrences = (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length
       if (occurrences > 0) {
         matched++
         // Diminishing returns — a term repeated 20x is not 20x more relevant.

@@ -38,10 +38,25 @@ describe('UnifiedSearchTool ranking', () => {
       expect(coincidental).toBeLessThan(0.4)
     })
 
-    it('matches on word boundaries, not substrings', () => {
+    it('matches on word boundaries, not substrings — suffix form', () => {
       // "out" must not match inside "timeout"; the old includes() check did.
       expect(relevance('the request timed out after a timeout', 'out')).toBeGreaterThan(0)
       expect(relevance('timeoutvalue configured', 'value')).toBe(0)
+    })
+
+    it('matches on word boundaries, not substrings — PREFIX form', () => {
+      // A leading \b alone is not enough: "timeout" would still prefix-match
+      // "timeoutvalue". Both ends must be bounded.
+      expect(relevance('timeoutvalue configured', 'timeout')).toBe(0)
+      expect(relevance('routerConfig loaded', 'route')).toBe(0)
+    })
+
+    it('still matches simple inflections, so bounding does not cost recall', () => {
+      // Bounding both ends must not make the matcher brittle: plurals and common
+      // verb forms are the same term for ranking purposes.
+      expect(relevance('several timeouts were logged', 'timeout')).toBeGreaterThan(0)
+      expect(relevance('routing the request', 'route')).toBeGreaterThan(0)
+      expect(relevance('the probe timed out and aborted', 'abort')).toBeGreaterThan(0)
     })
 
     it('applies the phrase bonus once, not once per term', () => {
