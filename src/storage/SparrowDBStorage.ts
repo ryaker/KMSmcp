@@ -49,6 +49,7 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js'
 import { computeFingerprint } from '../dedup/Fingerprint.js'
+import { GraphEdgeIndex } from './GraphEdgeIndex.js'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -206,6 +207,12 @@ export class SparrowDBStorage implements StorageSystem {
   // "graph-only" rather than crashing the store path.
   private vectorIndexAvailable = false
 
+  // Whole-graph adjacency, built lazily on first relationship read and then
+  // maintained incrementally. Replaces a per-node, per-label query fan-out that
+  // cost ~7 Cypher round-trips per search hit while only ever seeing two of the
+  // graph's relationship types. See GraphEdgeIndex.
+  private edgeIndex: GraphEdgeIndex | null = null
+
   constructor(config?: SparrowDBConfig) {
     this.dbPath =
       config?.dbPath ||
@@ -225,6 +232,10 @@ export class SparrowDBStorage implements StorageSystem {
     }
     const native = loadNativeBinding()
     this.db = native.SparrowDB.open(this.dbPath)
+
+    // A re-initialize points at a different handle — the adjacency index built
+    // from the previous one no longer describes this graph.
+    this.edgeIndex = null
 
     // Load content sidecar
     this._loadSidecar()
@@ -753,6 +764,7 @@ export class SparrowDBStorage implements StorageSystem {
         `MATCH (k:Knowledge {id: ${cypherStr(id)}}) DELETE k`
       )
     } catch { /* node may not exist */ }
+    this._edges().removeNode(id)
 
     if (hadEntry) {
       this.contentIndex.delete(id)
@@ -1429,6 +1441,7 @@ export class SparrowDBStorage implements StorageSystem {
           `(e {id: ${cypherStr(targetId)}}) ` +
           `CREATE (k)-[:ABOUT {strength: 100}]->(e)`
         )
+        this._edges().addEdge(sourceId, targetId, 'ABOUT', 1)
       } catch (error) {
         logger.warn(`⚠️ SparrowDB createAboutRelationships ${sourceId} → ${targetId}:`, error)
       }
@@ -1499,6 +1512,12 @@ export class SparrowDBStorage implements StorageSystem {
         `(b:Knowledge {id: ${cypherStr(targetId)}}) ` +
         `CREATE (a)-[:${safeRelType}${props}]->(b)`
       )
+      this._edges().addEdge(
+        sourceId,
+        targetId,
+        safeRelType,
+        strength !== undefined && strength >= 0 && strength <= 1 ? strength : null
+      )
     } catch (error) {
       logger.warn(`⚠️ SparrowDB createRelationship ${relationshipType}:`, error)
     }
@@ -1524,45 +1543,30 @@ export class SparrowDBStorage implements StorageSystem {
     }
   }
 
-  private async _getRelationships(nodeId: string): Promise<any[]> {
-    const relationships: any[] = []
-    try {
-      const out = this.db.execute(
-        `MATCH (a:Knowledge {id: ${cypherStr(nodeId)}})-[:RELATED_TO]->(b:Knowledge) ` +
-        `RETURN b.id`
+  /**
+   * The adjacency index, created on first use so it always wraps the current
+   * db handle (initialize() may replace it).
+   */
+  private _edges(): GraphEdgeIndex {
+    if (!this.edgeIndex) {
+      this.edgeIndex = new GraphEdgeIndex(
+        this.db,
+        (id: string) => this._findEntryByPrefix(id),
+        { debug: (m: string) => logger.debug(`⚡ SparrowDB ${m}`) }
       )
-      for (const row of out.rows) {
-        const rawId = String(row['b.id'] ?? '')
-        const target = this._findEntryByPrefix(rawId)
-        relationships.push({
-          relationship: 'RELATED_TO',
-          relatedNode: target?.id ?? rawId,
-          relatedContent: (target?.content ?? '').slice(0, 80),
-          strength: null
-        })
-      }
-
-      // ABOUT links to entity labels.
-      for (const label of ['Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service']) {
-        try {
-          const about = this.db.execute(
-            `MATCH (k:Knowledge {id: ${cypherStr(nodeId)}})-[:ABOUT]->(e:${label}) ` +
-            `RETURN e.id, e.name`
-          )
-          for (const row of about.rows) {
-            relationships.push({
-              relationship: 'ABOUT',
-              relatedNode: String(row['e.id'] ?? ''),
-              relatedContent: String(row['e.name'] ?? ''),
-              strength: null
-            })
-          }
-        } catch { continue }
-      }
-    } catch (error) {
-      logger.warn('⚠️ SparrowDB _getRelationships error:', error)
     }
-    return relationships.filter(r => r.relatedNode)
+    return this.edgeIndex
+  }
+
+  /**
+   * Relationships incident to `nodeId`, outgoing first, then incoming.
+   *
+   * See GraphEdgeIndex for why this reads a whole-graph adjacency rather than
+   * querying per node: the per-node reader saw only two of the graph's ~45
+   * relationship types and only followed edges outward.
+   */
+  private async _getRelationships(nodeId: string): Promise<any[]> {
+    return this._edges().relationshipsFor(nodeId)
   }
 
   // -------------------------------------------------------------------------

@@ -140,3 +140,42 @@ describe('UnifiedSearchTool ranking', () => {
     })
   })
 })
+
+describe('UnifiedSearchTool length normalisation', () => {
+  const relevance = (content: string, query: string) => (tool as any).calculateRelevance(content, query)
+  const rank = (results: any[], query: string) => (tool as any).rankResults(results, query)
+  const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString()
+
+  it('does not penalise a short, precisely on-topic entry', () => {
+    const short = 'Ollama classify timeout raised to 8000ms.'
+    expect(relevance(short, 'Ollama classify timeout')).toBeGreaterThan(0.8)
+  })
+
+  it('damps a long multi-topic note that merely mentions the terms', () => {
+    // The "everything I did today" shape: one incidental mention buried in 3k chars.
+    const megaNote = 'Session log. ' + 'Unrelated work on invoices and scheduling. '.repeat(60) +
+      'Also touched Ollama classify timeout. ' + 'More unrelated notes about branding. '.repeat(20)
+    const short = 'Ollama classify timeout raised to 8000ms.'
+    expect(relevance(megaNote, 'Ollama classify timeout')).toBeLessThan(relevance(short, 'Ollama classify timeout'))
+  })
+
+  it('a short older exact match outranks a long same-day note — the baseline failure', () => {
+    // Previously the mega-note won on recency alone despite being off-topic.
+    const megaNote = {
+      content: 'Session log. ' + 'Assorted unrelated work across many projects. '.repeat(70) +
+               'Ollama classify timeout mentioned once. ',
+      confidence: 1, timestamp: daysAgo(0),
+    }
+    const precise = {
+      content: 'Ollama classify timeout raised from 3000ms to 8000ms.',
+      confidence: 1, timestamp: daysAgo(45),
+    }
+    const ranked = rank([megaNote, precise], 'Ollama classify timeout')
+    expect(ranked[0].content).toContain('raised from 3000ms')
+  })
+
+  it('damping is bounded — a long but genuinely on-topic entry is not buried', () => {
+    const longOnTopic = 'Ollama classify timeout. '.repeat(150)
+    expect(relevance(longOnTopic, 'Ollama classify timeout')).toBeGreaterThan(0.55)
+  })
+})
