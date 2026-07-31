@@ -69,7 +69,23 @@ const DEFAULT_MODEL = 'nomic-embed-text'
 const DEFAULT_VERSION = 'v1'  // bump when pre-processing/model changes
 const DEFAULT_DIMENSIONS = 768
 const DEFAULT_TIMEOUT_MS = 5_000
+/**
+ * Reachability probe budget. Was hardcoded to 500 ms inline — 10x stricter than
+ * DEFAULT_TIMEOUT_MS above, which every real operation uses. That is fine against a
+ * loopback Ollama but fails against one on the LAN, where the round-trip alone is
+ * 115-133 ms and DNS can add several hundred more.
+ */
+const AVAILABILITY_TIMEOUT_MS = (() => {
+  const raw = process.env.OLLAMA_AVAILABILITY_TIMEOUT_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 2_000
+})()
+/**
+ * Cache a success for a while, but expire a failure fast. A single slow probe used to
+ * disable embedding for a full 30 s.
+ */
 const AVAILABILITY_CACHE_TTL_MS = 30_000
+const AVAILABILITY_CACHE_TTL_FAIL_MS = 5_000
 
 export interface OllamaEmbeddingServiceConfig {
   /** Ollama base URL (defaults to env OLLAMA_BASE_URL or http://localhost:11434). */
@@ -145,17 +161,20 @@ export class OllamaEmbeddingService implements EmbeddingService {
     }
 
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 500)
+    const timer = setTimeout(() => controller.abort(), AVAILABILITY_TIMEOUT_MS)
 
     try {
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         signal: controller.signal,
       })
       const value = response.ok
-      this.availableCache = { value, expiresAt: now + AVAILABILITY_CACHE_TTL_MS }
+      this.availableCache = {
+        value,
+        expiresAt: now + (value ? AVAILABILITY_CACHE_TTL_MS : AVAILABILITY_CACHE_TTL_FAIL_MS),
+      }
       return value
     } catch {
-      this.availableCache = { value: false, expiresAt: now + AVAILABILITY_CACHE_TTL_MS }
+      this.availableCache = { value: false, expiresAt: now + AVAILABILITY_CACHE_TTL_FAIL_MS }
       return false
     } finally {
       clearTimeout(timer)
