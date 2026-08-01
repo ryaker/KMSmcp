@@ -411,19 +411,75 @@ export class UnifiedSearchTool {
   /**
    * Remove duplicate results based on content similarity
    */
+  /**
+   * Collapse the same knowledge item returned by more than one backend.
+   *
+   * `unified_store` dual-writes an entry to graph + mem0 + mongodb under one id, so a
+   * single fact routinely arrives here 2-3 times. The copies are NOT interchangeable:
+   * only the graph copy carries `relationships`, and each backend reports a different
+   * `confidence` — the graph's is a *lexical match score* (matchedTerms/totalTerms,
+   * usually < 1) while MongoDB's is the *stored, author-assigned* confidence (usually
+   * exactly 1).
+   *
+   * Keeping "the highest confidence copy" therefore compared two different quantities
+   * and reliably discarded the graph copy — the only one with relationships. That is
+   * why searches reported `sources: {graph: N}` while every returned result had
+   * `relationships: []`: the graph hits were fetched, then dropped right here.
+   *
+   * Now the copies are MERGED rather than raced. Fields present on one backend and
+   * absent on another are unioned, so relationships survive regardless of which
+   * backend "wins" the scalar fields.
+   */
   private deduplicateResults(results: any[]): any[] {
     const unique = new Map<string, any>()
-    
+
     for (const result of results) {
       // Use ID if available, otherwise use content hash
       const key = result.id || crypto.createHash('md5').update(result.content).digest('hex')
-      
-      // Keep the result with highest confidence
-      if (!unique.has(key) || (result.confidence > unique.get(key).confidence)) {
+      const existing = unique.get(key)
+
+      if (!existing) {
         unique.set(key, result)
+        continue
       }
+
+      // Prefer the longer content — a backend may store a truncated projection.
+      const base = (result.content?.length ?? 0) > (existing.content?.length ?? 0) ? result : existing
+      const other = base === result ? existing : result
+
+      const merged: any = { ...other, ...base }
+
+      // Union the fields that only some backends populate, preferring whichever
+      // copy actually has them rather than whichever copy won on content length.
+      const rels = (base.relationships?.length ? base.relationships : other.relationships) ?? []
+      if (rels.length) merged.relationships = rels
+
+      // entityRefs drive downstream entity-context linking (search()'s linkedEntityIds
+      // annotation and expandWithEntityContext). Union them the same way as relationships,
+      // or whichever copy loses on content length silently drops its refs.
+      const entityRefs = Array.from(new Set([
+        ...(base.metadata?.entityRefs ?? []),
+        ...(other.metadata?.entityRefs ?? []),
+      ]))
+      if (entityRefs.length) {
+        merged.metadata = { ...other.metadata, ...base.metadata, entityRefs }
+      }
+
+      // Keep the stored confidence (the author's), not a per-backend match score.
+      merged.confidence = Math.max(base.confidence ?? 0, other.confidence ?? 0)
+
+      // Record every backend this item came from — previously the surviving copy
+      // claimed a single source, which made `sources` counts unreconcilable with
+      // the returned set.
+      const sourceSystems = new Set<string>([
+        ...(base._sourceSystems ?? [base.sourceSystem]),
+        ...(other._sourceSystems ?? [other.sourceSystem]),
+      ].filter(Boolean))
+      merged._sourceSystems = Array.from(sourceSystems)
+
+      unique.set(key, merged)
     }
-    
+
     return Array.from(unique.values())
   }
 
@@ -509,7 +565,28 @@ export class UnifiedSearchTool {
       if (new RegExp(`\\b${escapedPhrase}\\b`).test(contentLower)) phraseBonus = 0.15
     }
 
-    return Math.min(1, coverage * 0.7 + densityScore * 0.15 + phraseBonus)
+    const raw = Math.min(1, coverage * 0.7 + densityScore * 0.15 + phraseBonus)
+
+    // Length normalisation. Without it, long multi-topic entries dominate unrelated
+    // queries: a 3,000-char "everything I did today" note is keyword-dense enough to
+    // contain an incidental hit for almost any query, and if it is also recent it
+    // scores near-maximum on recency too — so it parks at the top of searches it has
+    // nothing to do with. A retrieval baseline over 20 real queries (P@5 0.54) named
+    // this as one of four causes.
+    //
+    // Damping is deliberately gentle and floored at 0.6: length correlates with
+    // substance as well as with noise, and a hard penalty would bury genuinely
+    // detailed entries. A ~500-char entry is unpenalised; the floor activates at
+    // ~2,321 chars, past which every length flattens to the same 0.6 factor — a
+    // 3,000-char entry already sits on that floor, a 40% reduction, enough to
+    // lose a tie to a short exact match without being excluded.
+    const len = content.length
+    const NEUTRAL_LEN = 500
+    const damping = len <= NEUTRAL_LEN
+      ? 1
+      : Math.max(0.6, 1 / (1 + Math.log10(len / NEUTRAL_LEN)))
+
+    return raw * damping
   }
 
   /**
