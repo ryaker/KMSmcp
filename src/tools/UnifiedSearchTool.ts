@@ -496,19 +496,323 @@ export class UnifiedSearchTool {
    * Scoring is now explicit and inspectable: lexical relevance, recency, and a small
    * confidence contribution, combined into `_score` and attached to each result so a
    * caller can see WHY something ranked where it did.
+   *
+   * Two rank-time passes run on top of that composite:
+   *
+   *  1. TERM WEIGHTING (IDF over the candidate set). Query terms are no longer equal.
+   *     A term present in nearly every candidate cannot discriminate between them; a
+   *     term present in one or two is what the user actually asked about. See
+   *     `computeTermWeights`.
+   *  2. NEAR-DUPLICATE SUPPRESSION. A cluster of paraphrases of one entry can no
+   *     longer occupy the whole top-N. See `suppressNearDuplicates`.
    */
   private rankResults(results: any[], query: string): any[] {
+    // IDF is computed over the candidates actually in hand — no global corpus index
+    // is needed, and none exists. Discriminating power is a property of the set being
+    // ranked, which is exactly the set we have.
+    const termWeights = this.computeTermWeights(results, query)
+
     const scored = results.map(r => {
-      const relevance = this.calculateRelevance(r.content, query)
+      const relevance = this.calculateRelevance(r.content, query, termWeights)
       const recency = this.calculateRecency(r.timestamp)
       // Relevance dominates; recency breaks ties between comparably relevant hits
       // (memory is corrected over time, so newer entries about the same topic usually
       // supersede older ones). Confidence contributes only marginally — it is nearly
       // always 1 and carries almost no ranking signal.
       const score = relevance * 0.70 + recency * 0.25 + (r.confidence ?? 0) * 0.05
-      return { ...r, _score: Number(score.toFixed(4)), _relevance: Number(relevance.toFixed(4)), _recency: Number(recency.toFixed(4)) }
+      return {
+        ...r,
+        _score: Number(score.toFixed(4)),
+        _relevance: Number(relevance.toFixed(4)),
+        _recency: Number(recency.toFixed(4)),
+        // New signals, exposed the same inspectable way as _score/_relevance/_recency:
+        // a caller can see which query terms this entry actually hit and how much each
+        // was worth against this candidate set.
+        _termWeights: termWeights,
+        _matchedTerms: this.matchedTerms(r.content, query)
+      }
     })
-    return scored.sort((a, b) => b._score - a._score)
+
+    scored.sort((a, b) => b._score - a._score)
+    return this.suppressNearDuplicates(scored)
+  }
+
+  /**
+   * IDF-style weight per query term, computed over the candidate set being ranked.
+   *
+   * WHY: query "Joytopia brand colors" scored 0.0 on the retrieval baseline. Every
+   * candidate was some project's brand colors — Tengo's, BlockCopy26's — because
+   * "brand" and "colors" matched everywhere and the one term that actually named the
+   * target, "Joytopia", counted for exactly as much as they did (1/3 of coverage
+   * each). Unweighted coverage cannot tell a discriminating proper noun apart from
+   * boilerplate vocabulary.
+   *
+   * The weight is the BM25 IDF form, `ln(1 + (N - df + 0.5) / (df + 0.5))`, which is
+   * smooth, needs no global corpus, and stays finite at df = N. For the failing query
+   * with 6 candidates of which 1 contains "joytopia" and all 6 contain "brand", that
+   * is ~1.54 vs ~0.07 — a 20x spread — so the single candidate carrying the proper
+   * noun takes nearly all of the available coverage.
+   *
+   * Weights are normalised to sum to 1 across the terms that appear at all, so
+   * `_relevance` keeps the same [0, 1] meaning it had before and stays comparable to
+   * the unweighted case.
+   *
+   * Terms with df = 0 (present in no candidate) get weight 0 and drop out of the
+   * denominator: a term nobody has cannot discriminate either, and leaving it in
+   * would deflate every score by the same factor for no ranking benefit.
+   *
+   * Returns {} — meaning "fall back to uniform weights" — when there is nothing to
+   * discriminate (fewer than 2 candidates, or no term present anywhere).
+   */
+  private computeTermWeights(results: any[], query: string): Record<string, number> {
+    const terms = this.extractQueryTerms(query)
+    if (terms.length === 0) return {}
+
+    const N = results.length
+    // With 0 or 1 candidate there is no "rest of the set" to be rare relative to.
+    if (N < 2) return {}
+
+    const contents = results.map(r => String(r?.content ?? '').toLowerCase())
+
+    const raw: Record<string, number> = {}
+    let total = 0
+    for (const term of terms) {
+      let df = 0
+      for (const content of contents) {
+        if (this.countOccurrences(content, term) > 0) df++
+      }
+      const idf = df === 0 ? 0 : Math.log(1 + (N - df + 0.5) / (df + 0.5))
+      raw[term] = idf
+      total += idf
+    }
+
+    if (total <= 0) return {}
+
+    const weights: Record<string, number> = {}
+    for (const term of terms) {
+      weights[term] = Number((raw[term] / total).toFixed(6))
+    }
+    return weights
+  }
+
+  /**
+   * Query terms after tokenisation and stopword removal — the unit both relevance
+   * scoring and term weighting operate on. Extracted so the two can never drift:
+   * an IDF weight keyed on a term the matcher never looks up is silently inert.
+   */
+  private extractQueryTerms(query: string): string[] {
+    if (!query) return []
+    // Drop stopwords and 1-char fragments so common filler does not inflate coverage.
+    const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'is', 'it'])
+    return Array.from(new Set(
+      query.trim().toLowerCase().split(/[^a-z0-9_.-]+/).filter(t => t.length > 1 && !STOP.has(t))
+    ))
+  }
+
+  /**
+   * Word-boundary occurrence count of one term in already-lowercased content.
+   *
+   * Bounded on BOTH sides. A leading \b alone still prefix-matches, so "timeout"
+   * would score against "timeoutvalue" — the substring defect this matcher exists to
+   * remove, in its prefix form.
+   *
+   * A short inflectional suffix is allowed so "timeout" matches "timeouts" and
+   * "abort" matches "aborted"; that is real recall, not accidental overlap. Terms
+   * ending in "e" get that "e" made optional so "route" also reaches "routing"
+   * (rout + ing). Anything beyond these suffixes must clear its own word boundary.
+   */
+  private countOccurrences(contentLower: string, term: string): number {
+    if (!contentLower || !term) return 0
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const stem = escaped.endsWith('e') ? `${escaped.slice(0, -1)}e?` : escaped
+    return (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length
+  }
+
+  /** Which query terms this entry actually contains — the per-result half of `_termWeights`. */
+  private matchedTerms(content: string, query: string): string[] {
+    if (!content) return []
+    const contentLower = String(content).toLowerCase()
+    return this.extractQueryTerms(query).filter(t => this.countOccurrences(contentLower, t) > 0)
+  }
+
+  /**
+   * Demote near-duplicates so one cluster of paraphrases cannot own the top-N.
+   *
+   * WHY: query "LRI binary parsing format" scored 0.0 on the retrieval baseline. The
+   * top five hits were all near-paraphrases of the SAME governance/process rule —
+   * the corpus holds 3+ close variants of it — and the single entry that actually
+   * described the binary format sat at ~8th. Every one of those five was individually
+   * a defensible hit; collectively they were one hit repeated, and they consumed the
+   * entire result window.
+   *
+   * Note this is a different problem from `deduplicateResults`, which collapses the
+   * same entry id arriving from several backends. These are genuinely distinct rows
+   * with distinct ids whose *content* is a rewording of each other.
+   *
+   * Measure: Jaccard over content-word token sets, vetoed by literal conflict. No
+   * embeddings, no model, O(n²) on a result set that is tens of items at most.
+   * Deliberately conservative — a missed duplicate costs one wasted slot, a wrongly
+   * collapsed pair costs a real answer:
+   *
+   *  - Threshold 0.50 of the combined vocabulary, sitting in the middle of a measured
+   *    gap. Against real corpus shapes, reworded variants of one rule land at
+   *    0.70-0.89, while distinct entries that merely share vocabulary top out at 0.27
+   *    (two different Ollama facts 0.04, two brand-colors entries 0.11, the
+   *    contradicting Phoenix camera-count entries 0.15, two steps of one procedure
+   *    0.19, two facts about kms_supersede 0.20, two distinct prose rules on one topic
+   *    0.27).
+   *  - LITERAL CONFLICT VETO. Two shapes defeat word overlap on its own: templated
+   *    one-liners ("service X listens on port N at host H" — 0.38 between entries about
+   *    entirely different services) and enumerated tables ("the refuse band starts at
+   *    0.88 / the confirm band runs 0.78 to 0.88" — 0.41, and they are not the same
+   *    fact). Both would otherwise sit uncomfortably close to the threshold, and both
+   *    are common in this corpus. What separates them from real paraphrases is that a
+   *    rewording preserves
+   *    the VALUES while a different fact changes them. So when both entries carry
+   *    literals — tokens holding a digit or an internal dot: numbers, versions, ports,
+   *    hostnames, filenames, hex offsets — and the smaller literal set is less than 60%
+   *    contained in the larger, the pair is never a duplicate no matter how much prose
+   *    it shares. Containment rather than Jaccard, so a paraphrase that simply drops a
+   *    detail is not vetoed. If either side has no literals the veto cannot fire.
+   *  - Entries with fewer than 8 content tokens are neither demoted nor allowed to
+   *    demote others. Jaccard is unstable on very short text — "Rich prefers dark
+   *    mode" vs "Rich prefers light mode" scores 0.75 while meaning opposite things —
+   *    so short entries are exempt in both directions.
+   *  - Single-linkage clustering: a candidate is compared against every member of a
+   *    cluster, not just its representative. Paraphrase chains drift, and variant 4 of
+   *    a rule is often closer to variant 2 than to the one that happened to rank first.
+   *  - Results are DEMOTED, never dropped. The cluster's best-scoring member keeps its
+   *    full score; the second gets 0.45x, the third 0.2x, and so on. A caller who
+   *    wants the variants can still page down to them, and `_duplicateOf` /
+   *    `_duplicateSimilarity` / `_duplicatePenalty` say exactly what happened.
+   *
+   * Input must already be sorted best-first: the first member of a cluster reached is
+   * the one kept at full score.
+   */
+  private suppressNearDuplicates(sorted: any[]): any[] {
+    const DUP_SIMILARITY = 0.50   // shared fraction of combined vocabulary
+    const MIN_TOKENS = 8          // below this, Jaccard is noise
+    const DEMOTE = 0.45           // multiplicative, compounding per extra cluster member
+
+    const clusters: Array<{ key: string, members: Array<{ tokens: Set<string>, literals: Set<string> }> }> = []
+
+    for (let i = 0; i < sorted.length; i++) {
+      const r = sorted[i]
+      r._duplicateOf = null
+      r._duplicateSimilarity = 0
+      r._duplicatePenalty = 1
+
+      const tokens = this.contentTokens(r.content)
+      if (tokens.size < MIN_TOKENS) continue
+      const literals = this.literalTokens(tokens)
+
+      let best: { key: string, members: Array<{ tokens: Set<string>, literals: Set<string> }> } | null = null
+      let bestSim = 0
+      for (const cluster of clusters) {
+        for (const member of cluster.members) {
+          if (this.literalsConflict(literals, member.literals)) continue
+          const sim = this.jaccard(tokens, member.tokens)
+          if (sim > bestSim) {
+            bestSim = sim
+            best = cluster
+          }
+        }
+      }
+
+      if (best && bestSim >= DUP_SIMILARITY) {
+        const penalty = Math.pow(DEMOTE, best.members.length)
+        best.members.push({ tokens, literals })
+        r._duplicateOf = best.key
+        r._duplicateSimilarity = Number(bestSim.toFixed(4))
+        r._duplicatePenalty = Number(penalty.toFixed(4))
+        r._score = Number((r._score * penalty).toFixed(4))
+      } else {
+        clusters.push({ key: r.id ?? `#${i}`, members: [{ tokens, literals }] })
+      }
+    }
+
+    // Stable re-sort: demoted members fall below the distinct entries they were
+    // crowding out, while untouched results keep their relative order.
+    return sorted.sort((a, b) => b._score - a._score)
+  }
+
+  /**
+   * Content-word token set for near-duplicate comparison.
+   *
+   * A wider stopword list than query-term extraction uses on purpose: function words
+   * are shared by *every* pair of English sentences, so leaving them in inflates
+   * Jaccard uniformly and pushes unrelated entries toward the threshold. Duplicate
+   * detection wants to compare what the entries are ABOUT.
+   */
+  private contentTokens(content: string): Set<string> {
+    if (!content) return new Set()
+    const STOP = new Set([
+      'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'is', 'it', 'be',
+      'are', 'was', 'were', 'been', 'as', 'at', 'by', 'with', 'from', 'that', 'this',
+      'these', 'those', 'but', 'not', 'no', 'do', 'does', 'did', 'has', 'have', 'had',
+      'will', 'would', 'can', 'could', 'should', 'must', 'may', 'if', 'then', 'than',
+      'so', 'such', 'all', 'any', 'each', 'its', 'we', 'you', 'they', 'them', 'their',
+      'our', 'us', 'via', 'per', 'into', 'onto', 'out', 'up', 'over', 'under', 'when',
+      'while', 'until', 'unless', 'also', 'only', 'just', 'more', 'most', 'other',
+      'there', 'here', 'how', 'what', 'which', 'who', 'why'
+    ])
+    const tokens = String(content).toLowerCase().split(/[^a-z0-9_.-]+/)
+    const out = new Set<string>()
+    for (const raw of tokens) {
+      // Trailing sentence punctuation rides along because "." and "-" are kept inside
+      // tokens (they have to be, for "0.88", "kms.yaker.org" and "read-only"). Trim it
+      // at the edges only, so "default." and "default" are the same word — and so the
+      // literal test below is not fooled into treating every sentence-final word as a
+      // dotted identifier.
+      const t = raw.replace(/^[.-]+/, '').replace(/[.-]+$/, '')
+      if (t.length <= 1 || STOP.has(t)) continue
+      // Fold trivial inflections so "modified"/"modify" style rewordings of one rule
+      // are not treated as different vocabulary.
+      out.add(t.replace(/(?:ing|ed|es|s)$/, ''))
+    }
+    return out
+  }
+
+  /**
+   * The subset of tokens that carry a VALUE rather than prose: anything with a digit
+   * (8180, 0.88, 32-byte, 0x10, v2) or an internal dot (kms.yaker.org, sparrowdb.node,
+   * metadata.subject). These are what a reworded entry preserves and a different fact
+   * changes — see the literal-conflict veto in `suppressNearDuplicates`.
+   */
+  private literalTokens(tokens: Set<string>): Set<string> {
+    const out = new Set<string>()
+    for (const t of tokens) {
+      if (/\d/.test(t) || t.includes('.')) out.add(t)
+    }
+    return out
+  }
+
+  /**
+   * True when two entries cite materially different values, which rules out their
+   * being rewordings of each other.
+   *
+   * Containment of the smaller set in the larger, not Jaccard: a paraphrase is allowed
+   * to drop details ({0.88} inside {0.88, 0.85} is not a conflict), but it may not
+   * substitute them ({8180} vs {9102} is). If either side cites no literals at all
+   * there is nothing to compare and the veto stays silent.
+   */
+  private literalsConflict(a: Set<string>, b: Set<string>): boolean {
+    if (a.size === 0 || b.size === 0) return false
+    const MIN_CONTAINMENT = 0.6
+    const [small, large] = a.size <= b.size ? [a, b] : [b, a]
+    let shared = 0
+    for (const t of small) if (large.has(t)) shared++
+    return (shared / small.size) < MIN_CONTAINMENT
+  }
+
+  /** |A ∩ B| / |A ∪ B|. Empty on either side means "no evidence of duplication". */
+  private jaccard(a: Set<string>, b: Set<string>): number {
+    if (a.size === 0 || b.size === 0) return 0
+    let intersection = 0
+    const [small, large] = a.size <= b.size ? [a, b] : [b, a]
+    for (const t of small) if (large.has(t)) intersection++
+    const union = a.size + b.size - intersection
+    return union === 0 ? 0 : intersection / union
   }
 
   /**
@@ -519,42 +823,51 @@ export class UnifiedSearchTool {
    * an *Ollama* timeout, because "timeout" appeared somewhere in the text. Coverage
    * (what fraction of query terms appear at all) is the dominant signal, with bounded
    * bonuses for repetition and for the full query appearing as a phrase.
+   *
+   * `termWeights` (optional) makes coverage WEIGHTED rather than uniform, so a rare,
+   * discriminating term counts for more of the score than boilerplate vocabulary the
+   * whole candidate set shares. See `computeTermWeights` for how they are derived and
+   * why. Omitted or empty → every term weighs 1, i.e. the original behaviour exactly;
+   * the function stays usable standalone on a single document with no candidate set.
    */
-  private calculateRelevance(content: string, query: string): number {
+  private calculateRelevance(content: string, query: string, termWeights?: Record<string, number>): number {
     if (!content || !query) return 0
 
     const contentLower = content.toLowerCase()
     const queryLower = query.trim().toLowerCase()
-    // Drop stopwords and 1-char fragments so common filler does not inflate coverage.
-    const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'is', 'it'])
-    const terms = Array.from(new Set(
-      queryLower.split(/[^a-z0-9_.-]+/).filter(t => t.length > 1 && !STOP.has(t))
-    ))
+    const terms = this.extractQueryTerms(query)
     if (terms.length === 0) return 0
 
-    let matched = 0
-    let density = 0
+    const weightFor = (term: string): number => {
+      if (termWeights && Object.prototype.hasOwnProperty.call(termWeights, term)) {
+        const w = termWeights[term]
+        // A legitimate 0 (term present in no candidate) must survive; only garbage
+        // falls back to the neutral weight.
+        if (typeof w === 'number' && Number.isFinite(w) && w >= 0) return w
+      }
+      return 1
+    }
+
+    let totalWeight = 0
+    let matchedWeight = 0
+    let densityWeight = 0
     for (const term of terms) {
-      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      // Bounded on BOTH sides. A leading \b alone still prefix-matches, so "timeout"
-      // would score against "timeoutvalue" — the substring defect this function exists
-      // to remove, in its prefix form.
-      //
-      // A short inflectional suffix is allowed so "timeout" matches "timeouts" and
-      // "abort" matches "aborted"; that is real recall, not accidental overlap. Terms
-      // ending in "e" get that "e" made optional so "route" also reaches "routing"
-      // (rout + ing). Anything beyond these suffixes must clear its own word boundary.
-      const stem = escaped.endsWith('e') ? `${escaped.slice(0, -1)}e?` : escaped
-      const occurrences = (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length
+      const weight = weightFor(term)
+      totalWeight += weight
+      const occurrences = this.countOccurrences(contentLower, term)
       if (occurrences > 0) {
-        matched++
+        matchedWeight += weight
         // Diminishing returns — a term repeated 20x is not 20x more relevant.
-        density += Math.min(occurrences, 5) / 5
+        densityWeight += weight * (Math.min(occurrences, 5) / 5)
       }
     }
 
-    const coverage = matched / terms.length          // how much of the query is present
-    const densityScore = density / terms.length      // how emphatically
+    // Every term weighed 0 → nothing in this query can discriminate. Score 0 rather
+    // than divide by zero.
+    if (totalWeight <= 0) return 0
+
+    const coverage = matchedWeight / totalWeight      // how much of the query is present
+    const densityScore = densityWeight / totalWeight  // how emphatically
 
     // Phrase bonus must be word-boundary matched too. A plain includes() would fire on
     // "value" inside "timeoutvalue" — the same substring bug this rewrite exists to fix,
