@@ -166,8 +166,40 @@ export class UnifiedSearchTool {
 
     // Sort by relevance and confidence
     const maxResults = query.options?.maxResults ?? 10
-    const sortedResults = this.rankResults(uniqueResults, args.query)
-      .slice(0, maxResults)
+    const rankedResults = this.rankResults(uniqueResults, args.query)
+    const sortedResults = rankedResults.slice(0, maxResults)
+
+    // Eval capture (KMS_EVAL_CAPTURE=1). Off by default and zero-cost when off.
+    //
+    // Why this exists: three baseline runs on 2026-08-01 measured retrieval getting
+    // WORSE after two ranking changes shipped (P@5 0.54 -> 0.43), and the cause could
+    // not be attributed — the ranker and the corpus had both changed, and every
+    // measurement only ever saw the ranker's OWN top-N. You cannot compare two rankers
+    // on a set that one of them selected.
+    //
+    // Capturing the deduplicated pool BEFORE slicing fixes that: any scorer can be
+    // replayed over the identical candidate set offline, so ranker changes become
+    // measurable instead of arguable.
+    const evalCapture = process.env.KMS_EVAL_CAPTURE === '1'
+      ? {
+          poolSize: uniqueResults.length,
+          rawCount: allResults.length,
+          candidates: rankedResults.map(r => ({
+            id: r.id,
+            content: r.content,
+            confidence: r.confidence,
+            timestamp: r.timestamp,
+            contentType: r.contentType,
+            sourceSystem: r.sourceSystem,
+            _sourceSystems: r._sourceSystems,
+            subject: r.metadata?.subject ?? null,
+            extractedBy: r.metadata?.extractedBy ?? null,
+            _score: r._score,
+            _relevance: r._relevance,
+            _recency: r._recency,
+          })),
+        }
+      : undefined
 
     const mergingTime = Date.now() - mergingStart
 
@@ -209,7 +241,8 @@ export class UnifiedSearchTool {
         totalTime: Date.now() - startTime
       },
       entity_context,
-      triggered_actions
+      triggered_actions,
+      ...(evalCapture ? { _evalCapture: evalCapture } : {})
     }
 
     // Step 5: Cache the results
