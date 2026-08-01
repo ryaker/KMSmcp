@@ -108,7 +108,22 @@ KMS has five corrective tools. Pick the right one:
 | Mark an entry partially wrong without replacing it | `kms_flag(id, 'RETRACTED' \| 'UNVERIFIED', note)` | Hides from default reads; original content preserved for audit. Pass `flag=null` to un-flag. |
 | Clean up old flagged entries past the reversibility window | `kms_reap({olderThanDays: 90, dryRun: true})` | Dry-run by default. Set `dryRun: false` to hard-delete. Admin operation. |
 
-**How this interacts with context injection**: `unified_search` (and the `kms-context-fetch.py` UserPromptSubmit hook that calls it) default-exclude flagged entries. The moment you supersede a wrong fact, it **stops leaking into every future session's context** automatically. Pass `options.includeFlagged: true` to see them (audit/reaper paths only).
+**How this interacts with context injection**: `unified_search` (and the `kms-context-fetch.py` UserPromptSubmit hook that calls it) default-exclude flagged entries, across all three backends including Mem0's fan-out shards. Superseding a wrong fact therefore stops it leaking into future sessions' context. Pass `options.includeFlagged: true` to see them (audit/reaper paths only).
+
+> This became true on 2026-08-01 (PR #91) and was **false** for the whole period before
+> it, in the way that mattered most. Mem0's extractor splits every `unified_store` write
+> into several "User described…" rows, each a separate searchable entry whose only link
+> back is `metadata.kms_id`. Mem0 has no flag concept, so `kms_supersede` / `kms_delete`
+> flagged the graph and MongoDB copies and left every shard live — and shards rank *well*,
+> because the extractor restates the source in query-like language. Measured immediately
+> after superseding 2 entries and deleting 5: three of those flagged parents still had 11
+> shards in the top-15 across six queries, serving the exact content the supersede was
+> written to retire. `searchMem0` now drops shards whose parent is flagged.
+>
+> Two things this still does **not** do. It does not make Mem0-only entries correctable —
+> those have no parent to flag (see the corrective-tools gap). And it does not stop the
+> fan-out generating new shards on every write, so one careful `unified_store` still
+> becomes several retrievable rows.
 
 **When in doubt, prefer `kms_supersede` over `kms_delete`**. The mistake is data — future you or a future agent might want to trace why a conclusion changed. Supersede preserves the chain; delete is for actual garbage.
 
