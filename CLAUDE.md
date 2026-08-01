@@ -264,12 +264,46 @@ literal or $parameter`. Use `executeWithParams` with `$emb`.
    unpublished), which overwrites `node_modules/sparrowdb/sparrowdb.node`. **A plain
    `npm ci` silently breaks vector support** until someone re-runs the build script.
 
-2. **Reads return `null` unless `id(k)` is projected first.** `MATCH (k) RETURN k.id`
-   yields `null`; `MATCH (k) RETURN id(k), k.id` yields the value. `_ensureInternalIdMap`
-   is accidentally immune because it happens to project `id(k)` first — any new query
-   that doesn't will silently read nulls. (Relatedly, the "SparrowDB truncates strings
-   to 7 chars" comment near `SparrowDBStorage.ts:586` is a misdiagnosis: full UUIDs
-   round-trip intact.)
+2. **A `RETURN` alias on a node scan reads the wrong property, or null.** In a plain
+   `MATCH (n:Label) … RETURN`, the engine resolves each property column by its
+   **output name**, not by the expression you projected:
+
+   | Query | Result |
+   |---|---|
+   | `MATCH (k:Knowledge) RETURN k.id` | correct |
+   | `MATCH (k:Knowledge) RETURN k.id AS id` | correct — alias equals the property name |
+   | `MATCH (k:Knowledge) RETURN k.id AS zzz` | `null` |
+   | `MATCH (k:Knowledge) RETURN k.id AS contentType` | **silently returns `k.contentType`** |
+
+   Projecting anything that materialises the node — `id(k)`, `labels(k)`, or the bare
+   variable `k`, in any position — restores correct resolution. Relationship-expansion
+   projections (`MATCH (a)-[r:T]->(b) RETURN a.id AS f`) are unaffected.
+
+   **Rule for new queries: project properties unaliased, or alias them to their own
+   property name.** `_ensureInternalIdMap` is safe because it projects `id(k)`.
+
+   Reproduction: `npx jest src/__tests__/SparrowDBBinding.reads.test.ts` — 15 assertions
+   against a real throwaway DB. Run it before writing anything else about SparrowDB
+   reads into this file.
+
+**Two claims that were in this section and were WRONG — do not reintroduce them:**
+
+- ~~"Reads return `null` unless `id(k)` is projected first."~~ False as stated, and
+  verified false 2026-07-31 on a scratch DB and on a copy of `~/.kms-sparrowdb-v2`:
+  `MATCH (k) RETURN k.id` and `MATCH (k) RETURN id(k), k.id` return **identical**
+  values — on the live copy, 2542 rows, 2497 non-null, same 45 nulls either way. Those
+  45 are genuinely property-less orphan nodes (internal ids 168–214, whole payload
+  `{col_0: 0}`), not a projection artifact. This claim is the alias defect above,
+  observed through an aliased query and then generalised to the wrong cause — which is
+  why one investigation saw nulls and another could not reproduce them.
+- ~~"SparrowDB truncates string properties to 7 characters on read."~~ False. Verified
+  three ways: scratch DB, live-store copy, and the exact query
+  `GraphEdgeIndex.readEdges()` issues (`MATCH (a)-[r:T]->(b) RETURN a.id, b.id,
+  r.strength` → whole 36-char UUIDs on both endpoints). On the live copy 2483 of 2497
+  readable ids are exactly 36 chars and **no** value of any length is 7 chars; the 14
+  shorter ones are genuinely short ids (`caryn_yaker`, `test-set-1778114586557`). This
+  one cost a prefix-matching resolver in `SparrowDBStorage` written to compensate for a
+  non-problem, plus two invalid review findings on PR #87. Removed in this PR.
 
 Before repeating any claim in this section, verify it — that is exactly how the
 superseded version above survived so long.
