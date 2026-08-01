@@ -454,6 +454,17 @@ export class UnifiedSearchTool {
       const rels = (base.relationships?.length ? base.relationships : other.relationships) ?? []
       if (rels.length) merged.relationships = rels
 
+      // entityRefs drive downstream entity-context linking (search()'s linkedEntityIds
+      // annotation and expandWithEntityContext). Union them the same way as relationships,
+      // or whichever copy loses on content length silently drops its refs.
+      const entityRefs = Array.from(new Set([
+        ...(base.metadata?.entityRefs ?? []),
+        ...(other.metadata?.entityRefs ?? []),
+      ]))
+      if (entityRefs.length) {
+        merged.metadata = { ...other.metadata, ...base.metadata, entityRefs }
+      }
+
       // Keep the stored confidence (the author's), not a per-backend match score.
       merged.confidence = Math.max(base.confidence ?? 0, other.confidence ?? 0)
 
@@ -565,9 +576,10 @@ export class UnifiedSearchTool {
     //
     // Damping is deliberately gentle and floored at 0.6: length correlates with
     // substance as well as with noise, and a hard penalty would bury genuinely
-    // detailed entries. A ~500-char entry is unpenalised; a 3,000-char one loses
-    // roughly a fifth of its score, enough to lose a tie to a short exact match
-    // without being excluded.
+    // detailed entries. A ~500-char entry is unpenalised; the floor activates at
+    // ~2,321 chars, past which every length flattens to the same 0.6 factor — a
+    // 3,000-char entry already sits on that floor, a 40% reduction, enough to
+    // lose a tie to a short exact match without being excluded.
     const len = content.length
     const NEUTRAL_LEN = 500
     const damping = len <= NEUTRAL_LEN

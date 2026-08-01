@@ -76,6 +76,25 @@ describe('UnifiedSearchTool.deduplicateResults', () => {
     expect(out.relationships).toHaveLength(1)
   })
 
+  it('keeps metadata.entityRefs when the copy that has them loses on content length', () => {
+    // Same failure mode as the relationships bug: entityRefs drive linkedEntityIds and
+    // expandWithEntityContext, so losing them on merge silently breaks entity linking.
+    const short = graphCopy({ metadata: { entityRefs: ['richard_yaker'] } })
+    const long = mongoCopy({
+      content: 'Ollama classify timeout raised to 8000ms after measuring 5219ms cold load',
+      metadata: {}
+    })
+    const [out] = dedupe([short, long])
+    expect(out.metadata.entityRefs).toEqual(['richard_yaker'])
+  })
+
+  it('unions entityRefs present on both copies without duplicates', () => {
+    const a = graphCopy({ metadata: { entityRefs: ['richard_yaker', 'susan_yaker'] } })
+    const b = mongoCopy({ metadata: { entityRefs: ['susan_yaker', 'tyler_sue_child'] } })
+    const [out] = dedupe([a, b])
+    expect(out.metadata.entityRefs.sort()).toEqual(['richard_yaker', 'susan_yaker', 'tyler_sue_child'])
+  })
+
   it('does not merge genuinely distinct entries', () => {
     const other = graphCopy({ id: 'different-id', content: 'unrelated fact' })
     expect(dedupe([graphCopy(), other])).toHaveLength(2)

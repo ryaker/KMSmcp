@@ -308,11 +308,22 @@ export class SparrowDBStorage implements StorageSystem {
     logger.debug(`⚡ Storing in SparrowDB: ${knowledge.id}`)
 
     // Delete any existing node (upsert via DELETE+CREATE, since MERGE+SET is unsupported).
+    // Mirrors delete(): SparrowDB refuses to DELETE a node with incident edges, so
+    // relationships must go first or the DELETE below throws (silently, into this
+    // catch), the stale node survives, and the CREATE further down duplicates it
+    // under the same id. removeNode() then keeps the in-memory adjacency in sync
+    // with what was just deleted from the graph.
+    try {
+      this.db.execute(
+        `MATCH (k:Knowledge {id: ${cypherStr(knowledge.id)}})-[r]-() DELETE r`
+      )
+    } catch { /* may have no relationships */ }
     try {
       this.db.execute(
         `MATCH (k:Knowledge {id: ${cypherStr(knowledge.id)}}) DELETE k`
       )
     } catch { /* node may not exist */ }
+    this._edges().removeNode(knowledge.id)
 
     const ts = knowledge.timestamp instanceof Date
       ? knowledge.timestamp.toISOString()
