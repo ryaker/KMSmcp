@@ -102,4 +102,27 @@ describe('metrics', () => {
   it('ndcg is 0 when nothing is labelled relevant', () => {
     expect(ndcgAtK(ordered, { '1': 0, '2': 0 }, 5)).toBe(0)
   })
+
+  it('rejects a negative k instead of silently slicing/dividing by it', () => {
+    expect(() => precisionAtK(ordered, labels, -1)).toThrow(RangeError)
+    expect(() => ndcgAtK(ordered, labels, -1)).toThrow(RangeError)
+    expect(() => metaShareAtK(ordered, -1)).toThrow(RangeError)
+  })
+
+  it('rejects a non-integer k instead of silently truncating the slice', () => {
+    expect(() => precisionAtK(ordered, labels, 2.5)).toThrow(RangeError)
+    expect(() => ndcgAtK(ordered, labels, 2.5)).toThrow(RangeError)
+    expect(() => metaShareAtK(ordered, 2.5)).toThrow(RangeError)
+  })
+
+  it('rejects a non-finite k (NaN/Infinity)', () => {
+    expect(() => precisionAtK(ordered, labels, NaN)).toThrow(RangeError)
+    expect(() => precisionAtK(ordered, labels, Infinity)).toThrow(RangeError)
+  })
+
+  it('k=0 is valid and yields 0, not a division-by-zero artifact', () => {
+    expect(precisionAtK(ordered, labels, 0)).toBe(0)
+    expect(ndcgAtK(ordered, labels, 0)).toBe(0)
+    expect(metaShareAtK(ordered, 0)).toBe(0)
+  })
 })

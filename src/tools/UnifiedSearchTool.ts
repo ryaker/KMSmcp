@@ -7,6 +7,15 @@ import { KnowledgeQuery } from '../types/index.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
 import type { GraphStorage } from '../types/index.js'
+import type { EvalCandidate } from '../eval/rankers.js'
+
+/** Shape of the KMS_EVAL_CAPTURE payload — the deduplicated, ranked pool captured
+ *  before `maxResults` slicing so a ranker can be replayed offline over the same set. */
+export interface EvalCapture {
+  poolSize: number
+  rawCount: number
+  candidates: EvalCandidate[]
+}
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -72,6 +81,8 @@ export class UnifiedSearchTool {
       name: string
       actions: string[]
     }>
+    // Present only when KMS_EVAL_CAPTURE=1 — the deduplicated pool pre-slicing.
+    _evalCapture?: EvalCapture
   }> {
     const startTime = Date.now()
     
@@ -105,12 +116,18 @@ export class UnifiedSearchTool {
       results: any[]
       totalFound: number
       sources: { mem0: number, graph: number, mongodb: number }
+      _evalCapture?: EvalCapture
     }>(cacheKey) : null
     const cacheCheckTime = Date.now() - cacheCheckStart
-    
-    if (cached && query.options?.cacheStrategy !== 'realtime') {
+    const wantsEvalCapture = process.env.KMS_EVAL_CAPTURE === '1'
+
+    // A cache entry written before KMS_EVAL_CAPTURE was set (or by a run with it off)
+    // has no _evalCapture. Serving it as a hit would silently hand the harness a
+    // response with no candidate pool. Treat that case as a miss so the full search
+    // path runs and captures fresh.
+    if (cached && query.options?.cacheStrategy !== 'realtime' && (!wantsEvalCapture || cached._evalCapture)) {
       debug(`⚡ CACHE HIT - Returning cached results`)
-      
+
       return {
         query: query.query,
         results: cached.results || [],
@@ -123,7 +140,8 @@ export class UnifiedSearchTool {
           searchTime: 0,
           mergingTime: 0,
           totalTime: Date.now() - startTime
-        }
+        },
+        ...(cached._evalCapture ? { _evalCapture: cached._evalCapture } : {})
       }
     }
 
@@ -180,7 +198,7 @@ export class UnifiedSearchTool {
     // Capturing the deduplicated pool BEFORE slicing fixes that: any scorer can be
     // replayed over the identical candidate set offline, so ranker changes become
     // measurable instead of arguable.
-    const evalCapture = process.env.KMS_EVAL_CAPTURE === '1'
+    const evalCapture: EvalCapture | undefined = wantsEvalCapture
       ? {
           poolSize: uniqueResults.length,
           rawCount: allResults.length,
@@ -468,11 +486,15 @@ export class UnifiedSearchTool {
 
     for (const result of results) {
       // Use ID if available, otherwise use content hash
+      // Every merged/inserted entry gets a stable string id, even when the source
+      // backend supplied none — callers (the eval capture in particular) join
+      // candidates back to relevance labels by id, so `undefined` here makes an
+      // entry silently unjoinable.
       const key = result.id || crypto.createHash('md5').update(result.content).digest('hex')
       const existing = unique.get(key)
 
       if (!existing) {
-        unique.set(key, result)
+        unique.set(key, result.id ? result : { ...result, id: key })
         continue
       }
 
@@ -480,7 +502,7 @@ export class UnifiedSearchTool {
       const base = (result.content?.length ?? 0) > (existing.content?.length ?? 0) ? result : existing
       const other = base === result ? existing : result
 
-      const merged: any = { ...other, ...base }
+      const merged: any = { ...other, ...base, id: base.id || other.id || key }
 
       // Union the fields that only some backends populate, preferring whichever
       // copy actually has them rather than whichever copy won on content length.
@@ -490,13 +512,18 @@ export class UnifiedSearchTool {
       // entityRefs drive downstream entity-context linking (search()'s linkedEntityIds
       // annotation and expandWithEntityContext). Union them the same way as relationships,
       // or whichever copy loses on content length silently drops its refs.
+      //
+      // metadata itself is merged unconditionally (not only when entityRefs is
+      // non-empty) — subject/extractedBy are per-copy fields too, and the eval capture
+      // reads them straight off this merged object. Merging only on the entityRefs
+      // branch meant a subject/extractedBy present solely on the losing copy was
+      // dropped whenever neither copy had entityRefs.
       const entityRefs = Array.from(new Set([
         ...(base.metadata?.entityRefs ?? []),
         ...(other.metadata?.entityRefs ?? []),
       ]))
-      if (entityRefs.length) {
-        merged.metadata = { ...other.metadata, ...base.metadata, entityRefs }
-      }
+      merged.metadata = { ...other.metadata, ...base.metadata }
+      if (entityRefs.length) merged.metadata.entityRefs = entityRefs
 
       // Keep the stored confidence (the author's), not a per-backend match score.
       merged.confidence = Math.max(base.confidence ?? 0, other.confidence ?? 0)

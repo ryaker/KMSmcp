@@ -67,7 +67,20 @@ export const shippedRanker: Ranker = candidates =>
 /** Relevance labels for one query: id -> 1 (relevant) | 0 (marginal/irrelevant). */
 export type Labels = Record<string, number>
 
+/**
+ * This is a measurement harness — a metric that silently returns NaN/Infinity on a bad
+ * `k` is worse than one that throws, because a bad number gets trusted and reported as
+ * if it meant something. Reject negative and non-integer k consistently rather than
+ * letting `slice`/division absorb it silently.
+ */
+function validateK(k: number): void {
+  if (!Number.isInteger(k) || k < 0) {
+    throw new RangeError(`k must be a non-negative integer, got ${k}`)
+  }
+}
+
 export function precisionAtK(ordered: EvalCandidate[], labels: Labels, k: number): number {
+  validateK(k)
   const top = ordered.slice(0, k)
   if (!top.length) return 0
   return top.filter(c => labels[c.id] === 1).length / k
@@ -84,6 +97,7 @@ export function reciprocalRank(ordered: EvalCandidate[], labels: Labels): number
  * comparing orderings over an identical pool, which is exactly this harness's job.
  */
 export function ndcgAtK(ordered: EvalCandidate[], labels: Labels, k: number): number {
+  validateK(k)
   const dcg = ordered.slice(0, k).reduce(
     (acc, c, i) => acc + (labels[c.id] === 1 ? 1 / Math.log2(i + 2) : 0), 0)
   const nRelevant = Object.values(labels).filter(v => v === 1).length
@@ -94,6 +108,7 @@ export function ndcgAtK(ordered: EvalCandidate[], labels: Labels, k: number): nu
 
 /** Share of the top-k that is meta/self-referential rather than domain knowledge. */
 export function metaShareAtK(ordered: EvalCandidate[], k: number): number {
+  validateK(k)
   const top = ordered.slice(0, k)
   if (!top.length) return 0
   const isMeta = (c: EvalCandidate) =>

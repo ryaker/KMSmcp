@@ -106,6 +106,49 @@ describe('UnifiedSearchTool.deduplicateResults', () => {
     expect(dedupe([a, b])).toHaveLength(1)
   })
 
+  it('carries the content-hash fallback key onto the merged object as a string id', () => {
+    // The eval capture joins candidates back to relevance labels by `.id`. If the
+    // fallback hash is only ever used as the internal Map key and never written back
+    // onto the object, every id-less candidate comes out with `id: undefined` and is
+    // unjoinable — silently defeating the harness.
+    const a = { content: 'same text', confidence: 0.5, sourceSystem: 'graph' }
+    const b = { content: 'same text', confidence: 0.9, sourceSystem: 'mongodb' }
+    const [out] = dedupe([a, b])
+    expect(typeof out.id).toBe('string')
+    expect(out.id.length).toBeGreaterThan(0)
+  })
+
+  it('backfills a string id even for a single id-less entry (no merge occurs)', () => {
+    const [out] = dedupe([{ content: 'lonely entry', confidence: 1, sourceSystem: 'mem0' }])
+    expect(typeof out.id).toBe('string')
+    expect(out.id.length).toBeGreaterThan(0)
+  })
+
+  it('preserves metadata.subject and metadata.extractedBy from the losing copy even when neither copy has entityRefs', () => {
+    // Previously the merged metadata object was only assigned when entityRefs was
+    // non-empty; with no entityRefs at all, metadata came solely from the "base" (the
+    // longer-content) copy, silently dropping subject/extractedBy carried only by the
+    // shorter copy. metaShareAtK reads exactly these fields off the eval capture.
+    const short = graphCopy({ metadata: { subject: 'KMS.retrieval.audit', extractedBy: 'kms-session-extract' } })
+    const long = mongoCopy({
+      content: 'Ollama classify timeout raised to 8000ms after measuring 5219ms cold load',
+      metadata: {}
+    })
+    const [out] = dedupe([short, long])
+    expect(out.metadata.subject).toBe('KMS.retrieval.audit')
+    expect(out.metadata.extractedBy).toBe('kms-session-extract')
+  })
+
+  it('lets the base (longer-content) copy win a genuine subject/extractedBy conflict', () => {
+    const short = graphCopy({ metadata: { subject: 'old.subject' } })
+    const long = mongoCopy({
+      content: 'Ollama classify timeout raised to 8000ms after measuring 5219ms cold load',
+      metadata: { subject: 'new.subject' }
+    })
+    const [out] = dedupe([short, long])
+    expect(out.metadata.subject).toBe('new.subject')
+  })
+
   it('handles an empty input', () => {
     expect(dedupe([])).toEqual([])
   })
