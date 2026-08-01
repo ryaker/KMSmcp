@@ -12,15 +12,41 @@
  *
  * Known SparrowDB constraints handled here:
  *
- *   STRING TRUNCATION (current build limitation):
- *     The current sparrowdb.node binary truncates string property values to 7
- *     characters when decoding from the CSR node store. This is a bug in the
- *     NAPI value decoding path (tracked as SPA issue). Workaround: all full-
- *     length string content is stored in a JSON sidecar file (`content-index.json`)
- *     alongside the SparrowDB directory. The sidecar is loaded at startup and
- *     consulted for search. Graph structure (IDs, labels, relationships, short
- *     metadata) is stored in SparrowDB itself.
+ *   CONTENT SIDECAR (not a truncation workaround):
+ *     Full entry content lives in a JSON sidecar (`content-index.json`) beside
+ *     the SparrowDB directory, loaded at startup and consulted for search.
+ *     The reason is that this build has no Node-reachable fulltext index
+ *     (see below), not that SparrowDB mangles strings. Graph structure (IDs,
+ *     labels, relationships, short metadata) lives in SparrowDB itself, and
+ *     sidecar lookups are exact by id — the graph stores whole ids.
  *
+ *     There is NO 7-character string truncation. A comment here used to claim
+ *     the NAPI decode path truncated string properties to 7 chars; it was a
+ *     misdiagnosis and it cost real work (a prefix-matching "resolver" written
+ *     to compensate, plus two invalid review findings on PR #87). Verified
+ *     2026-07-31 three ways — scratch DB, a copy of the live store, and the
+ *     exact query GraphEdgeIndex.readEdges() issues:
+ *       MATCH (k:Knowledge) RETURN k.id            → full 36-char UUIDs
+ *       MATCH (a)-[r:R]->(b) RETURN a.id, b.id     → full UUIDs on both ends
+ *     On the live store (2542 Knowledge nodes) 2483 ids read back at exactly
+ *     36 chars and not one value of any length is 7 chars. Ids shorter than 36
+ *     are genuinely short ids (`caryn_yaker`, `test-set-1778114586557`), not
+ *     clipped UUIDs.
+ *
+ *   - RETURN aliases on a node-scan projection read the WRONG property, or
+ *     null. In a plain `MATCH (n:Label) … RETURN` the engine resolves each
+ *     property column by its OUTPUT NAME, not by the projected expression:
+ *       RETURN k.id                       → correct
+ *       RETURN k.id AS id                 → correct (alias == property name)
+ *       RETURN k.id AS zzz                → null
+ *       RETURN k.id AS contentType        → silently returns k.contentType (!)
+ *     Adding anything that forces the node to materialise — `id(k)`,
+ *     `labels(k)`, or the bare node variable `k`, in any position — makes
+ *     aliases resolve correctly, which is why `_ensureInternalIdMap` (it
+ *     projects `id(k)`) is unaffected. Relationship-expansion projections
+ *     (`MATCH (a)-[r:T]->(b) RETURN a.id AS f`) are unaffected too. Rule for
+ *     new queries here: either project properties unaliased, or alias them to
+ *     their own property name.
  *   - Floats are bit-cast to i64 when stored via literal float syntax;
  *     workaround: store confidence as a string property.
  *   - No MERGE … SET support — upserts use DELETE + CREATE.
@@ -595,21 +621,22 @@ export class SparrowDBStorage implements StorageSystem {
   private _ensureInternalIdMap(): void {
     if (this.internalIdMapLoaded) return
     try {
+      // `id(k)` is load-bearing twice over: it is the key we are mapping, and
+      // its presence is what makes the aliased `k.id` column resolve at all
+      // (see the RETURN-alias note in the file header).
       const res = this.db.execute(
-        `MATCH (k:Knowledge) RETURN id(k) AS nid, k.id AS short_id`
+        `MATCH (k:Knowledge) RETURN id(k) AS nid, k.id AS node_id`
       )
       for (const row of res.rows) {
         const nid = row['nid']
-        const shortId = row['short_id']
+        const uuid = row['node_id']
         if (nid === null || nid === undefined) continue
-        const internalId = String(nid)
-        const prefix = String(shortId ?? '')
-        // Resolve possibly-truncated short_id to the full UUID via sidecar prefix lookup.
-        // SparrowDB 0.1.22 truncates string properties to 7 chars on read; the sidecar
-        // is the authoritative source for full UUIDs.
-        const entry = this._findEntryByPrefix(prefix)
+        // The graph stores whole ids, so this is an exact sidecar lookup. Nodes
+        // absent from the sidecar stay unmapped: a vector hit we cannot join to
+        // content is not returnable anyway.
+        const entry = this.contentIndex.get(String(uuid ?? ''))
         if (entry) {
-          this.internalIdToUuid.set(internalId, entry.id)
+          this.internalIdToUuid.set(String(nid), entry.id)
         }
       }
       this.internalIdMapLoaded = true
@@ -1120,7 +1147,9 @@ export class SparrowDBStorage implements StorageSystem {
       )
       const totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0)
 
-      // Content type distribution from sidecar (authoritative — SparrowDB strings truncated).
+      // Content type distribution from the sidecar: it is the only place every
+      // entry's contentType is guaranteed present (the graph node carries it
+      // only for entries written through the current upsert path).
       const contentTypes: Record<string, number> = {}
       for (const entry of this.contentIndex.values()) {
         contentTypes[entry.contentType] = (contentTypes[entry.contentType] ?? 0) + 1
@@ -1201,14 +1230,8 @@ export class SparrowDBStorage implements StorageSystem {
         `MATCH (n:Person) WHERE toLower(n.name) CONTAINS '${safeNorm}' RETURN n.id LIMIT 5`
       )
       if (partial.rows.length === 1) {
-        const rawId = String(partial.rows[0]['n.id'] ?? '').trim()
-        if (!rawId) return null
-        // SparrowDB may truncate string properties to 7 chars — try to expand prefix
-        if (this.knownPeople && rawId.length <= 7) {
-          const matches = Object.keys(this.knownPeople.people).filter(id => id.startsWith(rawId))
-          if (matches.length === 1) return matches[0]
-        }
-        return rawId || null
+        // Whole id — the graph does not clip strings.
+        return String(partial.rows[0]['n.id'] ?? '').trim() || null
       }
     } catch (e) {
       logger.warn('⚠️ SparrowDB resolvePersonId search error:', e)
@@ -1252,13 +1275,14 @@ export class SparrowDBStorage implements StorageSystem {
           const edgeStrength = rawStrength != null
             ? Math.round(parseFloatSafe(rawStrength)) / 100
             : undefined
-          // rawId may be truncated to 7 chars — use prefix search to
-          // resolve all matching sidecar entries.
-          const matches = this._findAllEntriesByPrefix(rawId)
-          const toProcess: ContentEntry[] = matches.length > 0
-            ? matches
-            : [{ id: rawId, content: '', confidence: 0, contentType: '',
-                 source: '', userId: '', timestamp: '', metadata: {} }]
+          // rawId is the neighbour's whole id. Traverse it even when the
+          // sidecar has no entry — the edge is still a real hop — but do not
+          // invent extra neighbours for it.
+          const match = this.contentIndex.get(rawId)
+          const toProcess: ContentEntry[] = [
+            match ?? { id: rawId, content: '', confidence: 0, contentType: '',
+                       source: '', userId: '', timestamp: '', metadata: {} }
+          ]
 
           for (const fullEntry of toProcess) {
             const fullId = fullEntry.id
@@ -1305,7 +1329,7 @@ export class SparrowDBStorage implements StorageSystem {
       } catch { continue }
       if (result.rows.length === 0) continue
 
-      // Strings from SparrowDB are truncated — use sidecar for content where available.
+      // Content comes from the sidecar; the graph node holds structure only.
       const summary: Record<string, any> = {
         id,
         name: entry?.content?.split(' ').slice(0, 3).join(' ') ?? null,
@@ -1324,7 +1348,7 @@ export class SparrowDBStorage implements StorageSystem {
         summary.top_relationships = rels.rows
           .map(r => {
             const mid = String(r['m.id'] ?? '')
-            const related = this._findEntryByPrefix(mid)
+            const related = this.contentIndex.get(mid)
             return related
               ? { rel: 'RELATED_TO', name: related.content.slice(0, 40), id: related.id }
               : null
@@ -1370,8 +1394,7 @@ export class SparrowDBStorage implements StorageSystem {
         )
         for (const row of r.rows) {
           const nodeId = String(row['n.id'] ?? '')
-          // Resolve full strings from sidecar.
-          const entry = this._findEntryByPrefix(nodeId)
+          const entry = this.contentIndex.get(nodeId)
           results.push({
             id: entry?.id ?? nodeId,
             type: String(row['n.type'] ?? label),
@@ -1407,7 +1430,7 @@ export class SparrowDBStorage implements StorageSystem {
         for (const row of r.rows) {
           const rawId = String(row['n.id'] ?? '')
           if (!rawId) continue
-          const entry = this._findEntryByPrefix(rawId)
+          const entry = this.contentIndex.get(rawId)
           const id = entry?.id ?? rawId
           const name = String(row['n.name'] ?? entry?.content?.split(' ')[0] ?? '')
           if (!name) continue
@@ -1465,40 +1488,6 @@ export class SparrowDBStorage implements StorageSystem {
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
-
-  /**
-   * Find a sidecar entry whose ID starts with the (possibly truncated) prefix.
-   * Returns the first match. When multiple IDs share the same 7-char prefix,
-   * disambiguation is impossible — this is a known limitation of the current
-   * SparrowDB build's 7-char string truncation.
-   */
-  private _findEntryByPrefix(prefix: string): ContentEntry | undefined {
-    if (!prefix) return undefined
-    // Exact match first.
-    if (this.contentIndex.has(prefix)) return this.contentIndex.get(prefix)
-    // Prefix search (handles 7-char truncation from SparrowDB native binding).
-    for (const [key, entry] of this.contentIndex) {
-      if (key.startsWith(prefix)) return entry
-    }
-    return undefined
-  }
-
-  /**
-   * Find ALL sidecar entries whose ID starts with the given prefix.
-   * Used by findRelated to handle ambiguous 7-char truncated IDs.
-   */
-  private _findAllEntriesByPrefix(prefix: string): ContentEntry[] {
-    if (!prefix) return []
-    if (this.contentIndex.has(prefix)) {
-      const e = this.contentIndex.get(prefix)
-      return e ? [e] : []
-    }
-    const matches: ContentEntry[] = []
-    for (const [key, entry] of this.contentIndex) {
-      if (key.startsWith(prefix)) matches.push(entry)
-    }
-    return matches
-  }
 
   private async _createRelationship(
     sourceId: string,
@@ -1562,7 +1551,7 @@ export class SparrowDBStorage implements StorageSystem {
     if (!this.edgeIndex) {
       this.edgeIndex = new GraphEdgeIndex(
         this.db,
-        (id: string) => this._findEntryByPrefix(id),
+        (id: string) => this.contentIndex.get(id),
         { debug: (m: string) => logger.debug(`⚡ SparrowDB ${m}`) }
       )
     }
