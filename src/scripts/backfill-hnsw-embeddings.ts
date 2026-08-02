@@ -390,15 +390,15 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     log('  bootout alone is not enough: the job has KeepAlive=true, so')
     log('  launchd will relaunch it. Disable it first.')
     log('')
-    log('    launchctl disable gui/501/com.ryaker.kms-mcp')
-    log('    launchctl bootout  gui/501/com.ryaker.kms-mcp')
+    log(`    launchctl disable gui/501/${DAEMON_LABEL}`)
+    log(`    launchctl bootout  gui/501/${DAEMON_LABEL}`)
     log('    sleep 10 && /usr/sbin/lsof -nP -i :8180 || echo CLEAR')
     log('')
     log('  Wait for CLEAR, then re-run this script. Afterwards:')
     log('')
-    log('    launchctl enable    gui/501/com.ryaker.kms-mcp')
+    log(`    launchctl enable    gui/501/${DAEMON_LABEL}`)
     log('    launchctl bootstrap gui/501 \\')
-    log('      ~/Library/LaunchAgents/com.ryaker.kms-mcp.plist')
+    log(`      ~/Library/LaunchAgents/${DAEMON_LABEL}.plist`)
     log('')
     return {
       total: 0,
@@ -416,7 +416,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
   // OS-level daemon check. Skip in dry-run since we don't write.
   const daemonProbe = opts.isDaemonRunning ?? defaultIsDaemonRunning
   if (!opts.dryRun && daemonProbe()) {
-    return failOpen('Daemon (com.ryaker.kms-mcp) is currently running:', 'launchctl reports active state')
+    return failOpen(`Daemon (${DAEMON_LABEL}) is currently running:`, 'launchctl reports active state')
   }
 
   let db: SparrowDBLike
@@ -516,7 +516,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     lastWriterCheck = Date.now()
     try {
       if (daemonProbe()) {
-        competingWriter = 'launchd daemon com.ryaker.kms-mcp reappeared mid-run'
+        competingWriter = `launchd daemon ${DAEMON_LABEL} reappeared mid-run`
       }
     } catch {
       // A probe that cannot answer is not evidence of a writer. Keep going —
@@ -729,12 +729,20 @@ async function defaultOpener(path: string): Promise<SparrowDBLike> {
  * (manual `node dist/index.js`), the operator can still pass
  * `KMS_BACKFILL_FORCE=1` to bypass.
  */
+/**
+ * launchd label of the process that competes for the SparrowDB writer.
+ * Overridable so the competing-writer path can be exercised end-to-end against a
+ * throwaway job instead of the production daemon — a stubbed probe proves the
+ * abort logic but proves nothing about whether launchctl parsing actually works.
+ */
+export const DAEMON_LABEL = process.env.KMS_DAEMON_LABEL || 'com.ryaker.kms-mcp'
+
 function defaultIsDaemonRunning(): boolean {
   if (process.env.KMS_BACKFILL_FORCE === '1') return false
   try {
     const uid = process.getuid?.() ?? 501
     const out = execSync(
-      `launchctl print "gui/${uid}/com.ryaker.kms-mcp"`,
+      `launchctl print "gui/${uid}/${DAEMON_LABEL}"`,
       { stdio: ['ignore', 'pipe', 'ignore'] }
     ).toString()
     // launchctl prints `state = running` (or `not running`). Treat anything
