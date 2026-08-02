@@ -197,7 +197,10 @@ export class UnifiedKMSServer {
     console.log('🛠️  Initializing Tools...')
     this.tools = {
       store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue, embeddingService, llmJudge),
-      search: new UnifiedSearchTool(this.storage, this.factCache),
+      // The search tool shares the store tool's embedder so the hybrid retrieval arm
+      // (KMS_HYBRID_RETRIEVAL=1, default off) reuses one `isAvailable()` probe cache
+      // instead of re-probing Ollama on every search.
+      search: new UnifiedSearchTool(this.storage, this.factCache, embeddingService),
       instructions: new KMSInstructionsTool(),
       documentStore: new DocumentStoreTool(this.storage.mongodb)
     }
