@@ -295,10 +295,26 @@ export class SparrowDBStorage implements StorageSystem {
    * so it cannot quarantine the index it is measuring. Verified by execution.
    */
   getVectorIndexHealth(): VectorIndexHealthReport {
+    // Count the nodes that SHOULD carry a vector, from the GRAPH not the index.
+    // This is the only signal that catches embeddings which never reached the
+    // index at all — every other signal is index-derived, so an index that simply
+    // never received the data looks perfectly healthy to all of them.
+    let expected: number | null = null
+    try {
+      const rows = (this.db as any).execute(
+        `MATCH (k:${SparrowDBStorage.VECTOR_LABEL}) RETURN count(k)`
+      )?.rows
+      const v = rows?.[0] && Object.values(rows[0])[0]
+      if (typeof v === 'number') expected = v
+    } catch {
+      // Corpus count is best-effort; its absence must not break the probe.
+    }
+
     return probeVectorIndex(
       this.db as any,
       SparrowDBStorage.VECTOR_LABEL,
       SparrowDBStorage.VECTOR_PROPERTY,
+      expected,
     )
   }
 

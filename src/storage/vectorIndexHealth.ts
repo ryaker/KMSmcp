@@ -49,6 +49,18 @@ export type VectorIndexStatus =
 
 export interface VectorIndexHealthReport {
   status: VectorIndexStatus
+  /**
+   * Nodes that SHOULD carry a vector, counted from the graph rather than the index.
+   *
+   * SparrowDB's signal 4, and the only one that catches writes which never reached
+   * the index at all — the "Succeeded: 282, actually 3" class, where the backfill
+   * reported success because addToVectorIndex returns void. Every other signal is
+   * derived from the index, so an index that simply never received the data looks
+   * perfectly healthy to all of them. Null when the node count is unavailable.
+   */
+  expected?: number | null
+  /** stored / expected. Null unless both are known. */
+  coverage?: number | null
   /** Vectors the index holds. Null when only the fallback probe was available. */
   stored: number | null
   /** Vectors greedy search can actually reach. */
@@ -78,6 +90,15 @@ export interface VectorIndexProbeTarget {
  */
 export const UNREACHABLE_ALERT_FRACTION = 0.05
 
+/**
+ * Minimum stored/expected ratio before reporting 'degraded'.
+ *
+ * 0.80 because coverage is legitimately imperfect — ~185 sidecar orphans have no
+ * graph node, some entries are too short to embed, and a backfill in progress is
+ * transiently low. Below 80% something is systematically not landing.
+ */
+export const COVERAGE_ALERT_FRACTION = 0.80
+
 const PROBE_DIMENSIONS = 768
 const PROBE_TOP_K = 100_000
 
@@ -92,24 +113,62 @@ export function probeVectorIndex(
   db: VectorIndexProbeTarget | null | undefined,
   label: string,
   property: string,
+  /** Nodes that should have a vector. Counted from the graph, not the index. */
+  expected?: number | null,
 ): VectorIndexHealthReport {
-  if (!db) {
-    return { status: 'unknown', stored: null, reachable: null, unreachable: null, precise: false,
-      alert: 'vector index probe skipped: no graph handle' }
-  }
+  const base = rawProbe(db, label, property)
+  const exp = expected ?? null
+  // Prefer `stored`; fall back to `reachable`. On the binding we run today
+  // `stored` is unavailable, and without a fallback the coverage signal would be
+  // permanently null in production — i.e. present in the code and absent in
+  // reality, which is the failure this whole file exists to prevent. `reachable`
+  // is a strictly conservative proxy: it is <= stored, so it can only over-report
+  // a problem, never hide one. It would have caught the actual incident, where
+  // 1306 of 2595 nodes were retrievable.
+  const counted = base.stored ?? base.reachable
+  const coverage = exp && exp > 0 && counted != null ? counted / exp : null
+  const out: VectorIndexHealthReport = { ...base, expected: exp, coverage }
 
-  // Preferred path — SparrowDB >= 1d5cec1. Verified safe against a live store:
-  // it routes through get_vector_index(), a pure RwLock read with zero I/O, so it
+  // Coverage can only downgrade a report, never upgrade one. An index that is
+  // present and internally consistent but holds a fraction of the corpus is the
+  // "Succeeded: 282, actually 3" state — invisible to every index-derived signal,
+  // because the index is perfectly healthy; it simply never received the data.
+  if (out.status === 'ok' && coverage != null && coverage < COVERAGE_ALERT_FRACTION) {
+    out.status = 'degraded'
+    out.alert =
+      `vector index (${label}, ${property}) COVERAGE LOW: ${counted} ` +
+      `${base.stored != null ? 'stored' : 'reachable'} vectors for ${exp} nodes ` +
+      `(${(coverage * 100).toFixed(1)}%). Embeddings are not reaching the index. Note that ` +
+      `addToVectorIndex returns void, so a writer can report success while storing nothing — ` +
+      `always verify against the index, never against the writer's own success count.`
+  }
+  return out
+}
+
+/** The index-derived half of the probe, before coverage is folded in. */
+function rawProbe(
+  db: VectorIndexProbeTarget | null | undefined,
+  label: string,
+  property: string,
+): VectorIndexHealthReport {
+  const unknown = (alert: string): VectorIndexHealthReport =>
+    ({ status: 'unknown', stored: null, reachable: null, unreachable: null, precise: false, alert })
+  const missing = (stored: number | null, precise: boolean): VectorIndexHealthReport =>
+    ({ status: 'missing', stored, reachable: stored === null ? null : 0, unreachable: null,
+       precise, alert: missingAlert(label, property) })
+
+  if (!db) return unknown('vector index probe skipped: no graph handle')
+
+  // Preferred path — SparrowDB >= 1d5cec1. Verified safe against a live store: it
+  // routes through get_vector_index(), a pure RwLock read with zero I/O, so it
   // cannot quarantine or otherwise mutate the index it is measuring.
   if (typeof db.vectorIndexHealth === 'function') {
     try {
       const h = db.vectorIndexHealth(label, property)
-      const { stored, reachable } = h
+      const stored = h.stored
+      const reachable = h.reachable
       const unreachable = h.unreachable ?? stored - reachable
-      if (stored === 0) {
-        return { status: 'missing', stored, reachable, unreachable, precise: true,
-          alert: missingAlert(label, property) }
-      }
+      if (stored === 0) return missing(0, true)
       if (unreachable / stored > UNREACHABLE_ALERT_FRACTION) {
         return { status: 'degraded', stored, reachable, unreachable, precise: true,
           alert:
@@ -120,43 +179,31 @@ export function probeVectorIndex(
       }
       return { status: 'ok', stored, reachable, unreachable, precise: true }
     } catch (e) {
-      // SparrowDB throws "no vector index on (L, p); call createVectorIndex first"
-      // when nothing is registered — which is exactly #451 step 3.
       const msg = e instanceof Error ? e.message : String(e)
-      if (/no vector index/i.test(msg)) {
-        return { status: 'missing', stored: 0, reachable: 0, unreachable: 0, precise: true,
-          alert: missingAlert(label, property) }
-      }
-      return { status: 'unknown', stored: null, reachable: null, unreachable: null, precise: false,
-        alert: `vector index probe failed for (${label}, ${property}): ${msg}` }
+      // SparrowDB throws "no vector index on (L, p); call createVectorIndex first"
+      // when nothing is registered — exactly #451 step 3.
+      if (/no vector index/i.test(msg)) return missing(0, true)
+      return unknown(`vector index probe failed for (${label}, ${property}): ${msg}`)
     }
   }
 
-  // Fallback for the binding we actually run today. It cannot see `stored`, so it
-  // cannot compute unreachable — but it still catches the missing-index case,
+  // Fallback for the binding we run today. It cannot see `stored`, so it cannot
+  // compute unreachable or coverage — but it still catches the missing case,
   // which is the one that silently eats writes.
   if (typeof db.vectorSearch === 'function') {
     try {
       const hits = db.vectorSearch(label, property, new Float32Array(PROBE_DIMENSIONS).fill(0.01), PROBE_TOP_K)
       const reachable = Array.isArray(hits) ? hits.length : 0
-      if (reachable === 0) {
-        return { status: 'missing', stored: null, reachable: 0, unreachable: null, precise: false,
-          alert: missingAlert(label, property) }
-      }
+      if (reachable === 0) return missing(null, false)
       return { status: 'ok', stored: null, reachable, unreachable: null, precise: false }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      if (/no vector index/i.test(msg)) {
-        return { status: 'missing', stored: null, reachable: null, unreachable: null, precise: false,
-          alert: missingAlert(label, property) }
-      }
-      return { status: 'unknown', stored: null, reachable: null, unreachable: null, precise: false,
-        alert: `vector index probe failed for (${label}, ${property}): ${msg}` }
+      if (/no vector index/i.test(msg)) return missing(null, false)
+      return unknown(`vector index probe failed for (${label}, ${property}): ${msg}`)
     }
   }
 
-  return { status: 'unknown', stored: null, reachable: null, unreachable: null, precise: false,
-    alert: 'vector index probe unavailable: binding exposes neither vectorIndexHealth nor vectorSearch' }
+  return unknown('vector index probe unavailable: binding exposes neither vectorIndexHealth nor vectorSearch')
 }
 
 function missingAlert(label: string, property: string): string {

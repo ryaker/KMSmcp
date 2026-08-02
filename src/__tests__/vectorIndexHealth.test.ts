@@ -116,3 +116,36 @@ describe('probeVectorIndex — never throws, never launders silence into health'
     }
   })
 })
+
+describe('coverage signal — SparrowDB signal 4', () => {
+  it('flags an index that is internally healthy but holds a fraction of the corpus', () => {
+    // The "Succeeded: 282, actually 3" state. Invisible to every index-derived
+    // signal, because the index IS healthy — it simply never received the data.
+    const r = probeVectorIndex(withHealth(300, 300), 'Knowledge', 'embedding', 2600)
+    expect(r.status).toBe('degraded')
+    expect(r.alert).toMatch(/COVERAGE LOW/)
+    // Must name the trap, or the next person trusts the writer's own count again.
+    expect(r.alert).toMatch(/returns void/)
+  })
+
+  it('falls back to reachable when stored is unavailable, so it works on the binding we run', () => {
+    // Without this the signal would be permanently null in production — present
+    // in code, absent in reality. reachable <= stored, so it can only over-report.
+    const db = { vectorSearch: () => new Array(1306).fill(0) }
+    const r = probeVectorIndex(db, 'Knowledge', 'embedding', 2595)
+    expect(r.status).toBe('degraded')          // 50% — the actual incident state
+    expect(r.coverage).toBeCloseTo(1306 / 2595, 3)
+  })
+
+  it('stays ok at realistic imperfect coverage', () => {
+    // ~185 sidecar orphans have no graph node; some entries are too short to embed.
+    const r = probeVectorIndex(withHealth(2439, 2439), 'Knowledge', 'embedding', 2606)
+    expect(r.status).toBe('ok')
+  })
+
+  it('never fabricates coverage when the corpus count is unknown', () => {
+    const r = probeVectorIndex(withHealth(2439, 2439), 'Knowledge', 'embedding', null)
+    expect(r.coverage).toBeNull()
+    expect(r.status).toBe('ok')
+  })
+})
