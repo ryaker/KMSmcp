@@ -645,6 +645,13 @@ export class UnifiedSearchTool {
       const subjects = typeof filters.subject === 'string'
         ? [filters.subject]
         : Array.isArray(filters.subject) ? filters.subject : undefined
+      // `findSimilar` has no `source` parameter at all (unlike contentType/subject, it
+      // cannot be pushed down even in the single-valued case), so this is always a
+      // post-filter. Without it a caller filtering on `source` would get vector hits from
+      // sources it explicitly excluded — the lexical arms already honour this filter
+      // (MongoDBStorage/Mem0Storage/SparrowDBStorage.search all do `$in`/equality checks
+      // on `filters.source`), so the vector arm must match rather than silently ignore it.
+      const sources = Array.isArray(filters.source) && filters.source.length > 0 ? filters.source : undefined
 
       const maxResults = query.options?.maxResults ?? 10
       // Over-fetch relative to the returned window: fusion needs enough of the vector
@@ -678,6 +685,7 @@ export class UnifiedSearchTool {
         if (!hit || typeof hit.id !== 'string') continue
         if (contentTypes && contentTypes.length > 1 && !contentTypes.includes(hit.contentType)) continue
         if (subjects && subjects.length > 1 && !subjects.includes(hit.subject ?? '')) continue
+        if (sources && !sources.includes(hit.source)) continue
 
         // `findSimilar` returns a 200-char preview, not the entry. Rehydrate through the
         // backend's own index so a vector-only hit is a first-class result rather than a

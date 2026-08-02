@@ -70,6 +70,23 @@ const buildTool = (opts: HarnessOpts = {}) => {
   return { tool, graph, mem0, mongodb, findSimilar, embedder }
 }
 
+/**
+ * Runs `fn` with KMS_EVAL_CAPTURE='1', then restores whatever the variable held
+ * beforehand — absent if it was absent, or its prior value if some other test (or the
+ * environment) had set one. An unconditional `delete` in the finally block would clobber
+ * that prior value instead of restoring it, leaking state into whatever runs next.
+ */
+async function withEvalCapture<T>(fn: () => Promise<T>): Promise<T> {
+  const original = process.env.KMS_EVAL_CAPTURE
+  process.env.KMS_EVAL_CAPTURE = '1'
+  try {
+    return await fn()
+  } finally {
+    if (original === undefined) delete process.env.KMS_EVAL_CAPTURE
+    else process.env.KMS_EVAL_CAPTURE = original
+  }
+}
+
 const QUERY = 'quarterly revenue forecast'
 
 /** Lexically strong: contains every query term. */
@@ -157,8 +174,7 @@ describe('UnifiedSearchTool — hybrid retrieval', () => {
     })
 
     it('captures the same eval fields it captured before this change', async () => {
-      process.env.KMS_EVAL_CAPTURE = '1'
-      try {
+      await withEvalCapture(async () => {
         const { tool } = buildTool({ mem0: [LEX_STRONG], similar: [vectorHit()] })
         const res = await tool.search({ query: QUERY })
         const candidate = res._evalCapture!.candidates[0]
@@ -167,9 +183,7 @@ describe('UnifiedSearchTool — hybrid retrieval', () => {
           'confidence', 'content', 'contentType', 'extractedBy', 'id',
           'sourceSystem', 'subject', 'timestamp',
         ])
-      } finally {
-        delete process.env.KMS_EVAL_CAPTURE
-      }
+      })
     })
   })
 
@@ -234,8 +248,7 @@ describe('UnifiedSearchTool — hybrid retrieval', () => {
     })
 
     it('carries the hybrid signals into the KMS_EVAL_CAPTURE pool', async () => {
-      process.env.KMS_EVAL_CAPTURE = '1'
-      try {
+      await withEvalCapture(async () => {
         const { tool } = buildTool({
           mem0: [LEX_STRONG],
           similar: [vectorHit({ id: SEMANTIC_ONLY.id, similarity: 0.83 })],
@@ -250,9 +263,7 @@ describe('UnifiedSearchTool — hybrid retrieval', () => {
         expect(captured['sem-only']._rrf).toBeCloseTo(1 / 61, 6)
         expect(captured['lex-strong']._lexicalRank).toBe(1)
         expect(typeof captured['lex-strong']._lexicalScore).toBe('number')
-      } finally {
-        delete process.env.KMS_EVAL_CAPTURE
-      }
+      })
     })
 
     it('deduplicates a document found by both arms into ONE candidate scoring in both', async () => {
@@ -402,6 +413,24 @@ describe('UnifiedSearchTool — hybrid retrieval', () => {
       expect(res.results.map(r => r.id)).toEqual(['a'])
     })
 
+    it('excludes a vector-only hit whose source is not in filters.source', async () => {
+      // `findSimilar` has no `source` parameter to push a filter down into (unlike
+      // contentType/subject), so this filter can ONLY be enforced as a post-filter here.
+      // Without it, a caller asking for filters.source: ['technical'] would get results
+      // the vector arm found under 'personal' — candidates it explicitly excluded.
+      const { tool } = buildTool({
+        similar: [
+          vectorHit({ id: 'wrong-source', source: 'personal' }),
+          vectorHit({ id: 'right-source', source: 'technical' }),
+        ],
+      })
+      const res = await tool.search({
+        query: QUERY,
+        filters: { source: ['technical'] },
+      })
+      expect(res.results.map(r => r.id)).toEqual(['right-source'])
+    })
+
     it('propagates includeFlagged to the vector arm', async () => {
       const { tool, findSimilar } = buildTool({ similar: [] })
       await tool.search({ query: QUERY, options: { includeFlagged: true } })
@@ -448,5 +477,22 @@ describe('UnifiedSearchTool — hybrid retrieval', () => {
     const again = await tool.search({ query: QUERY })
     expect(again.fromCache).toBe(true)
     expect((again as any)._hybridRetrieval).toBe(true)
+  })
+
+  it('restores a pre-existing KMS_EVAL_CAPTURE value instead of deleting it', async () => {
+    const SENTINEL = 'set-by-something-else-in-the-process'
+    process.env.KMS_EVAL_CAPTURE = SENTINEL
+    try {
+      await withEvalCapture(async () => {
+        expect(process.env.KMS_EVAL_CAPTURE).toBe('1')
+        const { tool } = buildTool({ mem0: [LEX_STRONG], similar: [vectorHit()] })
+        await tool.search({ query: QUERY })
+      })
+      // An unconditional `delete` here would leave this `undefined`, leaking state
+      // into whatever test or process runs next instead of restoring it.
+      expect(process.env.KMS_EVAL_CAPTURE).toBe(SENTINEL)
+    } finally {
+      delete process.env.KMS_EVAL_CAPTURE
+    }
   })
 })

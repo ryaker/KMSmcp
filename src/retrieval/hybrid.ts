@@ -214,6 +214,11 @@ export function fuseWithRRF<T extends FusionCandidate>(
     if (lexDelta !== 0) return lexDelta
     // Final determinism guard so two otherwise-identical candidates never swap order
     // between runs (which would make an offline replay disagree with the live run).
-    return String(a.id ?? '').localeCompare(String(b.id ?? ''))
+    // Plain codepoint comparison, not `localeCompare` — locale-dependent ordering would
+    // make this non-deterministic across environments/ICU versions, which is exactly
+    // what this guard exists to prevent.
+    const idA = String(a.id ?? '')
+    const idB = String(b.id ?? '')
+    return idA < idB ? -1 : idA > idB ? 1 : 0
   })
 }

@@ -141,6 +141,20 @@ describe('fuseWithRRF', () => {
     expect(fuseWithRRF([...tied].reverse()).map(c => c.id)).toEqual(['alpha', 'zeta'])
   })
 
+  it('breaks a full tie by plain codepoint id order, not locale-aware order', () => {
+    // 'B' (U+0042) < 'a' (U+0061) in codepoint order, but ICU locale collation treats
+    // letters case-insensitively and sorts 'a' before 'B' — `'B'.localeCompare('a')` is
+    // positive. A locale-dependent tie-break would order these ['a', 'B'] here (and
+    // differently again in another locale/ICU version), which makes an offline replay
+    // of a captured pool non-reproducible. The tie-break must not depend on locale.
+    const tied = [
+      { id: 'B', sourceSystem: 'vector', _vectorSimilarity: 0.9, _recency: 0.5, _lexicalScore: 0 },
+      { id: 'a', sourceSystem: 'mem0', _lexicalScore: 0, _recency: 0.5 },
+    ]
+    expect(fuseWithRRF(tied).map(c => c.id)).toEqual(['B', 'a'])
+    expect(fuseWithRRF([...tied].reverse()).map(c => c.id)).toEqual(['B', 'a'])
+  })
+
   it('returns an empty list unchanged', () => {
     expect(fuseWithRRF([])).toEqual([])
   })
