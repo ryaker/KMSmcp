@@ -34,17 +34,40 @@
  *
  * Critical safety
  * ===============
- * SparrowDB 0.1.22 is a single-writer engine. The KMSmcp launchd daemon
- * (`com.ryaker.kms-mcp` on the build server) holds a writer handle on the
- * same database. Running this script concurrently with the daemon will fail
- * to acquire the writer lock; the script aborts with a clear instruction
- * rather than retrying.
+ * SparrowDB 0.1.22 calls itself single-writer, but that guarantee is a
+ * PROCESS-LOCAL AtomicBool with no cross-process enforcement. Two processes
+ * each get their own, so neither sees the other and `SparrowDB.open()` simply
+ * succeeds. Nothing fails, nothing warns. Every insert re-serialises the entire
+ * in-memory index and writes the whole file, so whichever process saves LAST
+ * silently overwrites everything the other one did.
+ *
+ * This is not hypothetical. On 2026-08-01 this script reported 1721 successes
+ * and grew the index 2,497,757 -> 8,084,693 bytes. The daemon then relaunched,
+ * held an index snapshot from its own open(), performed one ordinary vector
+ * write, and saved 1299 vectors over the 2433 that were there. ~1150 destroyed,
+ * no error anywhere. Recovered only because a copy of the .bin happened to
+ * survive in a scratch directory.
+ *
+ * `bootout` alone is NOT sufficient — the job carries KeepAlive=true, so launchd
+ * relaunches it. It also runs `node --watch dist/index.js`, so ANY rebuild of
+ * dist/ by any process restarts it mid-run. Disable the job:
  *
  *   BEFORE running:
- *     launchctl bootout gui/501/com.ryaker.kms-mcp
+ *     launchctl disable gui/501/com.ryaker.kms-mcp
+ *     launchctl bootout  gui/501/com.ryaker.kms-mcp
+ *     sleep 10 && /usr/sbin/lsof -nP -i :8180 || echo CLEAR   # wait for CLEAR
  *
  *   AFTER running:
+ *     launchctl enable    gui/501/com.ryaker.kms-mcp
  *     launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.ryaker.kms-mcp.plist
+ *
+ * The script gates on this at startup AND re-checks every `writerCheckIntervalMs`
+ * while running (default 10s), aborting the moment a competing writer appears —
+ * a startup-only gate cannot see a daemon that returns at minute three.
+ *
+ * Note also that this script writes via `addToVectorIndex`, which populates the
+ * HNSW index WITHOUT writing the node property. Those vectors are therefore not
+ * rebuildable from column data. Prefer `SET k.embedding = $vec` if that matters.
  *
  * Run
  * ===
@@ -150,6 +173,23 @@ export interface BackfillOptions {
    * shell-out; tests inject a stub.
    */
   isDaemonRunning?: () => boolean
+  /**
+   * How often to RE-CHECK for a competing writer while the run is in flight,
+   * in milliseconds. 0 disables re-checking (startup gate only).
+   *
+   * Why this exists: on 2026-08-01 a backfill wrote 1721 vectors, the index grew
+   * 2.5MB -> 8.1MB, and roughly 1150 of them were destroyed. The startup gate had
+   * passed. The launchd job carries KeepAlive=true and runs `node --watch
+   * dist/index.js`, so the daemon relaunches on any rebuild of dist/ — and once
+   * relaunched it holds an index snapshot taken at ITS open() time. Because
+   * SparrowDB's single-writer guarantee is a process-local AtomicBool with no
+   * cross-process enforcement, and every insert re-serialises the whole in-memory
+   * index, the daemon's next vector write silently saved its stale view over the
+   * backfill's work. Last writer wins, no error, no detection.
+   *
+   * Checking once at startup cannot catch a writer that appears at minute three.
+   */
+  writerCheckIntervalMs?: number
 }
 
 /** Final report emitted at end of run. */
@@ -342,14 +382,21 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     log(`  ${reason}`)
     log(`    ${detail}`)
     log('')
-    log('  SparrowDB 0.1.22 is single-writer. The KMSmcp daemon')
-    log('  must be stopped before this script can safely write')
-    log('  to the HNSW index. Run:')
+    log('  SparrowDB 0.1.22 is single-writer, and that guarantee is a')
+    log('  process-local AtomicBool — it is NOT enforced across processes.')
+    log('  Two writers do not conflict; the second one silently overwrites')
+    log('  the first. The daemon must be stopped, and must STAY stopped.')
     log('')
-    log('    launchctl bootout gui/501/com.ryaker.kms-mcp')
+    log('  bootout alone is not enough: the job has KeepAlive=true, so')
+    log('  launchd will relaunch it. Disable it first.')
     log('')
-    log('  …then re-run this script. After it finishes:')
+    log('    launchctl disable gui/501/com.ryaker.kms-mcp')
+    log('    launchctl bootout  gui/501/com.ryaker.kms-mcp')
+    log('    sleep 10 && /usr/sbin/lsof -nP -i :8180 || echo CLEAR')
     log('')
+    log('  Wait for CLEAR, then re-run this script. Afterwards:')
+    log('')
+    log('    launchctl enable    gui/501/com.ryaker.kms-mcp')
     log('    launchctl bootstrap gui/501 \\')
     log('      ~/Library/LaunchAgents/com.ryaker.kms-mcp.plist')
     log('')
@@ -449,9 +496,38 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
   // Abort-on-fatal hook: TypeError from addToVectorIndex (dimension mismatch).
   let fatalError: Error | null = null
 
+  // Abort-on-competing-writer hook. The startup gate proves the daemon was down
+  // when we began; it says nothing about minute three. Everything already written
+  // is at risk the moment a second writer appears, so stop immediately and tell
+  // the operator rather than continuing to pile work onto an index that is about
+  // to be overwritten by someone else's stale snapshot.
+  let competingWriter: string | null = null
+  const writerCheckMs = opts.writerCheckIntervalMs ?? 10_000
+  const writerCheckEnabled = !opts.dryRun && writerCheckMs > 0
+  let lastWriterCheck = Date.now()
+
+  // Checked INLINE rather than on a setInterval. A timer is a macrotask, so a run
+  // whose embedder resolves immediately can finish every entry without the event
+  // loop ever reaching it — the check would silently never fire, which is exactly
+  // the class of bug this whole guard exists to prevent.
+  const checkForCompetingWriter = (): void => {
+    if (!writerCheckEnabled || competingWriter) return
+    if (Date.now() - lastWriterCheck < writerCheckMs) return
+    lastWriterCheck = Date.now()
+    try {
+      if (daemonProbe()) {
+        competingWriter = 'launchd daemon com.ryaker.kms-mcp reappeared mid-run'
+      }
+    } catch {
+      // A probe that cannot answer is not evidence of a writer. Keep going —
+      // failing the run on a flaky launchctl is worse than the risk it guards.
+    }
+  }
+
   const tasks = candidates.map(entry =>
     limit(async () => {
-      if (fatalError) return // short-circuit remaining queue after abort
+      checkForCompetingWriter()
+      if (fatalError || competingWriter) return // short-circuit remaining queue after abort
 
       const t0 = Date.now()
 
@@ -517,8 +593,33 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     }),
   )
 
-  // Wait for everything (or fatalError to propagate).
+  // Wait for everything (or fatalError / competingWriter to propagate).
   await Promise.allSettled(tasks)
+
+  // A competing writer means everything above is provisional: the other process
+  // holds an index snapshot from its own open() and will overwrite this run's
+  // work on its next vector write. Say so loudly — the 2026-08-01 incident looked
+  // like a clean success right up until the daemon's next save.
+  if (competingWriter) {
+    log('')
+    log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    log('  ABORTED — A COMPETING WRITER APPEARED MID-RUN')
+    log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    log('')
+    log(`  ${competingWriter}`)
+    log('')
+    log(`  ${succeeded} vectors were written before the abort, and they are`)
+    log('  NOT safe. The other process opened the index at its own start')
+    log('  time and will save that stale snapshot over this work on its')
+    log('  next vector write, silently. Verify before trusting them:')
+    log('')
+    log('    ls -l "$SPARROWDB_PATH/vector_indexes/hnsw_Knowledge_embedding.bin"')
+    log('')
+    log('  Disable the job (not just bootout — KeepAlive relaunches it),')
+    log('  confirm port 8180 is clear, then re-run. The state file makes')
+    log('  this resumable, so completed ids are not re-embedded.')
+    log('')
+  }
 
   // ----- Final flush ----------------------------------------------------------
   saveState(opts.statePath, state)
@@ -558,6 +659,20 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
       hnswSizeAfter: fileSizeOrZero(hnswPath),
       elapsedMs: Date.now() - startTime,
       aborted: { reason: `fatal_typeerror: ${fatalError.message}` },
+    }
+  }
+
+  if (competingWriter) {
+    return {
+      total,
+      succeeded,
+      alreadyCompleted,
+      graphOrphan,
+      embedFailed,
+      hnswSizeBefore,
+      hnswSizeAfter: fileSizeOrZero(hnswPath),
+      elapsedMs: Date.now() - startTime,
+      aborted: { reason: `competing_writer: ${competingWriter}` },
     }
   }
 

@@ -604,3 +604,75 @@ describe('backfill-hnsw-embeddings', () => {
     expect(report.embedFailed).toBe(1)
   })
 })
+
+describe('competing-writer detection mid-run', () => {
+  // The 2026-08-01 incident: the startup gate passed, the run reported 1721
+  // successes, and ~1150 of them were destroyed. The launchd job has
+  // KeepAlive=true and runs `node --watch dist/index.js`, so the daemon
+  // relaunched partway through, held an index snapshot from its own open(),
+  // and saved that stale view over the backfill's work on its next write.
+  // A gate that only fires at startup cannot see a writer that arrives later.
+
+  it('aborts when the daemon reappears partway through the run', async () => {
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = {}
+    for (let i = 0; i < 40; i++) sidecar[`id-${i}`] = { id: `id-${i}`, content: `entry ${i}`, metadata: {} }
+
+    let probeCalls = 0
+    const opts = buildOpts(tmp, sidecar, {
+      concurrency: 1,
+      writerCheckIntervalMs: 1,
+      // Clean at the startup gate, then the daemon comes back.
+      isDaemonRunning: () => ++probeCalls > 1,
+    })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted?.reason).toMatch(/^competing_writer:/)
+    expect(report.aborted?.reason).toContain('com.ryaker.kms-mcp')
+    // It must stop early rather than plough through the whole candidate set.
+    expect(report.succeeded).toBeLessThan(40)
+  })
+
+  it('completes normally when no competing writer ever appears', async () => {
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = {}
+    for (let i = 0; i < 5; i++) sidecar[`id-${i}`] = { id: `id-${i}`, content: `entry ${i}`, metadata: {} }
+
+    const opts = buildOpts(tmp, sidecar, { writerCheckIntervalMs: 1, isDaemonRunning: () => false })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeUndefined()
+    expect(report.succeeded).toBe(5)
+  })
+
+  it('does not abort on a probe that throws — an unanswerable probe is not evidence', async () => {
+    // Failing the run on a flaky launchctl would be worse than the risk it guards.
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = {}
+    for (let i = 0; i < 5; i++) sidecar[`id-${i}`] = { id: `id-${i}`, content: `entry ${i}`, metadata: {} }
+
+    let first = true
+    const opts = buildOpts(tmp, sidecar, {
+      writerCheckIntervalMs: 1,
+      isDaemonRunning: () => { if (first) { first = false; return false } throw new Error('launchctl unavailable') },
+    })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeUndefined()
+    expect(report.succeeded).toBe(5)
+  })
+
+  it('honours writerCheckIntervalMs=0 as "startup gate only"', async () => {
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = { 'id-0': { id: 'id-0', content: 'x', metadata: {} } }
+    let probeCalls = 0
+    const opts = buildOpts(tmp, sidecar, {
+      writerCheckIntervalMs: 0,
+      isDaemonRunning: () => { probeCalls++; return false },
+    })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeUndefined()
+    expect(probeCalls).toBe(1)   // startup gate only, no re-checks scheduled
+  })
+})
