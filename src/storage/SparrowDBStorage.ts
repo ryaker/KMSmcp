@@ -71,6 +71,7 @@ import { createRequire } from 'module'
 import { logger } from '../logger.js'
 import { probeVectorIndex } from './vectorIndexHealth.js'
 import type { VectorIndexHealthReport } from './vectorIndexHealth.js'
+import { classifyEmbeddingWriteError, lostUpdateMessage } from './embeddingWriteError.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
@@ -574,13 +575,19 @@ export class SparrowDBStorage implements StorageSystem {
         { emb: Array.from(embedding) }
       )
     } catch (e) {
-      // The most common failure is "node not found" — happens for the ~185
-      // sidecar-orphan entries that exist in the JSON sidecar but never got
-      // a graph node (pre-cutover legacy). Logged at debug, not warn.
-      logger.debug(
-        `storeEmbedding: graph SET failed for ${id} (likely sidecar-orphan): ` +
-        `${e instanceof Error ? e.message : String(e)}`
-      )
+      const msg = e instanceof Error ? e.message : String(e)
+      // Default LOUD, downgrade only what is known benign. See
+      // ./embeddingWriteError.ts for why this stopped being a debug-level concern.
+      switch (classifyEmbeddingWriteError(msg)) {
+        case 'lost-update':
+          logger.error(lostUpdateMessage(id, msg))
+          break
+        case 'sidecar-orphan':
+          logger.debug(`storeEmbedding: no graph node for ${id} (sidecar-orphan): ${msg}`)
+          break
+        default:
+          logger.warn(`storeEmbedding: graph SET failed for ${id} (unclassified): ${msg}`)
+      }
       return false
     }
 
