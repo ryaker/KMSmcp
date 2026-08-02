@@ -434,11 +434,55 @@ export class UnifiedSearchTool {
 
   private async searchMem0(query: KnowledgeQuery): Promise<any[]> {
     try {
-      return await this.storage.mem0.search(query)
+      return this.dropShardsOfFlaggedParents(await this.storage.mem0.search(query), query)
     } catch (error) {
       console.warn('⚠️ Mem0 search failed:', error instanceof Error ? error.message : String(error))
       return []
     }
+  }
+
+  /**
+   * Mem0 stores an LLM-extracted fan-out of each `unified_store` write: several
+   * "User described…" shards, each its own searchable row carrying
+   * `metadata.kms_id` back to the KMS entry it was derived from.
+   *
+   * Mem0 has no flag concept, so `kms_supersede` / `kms_delete` flag the graph and
+   * MongoDB copies and leave every shard live. Measured 2026-08-01: three
+   * freshly-flagged parents still had 11 shards surfacing in the top-15 across six
+   * queries, carrying the exact content the supersede was written to retire — a
+   * retracted claim about a retrieval regression kept being served after its parent
+   * was superseded. CLAUDE.md's promise that superseding a fact "stops it leaking
+   * into every future session's context automatically" was false for this path.
+   *
+   * The shards already carry the join key, so honour the parent's flag at read time.
+   * Doing it here rather than in Mem0 also covers shards written before the flag
+   * existed, which no write-time fix could reach.
+   */
+  private dropShardsOfFlaggedParents(results: any[], query: KnowledgeQuery): any[] {
+    if (query.options?.includeFlagged) return results
+    const graph: any = this.storage.graph
+    // Optional on the GraphStorage interface — a backend that cannot answer must not
+    // cause every Mem0 result to be dropped.
+    if (typeof graph?.findById !== 'function') return results
+
+    const parentFlagged = new Map<string, boolean>()
+    return results.filter(r => {
+      const parentId = r?.metadata?.kms_id
+      // No join key, or the shard IS the parent: nothing to inherit.
+      if (!parentId || parentId === r.id) return true
+      if (!parentFlagged.has(parentId)) {
+        let flagged = false
+        try {
+          // findById returns null for a parent this backend has never seen; an unknown
+          // parent is not evidence of retraction, so keep the shard either way.
+          flagged = Boolean(graph.findById(parentId)?.flag)
+        } catch {
+          flagged = false
+        }
+        parentFlagged.set(parentId, flagged)
+      }
+      return !parentFlagged.get(parentId)
+    })
   }
 
   private async searchGraph(query: KnowledgeQuery): Promise<any[]> {
