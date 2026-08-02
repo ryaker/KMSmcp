@@ -604,3 +604,231 @@ describe('backfill-hnsw-embeddings', () => {
     expect(report.embedFailed).toBe(1)
   })
 })
+
+describe('competing-writer detection mid-run', () => {
+  // The 2026-08-01 incident: the startup gate passed, the run reported 1721
+  // successes, and ~1150 of them were destroyed. The launchd job has
+  // KeepAlive=true and runs `node --watch dist/index.js`, so the daemon
+  // relaunched partway through, held an index snapshot from its own open(),
+  // and saved that stale view over the backfill's work on its next write.
+  // A gate that only fires at startup cannot see a writer that arrives later.
+
+  it('aborts when the daemon reappears partway through the run', async () => {
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = {}
+    for (let i = 0; i < 40; i++) sidecar[`id-${i}`] = { id: `id-${i}`, content: `entry ${i}`, metadata: {} }
+
+    let probeCalls = 0
+    const opts = buildOpts(tmp, sidecar, {
+      concurrency: 1,
+      writerCheckIntervalMs: 1,
+      // Clean at the startup gate, then the daemon comes back.
+      isDaemonRunning: () => ++probeCalls > 1,
+    })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted?.reason).toMatch(/^competing_writer:/)
+    expect(report.aborted?.reason).toContain('com.ryaker.kms-mcp')
+    // It must stop early rather than plough through the whole candidate set.
+    expect(report.succeeded).toBeLessThan(40)
+  })
+
+  it('completes normally when no competing writer ever appears', async () => {
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = {}
+    for (let i = 0; i < 5; i++) sidecar[`id-${i}`] = { id: `id-${i}`, content: `entry ${i}`, metadata: {} }
+
+    const opts = buildOpts(tmp, sidecar, { writerCheckIntervalMs: 1, isDaemonRunning: () => false })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeUndefined()
+    expect(report.succeeded).toBe(5)
+  })
+
+  it('does not abort on a probe that throws — an unanswerable probe is not evidence', async () => {
+    // Failing the run on a flaky launchctl would be worse than the risk it guards.
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = {}
+    for (let i = 0; i < 5; i++) sidecar[`id-${i}`] = { id: `id-${i}`, content: `entry ${i}`, metadata: {} }
+
+    let first = true
+    const opts = buildOpts(tmp, sidecar, {
+      writerCheckIntervalMs: 1,
+      isDaemonRunning: () => { if (first) { first = false; return false } throw new Error('launchctl unavailable') },
+    })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeUndefined()
+    expect(report.succeeded).toBe(5)
+  })
+
+  it('honours writerCheckIntervalMs=0 as "startup gate only"', async () => {
+    const tmp = makeTmpDir()
+    const sidecar: Record<string, any> = { 'id-0': { id: 'id-0', content: 'x', metadata: {} } }
+    let probeCalls = 0
+    const opts = buildOpts(tmp, sidecar, {
+      writerCheckIntervalMs: 0,
+      isDaemonRunning: () => { probeCalls++; return false },
+    })
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeUndefined()
+    expect(probeCalls).toBe(1)   // startup gate only, no re-checks scheduled
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR #93 CodeRabbit review fixes
+// ---------------------------------------------------------------------------
+
+describe('PR #93 review fixes', () => {
+  // CRITICAL: checkForCompetingWriter() at the top of the task proves the
+  // daemon was down when the task STARTED. embedWithRetry is a real network
+  // round-trip (380-480ms measured against the Ollama host); a daemon that
+  // reappears during that window is invisible until the NEXT entry's top-of-
+  // task check. Re-check immediately before the write, not only at the top.
+  it('re-checks contention after the embed and before the write — a writer detected during the embed window must not be written', async () => {
+    const tmp = makeTmpDir()
+    const sidecar = makeSidecar([makeEntry('a')])
+    const dbCalls: Array<{ id: string; vec: Float32Array }> = []
+    // Flipped by a real timer mid-embed, not counted probe calls:
+    // checkForCompetingWriter()'s throttle means the exact number of real
+    // (non-throttled) probe invocations before a given check is a race (an
+    // ordinal-counting stub was flaky here — see the sibling test's comment).
+    // A wall-clock flip well inside the 30ms embed window is deterministic:
+    // the top-of-task check runs at ~t=0 (always sees `false`, timer not due
+    // yet); the post-embed check this fix adds runs at ~t=30ms, long after
+    // the 5ms flip (always sees `true`).
+    let daemonReappeared = false
+    setTimeout(() => { daemonReappeared = true }, 5)
+
+    const opts = buildOpts(tmp, sidecar, {
+      concurrency: 1,
+      writerCheckIntervalMs: 1,
+      embeddingService: makeMockEmbedder({ delayMs: 30 }),
+      openSparrowDB: () => makeMockDb({ recorded: dbCalls }),
+      isDaemonRunning: () => daemonReappeared,
+    })
+
+    const report = await runBackfill(opts)
+
+    expect(report.aborted?.reason).toMatch(/^competing_writer:/)
+    expect(dbCalls).toHaveLength(0) // must NOT have written — contention was known before the write
+    expect(report.succeeded).toBe(0)
+    try { rmSync(tmp, { recursive: true, force: true }) } catch { /* noop */ }
+  })
+
+  // CRITICAL: everything this run wrote is unsafe once a competing writer is
+  // detected — SparrowDB rewrites the WHOLE file on every insert, so the other
+  // process's next save overwrites this run's entire contribution with its
+  // own stale open()-time snapshot, not just entries written after detection.
+  // Persisting those ids as `completed` makes the next resume SKIP vectors
+  // that no longer exist. On abort: revert state.completed/failed to the
+  // pre-run snapshot, do not persist the sidecar, and do not checkpoint.
+  it('does NOT persist unsafe writes as completed — a resume after a competing-writer abort must re-embed everything this run wrote', async () => {
+    const tmp = makeTmpDir()
+    const sidecar = makeSidecar([
+      makeEntry('id-0'), makeEntry('id-1'), makeEntry('id-2'),
+    ])
+    const dbCalls: Array<{ id: string; vec: Float32Array }> = []
+    let checkpointCalls = 0
+    // Tied to a real EVENT (the first genuine write), not a probe-call
+    // ordinal — checkForCompetingWriter()'s throttle window means the exact
+    // number of real (non-throttled) probe invocations per task is a race
+    // (sub-1ms scheduling decides whether a given check's probe call lands
+    // before or after another task's), so counting calls is not
+    // deterministic. Flipping a flag inside the write itself is: task 1's own
+    // checks (top-of-task, and the post-embed one this PR adds) always run
+    // BEFORE task 1's own write, so they always see `false` and task 1 always
+    // completes; every check task 2 makes runs strictly after that write, so
+    // it always sees `true` — regardless of which of its checks (if any got
+    // throttled) is the one that actually re-probes.
+    let daemonReappeared = false
+
+    const db: SparrowDBLike = {
+      addToVectorIndex: (_label, _prop, nodeId, vec) => {
+        dbCalls.push({ id: nodeId, vec })
+        daemonReappeared = true
+      },
+      checkpoint: () => { checkpointCalls++ },
+    }
+
+    const opts = buildOpts(tmp, sidecar, {
+      concurrency: 1,
+      writerCheckIntervalMs: 1,
+      // Delay long enough that a post-embed check is never itself throttled
+      // (it always fires >= 1ms after the previous real check).
+      embeddingService: makeMockEmbedder({ delayMs: 20 }),
+      openSparrowDB: () => db,
+      isDaemonRunning: () => daemonReappeared,
+    })
+
+    const report = await runBackfill(opts)
+
+    expect(report.aborted?.reason).toMatch(/^competing_writer:/)
+    // The write to the vector index genuinely happened this run (unsafe, but real).
+    expect(dbCalls.map(c => c.id)).toEqual(['id-0'])
+    expect(report.succeeded).toBe(1)
+
+    // Yet the persisted state file must NOT record 'id-0' as completed — a
+    // resumed run has to re-embed and re-write it, not silently skip it.
+    const state = JSON.parse(readFileSync(opts.statePath, 'utf8'))
+    expect(state.completed).toEqual([])
+
+    // The sidecar on disk must not carry this run's embedder_id stamp either.
+    const persisted = JSON.parse(readFileSync(opts.sidecarPath, 'utf8')) as Record<string, SidecarEntry>
+    expect(persisted['id-0'].metadata?.embedder_id).toBeUndefined()
+
+    // No checkpoint on the way out of a competing-writer abort.
+    expect(checkpointCalls).toBe(0)
+
+    try { rmSync(tmp, { recursive: true, force: true }) } catch { /* noop */ }
+  })
+
+  // MAJOR: the startup gate has done zero work when it runs, so refusing to
+  // begin on an unanswerable probe costs nothing. This is the opposite of the
+  // mid-run check, which stays lenient because aborting a long-running
+  // backfill on a flaky launchctl is worse than the (small) risk it guards.
+  it('fails CLOSED when the startup probe throws — refuses to start, never opens SparrowDB', async () => {
+    const tmp = makeTmpDir()
+    const sidecar = makeSidecar([makeEntry('a')])
+    let openerCalled = false
+
+    const opts = buildOpts(tmp, sidecar, {
+      isDaemonRunning: () => { throw new Error('launchctl unavailable') },
+      openSparrowDB: () => { openerCalled = true; return makeMockDb() },
+    })
+
+    const report = await runBackfill(opts)
+
+    expect(report.aborted).toBeDefined()
+    expect(report.aborted?.reason).toMatch(/lock_contention/)
+    expect(openerCalled).toBe(false)
+    expect(report.succeeded).toBe(0)
+  })
+
+  // MAJOR: operator instructions must use the launchd domain for the account
+  // actually running the script, not a hardcoded gui/501 — consistent with
+  // defaultIsDaemonRunning(), which already derives the domain from the
+  // current process uid.
+  it('operator instructions use the current UID, not a hardcoded gui/501', async () => {
+    const tmp = makeTmpDir()
+    const sidecar = makeSidecar([makeEntry('a')])
+    const lines: string[] = []
+    const getuidSpy = jest.spyOn(process, 'getuid' as any).mockReturnValue(777 as any)
+
+    try {
+      const opts = buildOpts(tmp, sidecar, {
+        log: m => lines.push(m),
+        isDaemonRunning: () => true, // trigger the "STOP THE LAUNCHD DAEMON" instructions
+      })
+      await runBackfill(opts)
+    } finally {
+      getuidSpy.mockRestore()
+    }
+
+    const text = lines.join('\n')
+    expect(text).toContain('gui/777/')
+    expect(text).not.toContain('gui/501')
+  })
+})
