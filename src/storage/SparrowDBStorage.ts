@@ -69,6 +69,8 @@
 
 import { createRequire } from 'module'
 import { logger } from '../logger.js'
+import { probeVectorIndex } from './vectorIndexHealth.js'
+import type { VectorIndexHealthReport } from './vectorIndexHealth.js'
 import { classifyEmbeddingWriteError, lostUpdateMessage } from './embeddingWriteError.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
@@ -278,6 +280,42 @@ export class SparrowDBStorage implements StorageSystem {
     logger.debug(
       `✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar, ` +
       `vectorIndex=${this.vectorIndexAvailable ? 'ready' : 'unavailable'}`
+    )
+  }
+
+  /**
+   * Report whether the HNSW vector index is actually usable.
+   *
+   * Nothing measured this before; the 2026-08-01 loss of ~1150 vectors went
+   * unnoticed until a retrieval investigation stumbled on it, and the repair that
+   * followed was a manual one-off. See ./vectorIndexHealth.ts for why the MISSING
+   * case is treated as critical rather than as "no data".
+   *
+   * Safe against the live store: on bindings that expose it, vectorIndexHealth()
+   * routes through get_vector_index(), a pure in-memory RwLock read with zero I/O,
+   * so it cannot quarantine the index it is measuring. Verified by execution.
+   */
+  getVectorIndexHealth(): VectorIndexHealthReport {
+    // Count the nodes that SHOULD carry a vector, from the GRAPH not the index.
+    // This is the only signal that catches embeddings which never reached the
+    // index at all — every other signal is index-derived, so an index that simply
+    // never received the data looks perfectly healthy to all of them.
+    let expected: number | null = null
+    try {
+      const rows = (this.db as any).execute(
+        `MATCH (k:${SparrowDBStorage.VECTOR_LABEL}) RETURN count(k)`
+      )?.rows
+      const v = rows?.[0] && Object.values(rows[0])[0]
+      if (typeof v === 'number') expected = v
+    } catch {
+      // Corpus count is best-effort; its absence must not break the probe.
+    }
+
+    return probeVectorIndex(
+      this.db as any,
+      SparrowDBStorage.VECTOR_LABEL,
+      SparrowDBStorage.VECTOR_PROPERTY,
+      expected,
     )
   }
 
