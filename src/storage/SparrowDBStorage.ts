@@ -69,6 +69,8 @@
 
 import { createRequire } from 'module'
 import { logger } from '../logger.js'
+import { probeVectorIndex } from './vectorIndexHealth.js'
+import type { VectorIndexHealthReport } from './vectorIndexHealth.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname } from 'path'
@@ -277,6 +279,26 @@ export class SparrowDBStorage implements StorageSystem {
     logger.debug(
       `✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar, ` +
       `vectorIndex=${this.vectorIndexAvailable ? 'ready' : 'unavailable'}`
+    )
+  }
+
+  /**
+   * Report whether the HNSW vector index is actually usable.
+   *
+   * Nothing measured this before; the 2026-08-01 loss of ~1150 vectors went
+   * unnoticed until a retrieval investigation stumbled on it, and the repair that
+   * followed was a manual one-off. See ./vectorIndexHealth.ts for why the MISSING
+   * case is treated as critical rather than as "no data".
+   *
+   * Safe against the live store: on bindings that expose it, vectorIndexHealth()
+   * routes through get_vector_index(), a pure in-memory RwLock read with zero I/O,
+   * so it cannot quarantine the index it is measuring. Verified by execution.
+   */
+  getVectorIndexHealth(): VectorIndexHealthReport {
+    return probeVectorIndex(
+      this.db as any,
+      SparrowDBStorage.VECTOR_LABEL,
+      SparrowDBStorage.VECTOR_PROPERTY,
     )
   }
 
