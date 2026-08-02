@@ -53,13 +53,13 @@
  * dist/ by any process restarts it mid-run. Disable the job:
  *
  *   BEFORE running:
- *     launchctl disable gui/501/com.ryaker.kms-mcp
- *     launchctl bootout  gui/501/com.ryaker.kms-mcp
+ *     launchctl disable gui/$(id -u)/com.ryaker.kms-mcp
+ *     launchctl bootout  gui/$(id -u)/com.ryaker.kms-mcp
  *     sleep 10 && /usr/sbin/lsof -nP -i :8180 || echo CLEAR   # wait for CLEAR
  *
  *   AFTER running:
- *     launchctl enable    gui/501/com.ryaker.kms-mcp
- *     launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.ryaker.kms-mcp.plist
+ *     launchctl enable    gui/$(id -u)/com.ryaker.kms-mcp
+ *     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryaker.kms-mcp.plist
  *
  * The script gates on this at startup AND re-checks every `writerCheckIntervalMs`
  * while running (default 10s), aborting the moment a competing writer appears —
@@ -67,7 +67,15 @@
  *
  * Note also that this script writes via `addToVectorIndex`, which populates the
  * HNSW index WITHOUT writing the node property. Those vectors are therefore not
- * rebuildable from column data. Prefer `SET k.embedding = $vec` if that matters.
+ * rebuildable from column data. If that matters, prefer the parameterized write
+ * `storeEmbedding()` uses (SparrowDBStorage.ts) instead — SparrowDB 0.1.22
+ * rejects list literals in SET, so the vector must go through
+ * `executeWithParams`, not an inline `SET k.embedding = [...]`:
+ *
+ *   db.executeWithParams(
+ *     `MATCH (k:Knowledge {id: ${cypherStr(id)}}) SET k.embedding = $emb`,
+ *     { emb: Array.from(embedding) }
+ *   )
  *
  * Run
  * ===
@@ -363,6 +371,10 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
   const startTime = Date.now()
   const hnswPath = join(opts.sparrowdbPath, 'vector_indexes', 'hnsw_Knowledge_embedding.bin')
   const hnswSizeBefore = fileSizeOrZero(hnswPath)
+  // Same derivation as defaultIsDaemonRunning() — the printed operator
+  // commands must target the launchd domain of the account actually running
+  // this script, not a hardcoded uid that's wrong on any other account.
+  const uid = process.getuid?.() ?? 501
 
   // ----- Lock acquisition first ------------------------------------------------
   // Two-step gate:
@@ -390,14 +402,14 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     log('  bootout alone is not enough: the job has KeepAlive=true, so')
     log('  launchd will relaunch it. Disable it first.')
     log('')
-    log(`    launchctl disable gui/501/${DAEMON_LABEL}`)
-    log(`    launchctl bootout  gui/501/${DAEMON_LABEL}`)
+    log(`    launchctl disable gui/${uid}/${DAEMON_LABEL}`)
+    log(`    launchctl bootout  gui/${uid}/${DAEMON_LABEL}`)
     log('    sleep 10 && /usr/sbin/lsof -nP -i :8180 || echo CLEAR')
     log('')
     log('  Wait for CLEAR, then re-run this script. Afterwards:')
     log('')
-    log(`    launchctl enable    gui/501/${DAEMON_LABEL}`)
-    log('    launchctl bootstrap gui/501 \\')
+    log(`    launchctl enable    gui/${uid}/${DAEMON_LABEL}`)
+    log(`    launchctl bootstrap gui/${uid} \\`)
     log(`      ~/Library/LaunchAgents/${DAEMON_LABEL}.plist`)
     log('')
     return {
@@ -414,9 +426,26 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
   }
 
   // OS-level daemon check. Skip in dry-run since we don't write.
+  //
+  // Fail CLOSED here, not open — the opposite of checkForCompetingWriter()
+  // below, which deliberately treats a throwing probe as "no evidence" and
+  // keeps going. That asymmetry is intentional: at startup we have not done
+  // any work yet, so refusing to begin costs nothing, while failing a
+  // long-running backfill on a flaky launchctl mid-run costs everything
+  // already in flight. Starting blind on an unanswerable probe risks writing
+  // straight into the exact contention this script exists to prevent.
   const daemonProbe = opts.isDaemonRunning ?? defaultIsDaemonRunning
-  if (!opts.dryRun && daemonProbe()) {
-    return failOpen(`Daemon (${DAEMON_LABEL}) is currently running:`, 'launchctl reports active state')
+  if (!opts.dryRun) {
+    let daemonIsRunning: boolean
+    try {
+      daemonIsRunning = daemonProbe()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return failOpen('Could not determine daemon state before starting:', `daemon probe threw: ${msg}`)
+    }
+    if (daemonIsRunning) {
+      return failOpen(`Daemon (${DAEMON_LABEL}) is currently running:`, 'launchctl reports active state')
+    }
   }
 
   let db: SparrowDBLike
@@ -434,6 +463,18 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
   const state = loadState(opts.statePath)
   const completedSet = new Set(state.completed)
   log(`📁 State file: ${state.completed.length} previously completed, ${state.failed.length} previously failed`)
+
+  // Snapshot of what was known-safe BEFORE this run touched anything. If a
+  // competing writer is detected mid-run, every vector THIS RUN wrote is
+  // unsafe — SparrowDB rewrites the whole index file on every insert, so the
+  // other process's next save overwrites this run's entire contribution with
+  // its own stale open()-time snapshot, not just entries written after
+  // detection. On that abort path we revert to exactly this snapshot rather
+  // than persisting any of this run's completions, so a resume re-embeds and
+  // re-writes everything instead of silently skipping vectors that no longer
+  // exist.
+  const preRunCompleted = [...state.completed]
+  const preRunFailed = [...state.failed]
 
   // ----- Build work list ------------------------------------------------------
   const candidates: SidecarEntry[] = []
@@ -540,7 +581,15 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
         return
       }
 
-      // 2. Insert into HNSW.
+      // 2. Re-check contention. embedWithRetry is a real network round-trip to
+      // Ollama (380-480ms measured) — the guard's answer from step 0 is stale
+      // by the time we get here. A daemon that reappears during the embed
+      // window must be caught NOW, before the write, not only at the next
+      // entry's top-of-task check.
+      checkForCompetingWriter()
+      if (fatalError || competingWriter) return
+
+      // 3. Insert into HNSW.
       try {
         db.addToVectorIndex('Knowledge', 'embedding', entry.id, embedResult.vec)
       } catch (e) {
@@ -566,7 +615,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
         return
       }
 
-      // 3. Stamp metadata + persist progress (in-memory only).
+      // 4. Stamp metadata + persist progress (in-memory only).
       const e = sidecar.get(entry.id)
       if (e) {
         e.metadata = {
@@ -580,7 +629,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
       succeeded++
       processedSinceFlush++
 
-      // 4. Periodic state flush + progress log.
+      // 5. Periodic state flush + progress log.
       if (processedSinceFlush >= flushEvery) {
         processedSinceFlush = 0
         saveState(opts.statePath, state)
@@ -598,9 +647,23 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 
   // A competing writer means everything above is provisional: the other process
   // holds an index snapshot from its own open() and will overwrite this run's
-  // work on its next vector write. Say so loudly — the 2026-08-01 incident looked
-  // like a clean success right up until the daemon's next save.
+  // ENTIRE contribution on its next vector write — SparrowDB re-serialises and
+  // rewrites the whole index file on every insert, so this is not limited to
+  // entries written after detection. Say so loudly — the 2026-08-01 incident
+  // looked like a clean success right up until the daemon's next save.
+  //
+  // Do not persist any of this run's completions: revert state.completed /
+  // state.failed to the pre-run snapshot, skip the sidecar write, and skip
+  // checkpoint() (one more write we don't need to make on the way out), then
+  // return BEFORE the normal finalization below. Persisting these ids as
+  // `completed` would make the next resume SKIP vectors that the daemon is
+  // about to destroy — exactly the silent-data-loss class this PR exists to
+  // prevent, just moved one abort path over.
   if (competingWriter) {
+    state.completed = preRunCompleted
+    state.failed = preRunFailed
+    saveState(opts.statePath, state)
+
     log('')
     log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
     log('  ABORTED — A COMPETING WRITER APPEARED MID-RUN')
@@ -616,12 +679,27 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
     log('    ls -l "$SPARROWDB_PATH/vector_indexes/hnsw_Knowledge_embedding.bin"')
     log('')
     log('  Disable the job (not just bootout — KeepAlive relaunches it),')
-    log('  confirm port 8180 is clear, then re-run. The state file makes')
-    log('  this resumable, so completed ids are not re-embedded.')
+    log('  confirm port 8180 is clear, then re-run. This run recorded NO new')
+    log('  completions — the state file was reverted to what it was before')
+    log('  this run, so the resume re-embeds and re-writes everything in')
+    log('  this window rather than silently skipping lost vectors.')
     log('')
+
+    return {
+      total,
+      succeeded,
+      alreadyCompleted,
+      graphOrphan,
+      embedFailed,
+      hnswSizeBefore,
+      hnswSizeAfter: fileSizeOrZero(hnswPath),
+      elapsedMs: Date.now() - startTime,
+      aborted: { reason: `competing_writer: ${competingWriter}` },
+    }
   }
 
-  // ----- Final flush ----------------------------------------------------------
+  // ----- Final flush (fatalError or full completion only — competingWriter
+  // returned above) ------------------------------------------------------------
   saveState(opts.statePath, state)
 
   // Persist the sidecar ONCE — see comment in storeEmbedding (PR #69) about
@@ -659,20 +737,6 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
       hnswSizeAfter: fileSizeOrZero(hnswPath),
       elapsedMs: Date.now() - startTime,
       aborted: { reason: `fatal_typeerror: ${fatalError.message}` },
-    }
-  }
-
-  if (competingWriter) {
-    return {
-      total,
-      succeeded,
-      alreadyCompleted,
-      graphOrphan,
-      embedFailed,
-      hnswSizeBefore,
-      hnswSizeAfter: fileSizeOrZero(hnswPath),
-      elapsedMs: Date.now() - startTime,
-      aborted: { reason: `competing_writer: ${competingWriter}` },
     }
   }
 
