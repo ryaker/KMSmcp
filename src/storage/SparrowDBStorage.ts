@@ -64,7 +64,7 @@
  *
  * Environment variables:
  *   KMS_STORAGE_BACKEND=sparrowdb   (switches graph backend from Neo4j to SparrowDB)
- *   SPARROWDB_PATH=/path/to/kms.db  (default: ~/.kms-sparrowdb)
+ *   SPARROWDB_PATH=/path/to/kms.db  (default: ~/.kms-sparrowdb-v2)
  */
 
 import { createRequire } from 'module'
@@ -80,6 +80,12 @@ import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/Emb
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { GraphEdgeIndex } from './GraphEdgeIndex.js'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
+import { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME } from './sparrowDbPath.js'
+
+// Re-exported for backward compatibility — the canonical definitions now
+// live in sparrowDbPath.ts (see that file's header for why), which has no
+// `import.meta.url` dependency and can be unit tested on its own.
+export { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME }
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -130,7 +136,7 @@ interface SparrowDBModule {
 
 export interface SparrowDBConfig {
   /** Filesystem path to the database directory.
-   *  Default: $SPARROWDB_PATH env var, or ~/.kms-sparrowdb */
+   *  Default: $SPARROWDB_PATH env var, or ~/.kms-sparrowdb-v2 */
   dbPath?: string
 }
 
@@ -243,10 +249,7 @@ export class SparrowDBStorage implements StorageSystem {
   private edgeIndex: GraphEdgeIndex | null = null
 
   constructor(config?: SparrowDBConfig) {
-    this.dbPath =
-      config?.dbPath ||
-      process.env.SPARROWDB_PATH ||
-      join(homedir(), '.kms-sparrowdb')
+    this.dbPath = resolveSparrowDBPath(config?.dbPath)
     this.sidecarPath = join(this.dbPath, 'content-index.json')
   }
 

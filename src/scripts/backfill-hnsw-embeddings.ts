@@ -117,6 +117,7 @@ import { join, dirname } from 'path'
 import { execSync } from 'child_process'
 
 import { OllamaEmbeddingService, type EmbeddingService } from '../embedding/EmbeddingService.js'
+import { resolveSparrowDBPath } from '../storage/sparrowDbPath.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -825,7 +826,7 @@ function defaultIsDaemonRunning(): boolean {
 async function main(argv: string[]): Promise<number> {
   const dryRun = argv.includes('--dry-run')
 
-  const sparrowdbPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  const sparrowdbPath = resolveSparrowDBPath()
   const sidecarPath = join(sparrowdbPath, 'content-index.json')
   const statePath = process.env.KMS_BACKFILL_STATE_FILE || join(homedir(), '.kms-backfill-state.json')
 

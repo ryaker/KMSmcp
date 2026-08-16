@@ -31,6 +31,7 @@ const require = createRequire(import.meta.url)
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 import type { GraphStorage } from '../types/index.js'
 import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
+import { resolveSparrowDBPath } from '../storage/sparrowDbPath.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
@@ -126,7 +127,7 @@ async function getTools() {
   // Graph backend: SparrowDB (default — embedded, no Aura latency).
   // KMS_STORAGE_BACKEND env var is now a no-op kept for backwards compat;
   // SparrowDB is the only graph backend after the cutover.
-  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  const sparrowPath = resolveSparrowDBPath()
   console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
   const graphBackend: GraphStorage = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
 
@@ -239,7 +240,7 @@ async function cmdSearch(args: string[]) {
 async function cmdPing() {
   const cfg = buildConfig()
 
-  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  const sparrowPath = resolveSparrowDBPath()
 
   const checks = await Promise.allSettled([
     (async () => {
@@ -331,9 +332,7 @@ async function cmdExport(args: string[]) {
     strict: false
   })
 
-  const dbPath = (values.path as string | undefined)
-    || process.env.SPARROWDB_PATH
-    || homedir() + '/.kms-sparrowdb'
+  const dbPath = resolveSparrowDBPath(values.path as string | undefined)
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
   const backupDir = homedir() + '/.kms-backups'
@@ -441,9 +440,7 @@ async function cmdImport(args: string[]) {
     strict: false
   })
 
-  const dbPath = (values.path as string | undefined)
-    || process.env.SPARROWDB_PATH
-    || homedir() + '/.kms-sparrowdb'
+  const dbPath = resolveSparrowDBPath(values.path as string | undefined)
 
   const { existsSync, mkdirSync, createReadStream, writeFileSync } = await import('node:fs')
   const readline = await import('node:readline')

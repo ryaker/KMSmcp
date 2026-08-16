@@ -3,8 +3,6 @@
  * Orchestrates all components into a single, powerful MCP server
  */
 
-import { homedir } from 'node:os'
-import { join } from 'node:path'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import {
   CallToolRequestSchema,
@@ -29,7 +27,7 @@ import { EntityLinker } from './inference/EntityLinker.js'
 import { OllamaEmbeddingService } from './embedding/EmbeddingService.js'
 import { AnthropicHaikuJudge } from './embedding/AnthropicHaikuJudge.js'
 import type { LLMJudgeService } from './embedding/LLMJudgeService.js'
-import { MongoDBStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js'
+import { MongoDBStorage, Mem0Storage, SparrowDBStorage, resolveSparrowDBPath } from './storage/index.js'
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js'
 
 export class UnifiedKMSServer {
@@ -119,7 +117,7 @@ export class UnifiedKMSServer {
     // Graph backend: SparrowDB (default — embedded, ~5ms read latency).
     // Legacy Neo4j and Shadow modes were removed in the SparrowDB cutover;
     // the env vars KMS_STORAGE_BACKEND / KMS_SHADOW_MODE are now no-ops.
-    const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+    const sparrowPath = resolveSparrowDBPath()
     console.log(`⚡ Graph backend: SparrowDB (path: ${sparrowPath})`)
     const graphBackend: GraphStorage = new SparrowDBStorage({ dbPath: sparrowPath })
     const graphBackendName = 'SparrowDB'
