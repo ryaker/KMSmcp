@@ -1,0 +1,32 @@
+#!/bin/sh
+# Blocks the failure that put 18,997 node_modules files in this repo's index:
+# a .gitignore rule added AFTER files were already tracked never applies to them,
+# so the repo looks clean while every dependency install churns thousands of
+# phantom diffs.
+#
+# Two checks. The first catches new offenders, the second catches the disease
+# already present — a path that is BOTH tracked and ignored.
+
+fail=0
+
+staged=$(git diff --cached --name-only --diff-filter=A)
+if [ -n "$staged" ]; then
+  offenders=$(printf '%s\n' "$staged" | git check-ignore --stdin 2>/dev/null)
+  if [ -n "$offenders" ]; then
+    echo "pre-commit: refusing to ADD paths that .gitignore excludes:" >&2
+    printf '  %s\n' $offenders >&2
+    echo "" >&2
+    echo "These were almost certainly staged with 'git add -f'. If that was" >&2
+    echo "deliberate, commit with --no-verify and say why in the message." >&2
+    fail=1
+  fi
+fi
+
+tracked_and_ignored=$(git ls-files -c | git check-ignore --stdin --no-index 2>/dev/null | head -5)
+if [ -n "$tracked_and_ignored" ]; then
+  echo "pre-commit: WARNING — these paths are tracked AND gitignored:" >&2
+  printf '  %s\n' $tracked_and_ignored >&2
+  echo "  (showing up to 5) Fix with: git rm -r --cached <path>" >&2
+fi
+
+exit $fail

@@ -23,7 +23,8 @@
     "auth0:cleanup:dry-run": "tsx scripts/cleanup-auth0-clients.ts --dry-run",
     "build:sparrowdb": "bash scripts/build-sparrowdb-node.sh",
     "import:granola": "tsx scripts/import-granola.ts",
-    "import:granola:dry-run": "tsx scripts/import-granola.ts --dry-run"
+    "import:granola:dry-run": "tsx scripts/import-granola.ts --dry-run",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [
     "mcp",
