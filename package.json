@@ -53,7 +53,7 @@
     "mongodb": "^6.0.0",
     "neo4j-driver": "^5.15.0",
     "node-fetch": "^3.3.0",
-    "sparrowdb": "^0.1.20"
+    "sparrowdb": "^0.1.27"
   },
   "devDependencies": {
     "@types/cors": "^2.8.0",

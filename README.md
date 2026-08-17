@@ -391,7 +391,7 @@ bash scripts/build-sparrowdb-node.sh [/path/to/SparrowDB]
 ### Import from Neo4j
 
 ```bash
-SPARROWDB_PATH=~/.kms-sparrowdb \
+SPARROWDB_PATH=~/.kms-sparrowdb-v2 \
 doppler run --project ry-local --config dev_personal -- \
   node scripts/import-neo4j-to-sparrowdb.mjs
 ```
@@ -399,7 +399,7 @@ doppler run --project ry-local --config dev_personal -- \
 ### Start KMS with SparrowDB backend
 
 ```bash
-SPARROWDB_PATH=~/.kms-sparrowdb \
+SPARROWDB_PATH=~/.kms-sparrowdb-v2 \
 KMS_STORAGE_BACKEND=sparrowdb \
 doppler run --project ry-local --config dev_personal -- npm run dev
 ```
@@ -408,7 +408,7 @@ doppler run --project ry-local --config dev_personal -- npm run dev
 
 ```bash
 KMS_SHADOW_MODE=true \
-SPARROWDB_PATH=~/.kms-sparrowdb \
+SPARROWDB_PATH=~/.kms-sparrowdb-v2 \
 doppler run --project ry-local --config dev_personal -- npm run dev
 ```
 

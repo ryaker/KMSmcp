@@ -31,6 +31,7 @@ const require = createRequire(import.meta.url)
 import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 import type { GraphStorage } from '../types/index.js'
 import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
+import { resolveSparrowDBPath } from '../storage/sparrowDbPath.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
@@ -126,7 +127,7 @@ async function getTools() {
   // Graph backend: SparrowDB (default — embedded, no Aura latency).
   // KMS_STORAGE_BACKEND env var is now a no-op kept for backwards compat;
   // SparrowDB is the only graph backend after the cutover.
-  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  const sparrowPath = resolveSparrowDBPath()
   console.error(`⚡ CLI graph backend: SparrowDB (path: ${sparrowPath})`)
   const graphBackend: GraphStorage = new SparrowDBStorage({ dbPath: sparrowPath }) as GraphStorage
 
@@ -239,7 +240,7 @@ async function cmdSearch(args: string[]) {
 async function cmdPing() {
   const cfg = buildConfig()
 
-  const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2')
+  const sparrowPath = resolveSparrowDBPath()
 
   const checks = await Promise.allSettled([
     (async () => {
@@ -307,6 +308,24 @@ async function cmdRoute(args: string[]) {
 // ── Shared helper: load SparrowDB native binding ──────────────────────────────
 
 async function loadSparrowDBNative(): Promise<any> {
+  // Prefer the installed npm dependency. Node's own resolution + the
+  // package's own index.js/platforms.js pick the correct prebuilt binary
+  // for this platform+arch — do not reconstruct a path into node_modules
+  // or hardcode a platform-specific filename here. Same precedent as
+  // SparrowDBStorage.ts's loadNativeBinding().
+  const attempted: string[] = []
+  try {
+    return require('sparrowdb')
+  } catch (err) {
+    attempted.push(`sparrowdb (node_modules): ${(err as Error).message.split('\n')[0]}`)
+  }
+
+  // Fall back to a local SparrowDB source-tree dev build. These paths only
+  // matter when the npm dependency isn't installed at all — they must
+  // never win over it, since an on-disk source checkout can silently be a
+  // stale build (see #524: an old binary here predates the process lock
+  // and can open a live database SparrowDB itself would refuse to touch
+  // concurrently).
   const { existsSync } = await import('node:fs')
   const candidatePaths = [
     join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
@@ -314,8 +333,21 @@ async function loadSparrowDBNative(): Promise<any> {
     join(homedir(), 'Dev', 'SparrowDB', 'target', 'debug', 'sparrowdb.node'),
   ]
   for (const p of candidatePaths) {
-    if (existsSync(p)) return require(p)
+    attempted.push(p)
+    if (existsSync(p)) {
+      try {
+        return require(p)
+      } catch (err) {
+        attempted.push(`  ${p}: ${(err as Error).message.split('\n')[0]}`)
+      }
+    }
   }
+
+  console.error(
+    `sparrowdb native module not found. Tried:\n${attempted.map((a) => `  - ${a}`).join('\n')}\n` +
+    `Install: npm install sparrowdb\n` +
+    `Or build locally: cargo build --release -p sparrowdb-node  in ~/Dev/SparrowDB`
+  )
   return null
 }
 
@@ -331,9 +363,7 @@ async function cmdExport(args: string[]) {
     strict: false
   })
 
-  const dbPath = (values.path as string | undefined)
-    || process.env.SPARROWDB_PATH
-    || homedir() + '/.kms-sparrowdb'
+  const dbPath = resolveSparrowDBPath(values.path as string | undefined)
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
   const backupDir = homedir() + '/.kms-backups'
@@ -441,9 +471,7 @@ async function cmdImport(args: string[]) {
     strict: false
   })
 
-  const dbPath = (values.path as string | undefined)
-    || process.env.SPARROWDB_PATH
-    || homedir() + '/.kms-sparrowdb'
+  const dbPath = resolveSparrowDBPath(values.path as string | undefined)
 
   const { existsSync, mkdirSync, createReadStream, writeFileSync } = await import('node:fs')
   const readline = await import('node:readline')
