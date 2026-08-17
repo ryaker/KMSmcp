@@ -17,12 +17,24 @@
  *      saw nulls, another could not reproduce them, and the reason is the real
  *      defect covered below — it is about the RETURN *alias*, not about id().
  *
- * The real defect: in a node-scan projection the engine resolves a property
- * column by its OUTPUT NAME rather than by the projected expression. So
- * `RETURN k.id AS zzz` reads a property named `zzz` (null), and
- * `RETURN k.id AS contentType` silently hands back k.contentType. Projecting
- * anything that materialises the node (`id(k)`, `labels(k)`, the variable `k`)
- * restores correct resolution, which is why `_ensureInternalIdMap` is immune.
+ * The real defect (as of 2026-07-31, sparrowdb npm 0.1.20): in a node-scan
+ * projection the engine resolves a property column by its OUTPUT NAME rather
+ * than by the projected expression. So `RETURN k.id AS zzz` read a property
+ * named `zzz` (null), and `RETURN k.id AS contentType` silently handed back
+ * k.contentType. Projecting anything that materialises the node (`id(k)`,
+ * `labels(k)`, the variable `k`) restored correct resolution, which is why
+ * `_ensureInternalIdMap` was immune.
+ *
+ * UPDATE 2026-08-17: that defect is FIXED upstream as of sparrowdb npm
+ * >=0.1.26 (SparrowDB #514, "projection resolves RETURN columns by AST expr,
+ * not display name"). This describe block's `SparrowDB = require_('sparrowdb')`
+ * had been silently `describe.skip`'d this whole time — no working native
+ * binding ever resolved locally on this machine before now — so bumping the
+ * dependency to 0.1.27 (see cli/kms.ts's native-loader fix, same PR) is what
+ * ran it for the first time. The three tests that asserted the old broken
+ * behaviour as "expected" failed as a result; their assertions were updated
+ * below to the correct, current behaviour. See inline comments for what used
+ * to happen — do not re-derive this from a test that passed on 0.1.20.
  */
 
 import { createRequire } from 'module'
@@ -156,24 +168,31 @@ describeIfBinding('sparrowdb binding — read behaviour', () => {
   })
 
   // -------------------------------------------------------------------------
-  // The defect that actually exists: RETURN aliases resolve by output name
+  // The defect that used to exist: RETURN aliases resolved by output name
+  // instead of by expression. Fixed upstream in SparrowDB #514 (sparrowdb
+  // npm >=0.1.26) — see the UPDATE note in the file header.
   // -------------------------------------------------------------------------
 
-  describe('RETURN aliases on a node scan resolve by output name, not by expression', () => {
-    it('an alias that names no property reads null', () => {
-      const rows = db.execute('MATCH (k:Knowledge) RETURN k.id AS zzz').rows
-      expect(rows).toHaveLength(2)
-      expect(rows.every(r => r['zzz'] === null)).toBe(true)
+  describe('RETURN aliases on a node scan resolve by expression, not by output name (fixed — SparrowDB #514)', () => {
+    it('an alias that names no property still resolves the projected expression', () => {
+      // Used to read null (the alias "zzz" names no real property, and
+      // resolution used to be keyed on the alias string). Now resolves k.id
+      // regardless of what the alias is spelled.
+      const rows = db.execute('MATCH (k:Knowledge) RETURN k.id AS zzz').rows.map(r => r['zzz'])
+      expect(rows.sort()).toEqual([UUID_A, UUID_B].sort())
     })
 
-    it('an alias naming a DIFFERENT property silently returns that other property', () => {
-      // The dangerous shape: this reads like "give me the id" and returns the
-      // contentType. Not an error, not a null — wrong data.
+    it('an alias naming a DIFFERENT property resolves the aliased expression, not the name it collides with', () => {
+      // Used to read like "give me the id" and silently return contentType
+      // instead — not an error, not a null, just wrong data, because
+      // resolution used to look up a property literally named "contentType".
+      // Now resolves k.id correctly no matter which property name the alias
+      // collides with.
       const row = db.execute(
         `MATCH (k:Knowledge {id: '${UUID_A}'}) RETURN k.id AS contentType`
       ).rows[0]
-      expect(row['contentType']).toBe('insight')
-      expect(row['contentType']).not.toBe(UUID_A)
+      expect(row['contentType']).toBe(UUID_A)
+      expect(row['contentType']).not.toBe('insight')
     })
 
     it('an alias equal to the property name is correct', () => {
@@ -195,7 +214,7 @@ describeIfBinding('sparrowdb binding — read behaviour', () => {
       expect(rows.sort()).toEqual([UUID_A, UUID_B].sort())
     })
 
-    it('_ensureInternalIdMap survives only because it projects id(k)', () => {
+    it('_ensureInternalIdMap no longer needs id(k) alongside it to resolve node_id correctly', () => {
       // Verbatim shape from SparrowDBStorage._ensureInternalIdMap().
       const rows = db.execute('MATCH (k:Knowledge) RETURN id(k) AS nid, k.id AS node_id').rows
       expect(rows).toHaveLength(2)
@@ -203,9 +222,11 @@ describeIfBinding('sparrowdb binding — read behaviour', () => {
         expect(typeof row['nid']).toBe('number')
         expect([UUID_A, UUID_B]).toContain(row['node_id'])
       }
-      // Drop the id(k) column and the same alias goes null.
+      // Used to go null once id(k) was dropped — that used to be the whole
+      // reason _ensureInternalIdMap carried the otherwise-unused id(k)
+      // column. Now resolves correctly with or without it.
       const stripped = db.execute('MATCH (k:Knowledge) RETURN k.id AS node_id').rows
-      expect(stripped.every(r => r['node_id'] === null)).toBe(true)
+      expect(stripped.map(r => r['node_id']).sort()).toEqual([UUID_A, UUID_B].sort())
     })
 
     it('relationship-expansion projections are unaffected by the alias defect', () => {
