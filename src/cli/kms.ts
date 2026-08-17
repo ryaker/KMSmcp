@@ -308,6 +308,24 @@ async function cmdRoute(args: string[]) {
 // ── Shared helper: load SparrowDB native binding ──────────────────────────────
 
 async function loadSparrowDBNative(): Promise<any> {
+  // Prefer the installed npm dependency. Node's own resolution + the
+  // package's own index.js/platforms.js pick the correct prebuilt binary
+  // for this platform+arch — do not reconstruct a path into node_modules
+  // or hardcode a platform-specific filename here. Same precedent as
+  // SparrowDBStorage.ts's loadNativeBinding().
+  const attempted: string[] = []
+  try {
+    return require('sparrowdb')
+  } catch (err) {
+    attempted.push(`sparrowdb (node_modules): ${(err as Error).message.split('\n')[0]}`)
+  }
+
+  // Fall back to a local SparrowDB source-tree dev build. These paths only
+  // matter when the npm dependency isn't installed at all — they must
+  // never win over it, since an on-disk source checkout can silently be a
+  // stale build (see #524: an old binary here predates the process lock
+  // and can open a live database SparrowDB itself would refuse to touch
+  // concurrently).
   const { existsSync } = await import('node:fs')
   const candidatePaths = [
     join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
@@ -315,8 +333,21 @@ async function loadSparrowDBNative(): Promise<any> {
     join(homedir(), 'Dev', 'SparrowDB', 'target', 'debug', 'sparrowdb.node'),
   ]
   for (const p of candidatePaths) {
-    if (existsSync(p)) return require(p)
+    attempted.push(p)
+    if (existsSync(p)) {
+      try {
+        return require(p)
+      } catch (err) {
+        attempted.push(`  ${p}: ${(err as Error).message.split('\n')[0]}`)
+      }
+    }
   }
+
+  console.error(
+    `sparrowdb native module not found. Tried:\n${attempted.map((a) => `  - ${a}`).join('\n')}\n` +
+    `Install: npm install sparrowdb\n` +
+    `Or build locally: cargo build --release -p sparrowdb-node  in ~/Dev/SparrowDB`
+  )
   return null
 }
 
