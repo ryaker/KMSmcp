@@ -65,6 +65,10 @@
  * Environment variables:
  *   KMS_STORAGE_BACKEND=sparrowdb   (switches graph backend from Neo4j to SparrowDB)
  *   SPARROWDB_PATH=/path/to/kms.db  (default: ~/.kms-sparrowdb-v2)
+ *   KMS_SELF_ENTITY_ID=<node id>    (the Person node that "my dad"/"my wife" resolve
+ *                                    against; falls back to KMS_DEFAULT_USER_ID, then
+ *                                    to `richard_yaker` — and only when such a node
+ *                                    actually exists. See OntologyIndex.)
  */
 
 import { createRequire } from 'module'
@@ -79,6 +83,8 @@ import { fileURLToPath } from 'url'
 import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js'
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { GraphEdgeIndex } from './GraphEdgeIndex.js'
+import { OntologyIndex } from './OntologyIndex.js'
+import type { OntologyMatch } from './OntologyIndex.js'
 import { isSparrowdbPackageNotInstalled } from './nativeLoaderGuard.js'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 import { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME } from './sparrowDbPath.js'
@@ -265,6 +271,12 @@ export class SparrowDBStorage implements StorageSystem {
   // graph's relationship types. See GraphEdgeIndex.
   private edgeIndex: GraphEdgeIndex | null = null
 
+  // Ontology entity index (Person/Organization/Event/…). Built lazily on first
+  // ontology-aware read. Separate from the Knowledge sidecar because these nodes
+  // are not Knowledge entries at all: they have no content string, no userId and no
+  // contentType, and before this existed the search path could not see them.
+  private ontologyIndex: OntologyIndex | null = null
+
   constructor(config?: SparrowDBConfig) {
     this.dbPath = resolveSparrowDBPath(config?.dbPath)
     this.sidecarPath = join(this.dbPath, 'content-index.json')
@@ -283,8 +295,9 @@ export class SparrowDBStorage implements StorageSystem {
     this.db = native.SparrowDB.open(this.dbPath)
 
     // A re-initialize points at a different handle — the adjacency index built
-    // from the previous one no longer describes this graph.
+    // from the previous one no longer describes this graph. Same for the ontology.
     this.edgeIndex = null
+    this.ontologyIndex = null
 
     // Load content sidecar
     this._loadSidecar()
@@ -1188,12 +1201,60 @@ export class SparrowDBStorage implements StorageSystem {
         })
       )
 
-      logger.debug(`⚡ SparrowDB found ${results.length} results`)
-      return results
+      const ontologyResults = await this._ontologyArm(query, results)
+
+      logger.debug(
+        `⚡ SparrowDB found ${results.length} knowledge + ${ontologyResults.length} ontology results`
+      )
+      return [...results, ...ontologyResults]
     } catch (error) {
       logger.warn('⚠️ SparrowDB search error:', error)
       return []
     }
+  }
+
+  /**
+   * The ontology arm of `search`.
+   *
+   * Runs alongside the Knowledge sidecar scan rather than instead of it: "who is Eddie
+   * Yaker" should return the Person node AND whatever notes mention him, and a purely
+   * technical query should return neither an entity nor a degraded Knowledge ranking.
+   *
+   * Skipped outright when the caller's filters could not possibly be satisfied by an
+   * entity — an ontology node has no `contentType`, no `metadata.subject` and no
+   * authored `confidence`, so honouring those filters means standing down, not
+   * pretending the fields exist.
+   */
+  private async _ontologyArm(query: KnowledgeQuery, knowledgeResults: any[]): Promise<any[]> {
+    const filters = query.filters ?? {}
+    if (filters.contentType && filters.contentType.length > 0 && !filters.contentType.includes('entity')) {
+      return []
+    }
+    if (filters.subject !== undefined) return []
+    if (filters.source && filters.source.length > 0 && !filters.source.includes('personal')) return []
+    if (!query.query?.trim()) return []
+
+    const maxResults = Math.floor(query.options?.maxResults ?? 10)
+    // Relationships are the point of an entity result — "Person + 1-hop edges" is what
+    // makes "my dad" answerable — but a caller that explicitly opted out gets the same
+    // answer it asked for here as on the Knowledge path, and skips the adjacency build.
+    const hits = await this.searchOntology(
+      query.query,
+      Math.max(1, Math.min(5, maxResults)),
+      { includeRelationships: query.options?.includeRelationships !== false }
+    )
+
+    // An id already returned as Knowledge must not come back a second time as an
+    // entity; dedup downstream would merge them, but on `content` length, which would
+    // hand the caller whichever copy happened to be wordier.
+    const seen = new Set(knowledgeResults.map(r => r.id))
+    let out = hits.filter(h => !seen.has(h.id))
+
+    if (filters.minConfidence !== undefined) {
+      const min = filters.minConfidence
+      out = out.filter(h => h.confidence >= min)
+    }
+    return out
   }
 
   // -------------------------------------------------------------------------
@@ -1375,64 +1436,66 @@ export class SparrowDBStorage implements StorageSystem {
     }
   }
 
+  /**
+   * A brief card for one node — what `unified_search` returns as `entity_context`.
+   *
+   * Previously this re-queried the graph for a fixed property list and then threw the
+   * result away: `name` was the first three words of the sidecar entry (null for a
+   * Person, which has no sidecar entry), `key_props` was always `{}`, and
+   * `top_relationships` read only `RELATED_TO`, so a Person's `PARENT_OF` /
+   * `SIBLING_OF` edges never appeared. The ontology index already holds the node's real
+   * name, labels and properties, and the edge index already holds every typed edge, so
+   * the card is assembled from those.
+   */
   async getEntitySummary(id: string): Promise<Record<string, any> | null> {
-    // Check sidecar first for full content.
+    const entity = this._ontology().get(id)
     const entry = this.contentIndex.get(id)
 
-    // Try each label in the graph.
-    for (const label of ['Knowledge', 'Person', 'Organization', 'Project',
-                          'Technology', 'Concept', 'Service', 'Event']) {
-      let result: QueryResult
+    if (entity) {
+      let top_relationships: any[] = []
       try {
-        result = this.db.execute(
-          `MATCH (n:${label} {id: ${cypherStr(id)}}) ` +
-          `RETURN n.id, n.name, n.description, n.notes, n.headline, ` +
-          `       n.profession, n.career, n.purpose, n.industry, ` +
-          `       n.expertise, n.role, n.status, n.domain, n.taskPattern, ` +
-          `       n.approach, n.path`
-        )
-      } catch { continue }
-      if (result.rows.length === 0) continue
-
-      // Content comes from the sidecar; the graph node holds structure only.
-      const summary: Record<string, any> = {
-        id,
-        name: entry?.content?.split(' ').slice(0, 3).join(' ') ?? null,
-        type: [label],
-        summary: entry?.content?.slice(0, 200) ?? null,
-        key_props: {} as Record<string, any>,
-        top_relationships: []
+        top_relationships = this._edges().relationshipsFor(id).slice(0, 6).map(r => ({
+          rel: r.relationship,
+          direction: r.direction,
+          id: r.relatedNode,
+          name: this._ontology().get(r.relatedNode)?.name
+            ?? this.contentIndex.get(r.relatedNode)?.content?.slice(0, 40)
+            ?? r.relatedNode
+        }))
+      } catch (error) {
+        logger.debug(`entity summary relationships unavailable for ${id}: ${error}`)
       }
 
-      // Best-effort: fetch up to 4 connected nodes.
-      try {
-        const rels = this.db.execute(
-          `MATCH (n {id: ${cypherStr(id)}})-[:RELATED_TO]-(m) ` +
-          `RETURN m.id LIMIT 4`
-        )
-        summary.top_relationships = rels.rows
-          .map(r => {
-            const mid = String(r['m.id'] ?? '')
-            const related = this.contentIndex.get(mid)
-            return related
-              ? { rel: 'RELATED_TO', name: related.content.slice(0, 40), id: related.id }
-              : null
-          })
-          .filter(Boolean)
-      } catch { /* ignore */ }
-
-      return summary
+      return {
+        id,
+        name: entity.name,
+        type: entity.labels,
+        summary: entity.content.slice(0, 400),
+        key_props: entity.props,
+        top_relationships
+      }
     }
 
-    // Not in graph at all — return from sidecar only if available.
+    // Not an ontology entity — fall back to the Knowledge sidecar.
     if (entry) {
+      let top_relationships: any[] = []
+      try {
+        top_relationships = this._edges().relationshipsFor(id).slice(0, 4).map(r => ({
+          rel: r.relationship,
+          direction: r.direction,
+          id: r.relatedNode,
+          name: r.relatedContent || this._ontology().get(r.relatedNode)?.name || r.relatedNode
+        }))
+      } catch (error) {
+        logger.debug(`entity summary relationships unavailable for ${id}: ${error}`)
+      }
       return {
         id,
         name: null,
         type: ['Knowledge'],
         summary: entry.content.slice(0, 200),
         key_props: {},
-        top_relationships: []
+        top_relationships
       }
     }
     return null
@@ -1616,11 +1679,97 @@ export class SparrowDBStorage implements StorageSystem {
     if (!this.edgeIndex) {
       this.edgeIndex = new GraphEdgeIndex(
         this.db,
-        (id: string) => this.contentIndex.get(id),
+        // Ontology nodes are not in the Knowledge sidecar, so without the second
+        // lookup a `PARENT_OF` edge rendered as an id with an empty preview — the
+        // relationship was present and unreadable, which is barely better than absent.
+        (id: string) => this.contentIndex.get(id) ?? this._ontologyEntry(id),
         { debug: (m: string) => logger.debug(`⚡ SparrowDB ${m}`) }
       )
     }
     return this.edgeIndex
+  }
+
+  /** An ontology node in the shape GraphEdgeIndex's entry resolver expects. */
+  private _ontologyEntry(id: string): { id: string; content: string } | undefined {
+    const entity = this._ontology().get(id)
+    return entity ? { id: entity.id, content: entity.name } : undefined
+  }
+
+  /**
+   * The ontology index, created on first use so it always wraps the current db handle.
+   *
+   * The adjacency is handed over so kinship cues ("my dad") can be resolved by walking
+   * `PARENT_OF` from the self node, and it is set lazily — constructing the edge index
+   * here would build the whole-graph adjacency on every search, including the ones that
+   * never ask for a relationship.
+   */
+  private _ontology(): OntologyIndex {
+    if (!this.ontologyIndex) {
+      this.ontologyIndex = new OntologyIndex(this.db, {
+        edges: null,
+        debug: (m: string) => logger.debug(`⚡ SparrowDB ${m}`)
+      })
+    }
+    return this.ontologyIndex
+  }
+
+  /**
+   * Entity candidates for a natural-language query — Person, Organization, Event, and
+   * every other ontology label, with their real labels and 1-hop relationships.
+   *
+   * Exposed on the GraphStorage interface (optionally) so callers other than `search`
+   * can reach the ontology directly, and so a graph backend that has no ontology simply
+   * omits the method rather than returning misleading empties.
+   */
+  async searchOntology(
+    query: string,
+    maxResults = 5,
+    options: { includeRelationships?: boolean } = {}
+  ): Promise<any[]> {
+    try {
+      const ontology = this._ontology()
+      ontology.setNeighbourReader(this._edges())
+      const matches = ontology.search(query, { limit: maxResults })
+      const withRelationships = options.includeRelationships !== false
+      return matches.map(m => this._ontologyResult(m, withRelationships))
+    } catch (error) {
+      logger.warn('⚠️ SparrowDB ontology search error:', error)
+      return []
+    }
+  }
+
+  /** One ontology match in the result shape every other search arm returns. */
+  private _ontologyResult(match: OntologyMatch, includeRelationships = true): any {
+    const { entity, score, reasons } = match
+    let relationships: any[] = []
+    if (includeRelationships) {
+      try {
+        relationships = this._edges().relationshipsFor(entity.id)
+      } catch (error) {
+        logger.debug(`ontology relationships unavailable for ${entity.id}: ${error}`)
+      }
+    }
+    return {
+      id: entity.id,
+      content: entity.content,
+      confidence: score,
+      // Deliberately NOT a copy of `entity.props` — that is the same data the card
+      // already renders, and `index.ts` drops whole results when the response exceeds
+      // its byte budget, so duplicating content here would evict real hits. Structured
+      // properties reach callers through `entity_context[id].key_props`.
+      metadata: { ontology: true, matchReasons: reasons },
+      sourceSystem: 'sparrowdb',
+      // Ontology nodes carry no write timestamp; `calculateRecency` reads a missing
+      // one as neutral, which is right — an entity is neither fresh nor stale.
+      timestamp: undefined,
+      contentType: 'entity',
+      source: 'personal',
+      nodeLabels: entity.labels,
+      // The ontology arm's own match strength, kept distinct from `confidence` so the
+      // ranker can floor lexical relevance with it without conflating the two.
+      _ontologyScore: score,
+      relationships
+    }
   }
 
   /**

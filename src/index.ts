@@ -535,7 +535,7 @@ export class UnifiedKMSServer {
       },
       {
         name: 'unified_search',
-        description: 'Search across all KMS systems with FACT caching and intelligent ranking',
+        description: 'Search across all KMS systems with FACT caching and intelligent ranking. Also returns ontology entities (Person, Organization, Project, Event, …) with their real nodeLabels and 1-hop relationships, so questions about people and things ("my dad", "who is Eddie Yaker", "what happened July 12 2023") reach the graph rather than only the stored notes.',
         inputSchema: {
           type: 'object',
           properties: {

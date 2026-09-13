@@ -14,6 +14,7 @@ import {
   isHybridRetrievalEnabled,
   VECTOR_SOURCE_SYSTEM,
 } from '../retrieval/hybrid.js'
+import { ENTITY_LABELS, OPERATIONAL_LABELS } from '../storage/OntologyIndex.js'
 
 /** Shape of the KMS_EVAL_CAPTURE payload — the deduplicated, ranked pool captured
  *  before `maxResults` slicing so a ranker can be replayed offline over the same set. */
@@ -382,16 +383,19 @@ export class UnifiedSearchTool {
     entity_context: Record<string, any>
     triggered_actions: Array<{ id: string, type: string, name: string, actions: string[] }>
   }> {
-    // Node types that warrant an entity card — operational/system nodes are returned as triggers instead
-    const ENTITY_LABELS = new Set(['Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event'])
-    const OPERATIONAL_LABELS = new Set(['ContextTrigger', 'ToolRoute', 'ResourceMap', 'QueryType', 'System', 'MemoryTier'])
+    // Node types that warrant an entity card — operational/system nodes are returned as
+    // triggers instead. Both sets come from OntologyIndex, which is what actually
+    // produces the labels: a private copy here is how this gate ended up filtering for
+    // labels no search arm ever emitted.
+    const entityLabels = new Set<string>(ENTITY_LABELS)
+    const operationalLabels = new Set<string>(OPERATIONAL_LABELS)
 
     // Collect entity IDs from graph results
     const entityIds = new Set<string>()
     for (const r of results.graph) {
       const labels: string[] = r.nodeLabels || []
-      const hasEntityLabel = labels.some(l => ENTITY_LABELS.has(l))
-      const hasOperationalLabel = labels.some(l => OPERATIONAL_LABELS.has(l))
+      const hasEntityLabel = labels.some(l => entityLabels.has(l))
+      const hasOperationalLabel = labels.some(l => operationalLabels.has(l))
       if (hasEntityLabel && !hasOperationalLabel && r.id) {
         entityIds.add(r.id)
       }
@@ -834,7 +838,7 @@ export class UnifiedSearchTool {
    */
   private rankResults(results: any[], query: string): any[] {
     const scored = results.map(r => {
-      const relevance = this.calculateRelevance(r.content, query)
+      const relevance = this.effectiveRelevance(r, query)
       const recency = this.calculateRecency(r.timestamp)
       // Relevance dominates; recency breaks ties between comparably relevant hits
       // (memory is corrected over time, so newer entries about the same topic usually
@@ -861,7 +865,7 @@ export class UnifiedSearchTool {
    */
   private rankResultsHybrid(results: any[], query: string): any[] {
     const scored = results.map(r => {
-      const relevance = this.calculateRelevance(r.content, query)
+      const relevance = this.effectiveRelevance(r, query)
       const recency = this.calculateRecency(r.timestamp)
       const lexicalScore = relevance * 0.70 + recency * 0.25 + (r.confidence ?? 0) * 0.05
       return {
@@ -873,6 +877,30 @@ export class UnifiedSearchTool {
     })
 
     return fuseWithRRF(scored).map(r => ({ ...r, _score: r._rrf }))
+  }
+
+  /**
+   * Relevance used for ranking — lexical, floored by the ontology arm's own match score.
+   *
+   * An ontology entity card almost never shares tokens with the question that retrieved
+   * it. "my dad" reaches `charles_yaker` by walking `PARENT_OF` from the self node, and
+   * the card it produces ("Charles Jack Yaker (Charlie) — Person / relationship:
+   * father …") contains neither "my" nor "dad", so `calculateRelevance` scores it ~0 and
+   * the composite buries it under every incidental keyword hit. That is precisely the
+   * failure this arm exists to fix, and it would survive the fix unless the score the
+   * ontology arm already computed is allowed to stand in.
+   *
+   * A floor, not a bonus: a candidate is ranked on the BETTER of its two independently
+   * bounded [0, 1] signals, so nothing can exceed what a perfect lexical match already
+   * scores, and a result with no `_ontologyScore` — every Knowledge, Mem0, MongoDB and
+   * vector hit — is scored exactly as before.
+   */
+  private effectiveRelevance(result: any, query: string): number {
+    const lexical = this.calculateRelevance(result?.content, query)
+    const ontology = typeof result?._ontologyScore === 'number' && Number.isFinite(result._ontologyScore)
+      ? Math.min(1, Math.max(0, result._ontologyScore))
+      : 0
+    return Math.max(lexical, ontology)
   }
 
   /**
