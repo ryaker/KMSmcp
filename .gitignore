@@ -56,3 +56,4 @@ temp/
 .claude/.mcp.json
 DEDUP_*.md
 people-registry.csv
+!.eslintrc.json

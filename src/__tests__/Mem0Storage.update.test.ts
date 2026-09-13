@@ -3,7 +3,8 @@
  *
  * Covers the contract added to fix Mem0 corpus drift after kms_update:
  *   - Looks the Mem0 internal id up via search-and-filter on metadata.kms_id.
- *   - Calls client.update(mem0Id, content) once located.
+ *   - Calls client.update(mem0Id, { text: content }) once located — the SDK's
+*     signature is update(memoryId, {text, metadata, timestamp}), not a bare string.
  *   - Probe-and-skip on zero matches (entry never routed to Mem0).
  *   - 404 from client.update is swallowed (race between search and update).
  *   - No-op when content is missing (Mem0 update endpoint requires text).
@@ -73,7 +74,7 @@ describe('Mem0Storage.update — kms_update propagation', () => {
         })
       )
       // Update was called with the looked-up Mem0 id, not the kms id.
-      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-xyz', 'corrected content')
+      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-xyz', { text: 'corrected content' })
       expect(result).toBe(true)
     })
 
@@ -99,7 +100,7 @@ describe('Mem0Storage.update — kms_update propagation', () => {
       ])
 
       const result = await storage.update('kms-abc', 'corrected')
-      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-xyz', 'corrected')
+      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-xyz', { text: 'corrected' })
       expect(result).toBe(true)
     })
 
@@ -112,7 +113,7 @@ describe('Mem0Storage.update — kms_update propagation', () => {
       })
 
       const result = await storage.update('kms-abc', 'corrected')
-      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-first', 'corrected')
+      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-first', { text: 'corrected' })
       expect(mockClient.update).toHaveBeenCalledTimes(1)
       expect(result).toBe(true)
     })

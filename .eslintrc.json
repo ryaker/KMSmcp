@@ -1,0 +1,40 @@
+{
+  "root": true,
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "module"
+  },
+  "plugins": ["@typescript-eslint"],
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "env": {
+    "node": true,
+    "es2022": true,
+    "jest": true
+  },
+  "ignorePatterns": [
+    "dist/",
+    "node_modules/",
+    "graphify-out/",
+    "coverage/",
+    "m1-mini-setup/",
+    "gateway/",
+    "examples/",
+    "*.js"
+  ],
+  "rules": {
+    "@typescript-eslint/no-explicit-any": "off",
+    "@typescript-eslint/no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
+    "@typescript-eslint/no-non-null-assertion": "off",
+    "@typescript-eslint/no-var-requires": "off",
+    "no-console": "off",
+    "no-empty": ["warn", { "allowEmptyCatch": true }],
+    "no-irregular-whitespace": ["error", { "skipRegExps": true, "skipStrings": true, "skipTemplates": true }],
+    "no-fallthrough": "warn",
+    "no-constant-condition": ["warn", { "checkLoops": false }],
+    "@typescript-eslint/no-namespace": "warn"
+  }
+}

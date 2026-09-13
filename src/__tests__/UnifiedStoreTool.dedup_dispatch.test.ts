@@ -284,7 +284,7 @@ describe('DG-T1-C — UnifiedStoreTool action dispatch (issue #46)', () => {
   it('action=complement writes a new entry with metadata.related_to and bypasses the gate', async () => {
     // Inject a refuse-band candidate so we can prove the gate was bypassed
     // (a normal store with this candidate would return dedup_required).
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'existing-id',
         similarity: 0.99,
@@ -372,7 +372,7 @@ describe('DG-T1-C — UnifiedStoreTool action dispatch (issue #46)', () => {
 
   it('action=force-new writes a new entry with metadata.force_new_reason and bypasses the gate', async () => {
     // Inject a refuse-band candidate to prove the gate was bypassed
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'existing-id',
         similarity: 0.99,

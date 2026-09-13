@@ -134,7 +134,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   // -------------------------------------------------------------------------
 
   it('returns dedup_required (refuse band) when a candidate sim >= 0.88', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'existing-fact-id',
         similarity: 0.92,
@@ -190,7 +190,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   // -------------------------------------------------------------------------
 
   it('returns dedup_required (confirm band) when candidate sim is in [0.78, 0.88)', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'related-id',
         similarity: 0.83,
@@ -222,7 +222,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   // -------------------------------------------------------------------------
 
   it('proceeds to normal store when all candidates have sim < 0.78', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'unrelated-id',
         similarity: 0.41,
@@ -250,7 +250,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   })
 
   it('proceeds to normal store when findSimilar returns []', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([])
     const tool = makeTool()
     const result = await tool.store({ content: 'first ever entry', contentType: 'fact', userId: 'u' })
     expect(isDedupRequired(result)).toBe(false)
@@ -264,7 +264,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
 
   it('applies procedure refuse threshold of 0.85 (lower than default)', async () => {
     // sim=0.86 — would be confirm-band under default 0.88, refuse-band under procedure 0.85.
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'proc-id',
         similarity: 0.86,
@@ -292,7 +292,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   it('applies pattern refuse threshold of 0.92 (higher than default)', async () => {
     // sim=0.89 — would be refuse-band under default 0.88, but pattern's stricter
     // 0.92 threshold puts it in confirm-band.
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'pat-id',
         similarity: 0.89,
@@ -357,7 +357,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   it('dedup_threshold_override honored when both refuse + confirm provided', async () => {
     // sim=0.80 — would be confirm-band under defaults (0.88/0.78). With override
     // refuse=0.95, confirm=0.85 → 0.80 is below confirm → distinct → proceeds.
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'x',
         similarity: 0.80,
@@ -383,7 +383,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   })
 
   it('dedup_threshold_override applied symmetrically (refuse-band path)', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'x',
         similarity: 0.96,
@@ -414,7 +414,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     // With defaults (0.88/0.78), sim=0.83 is confirm-band. If override were
     // accepted asymmetrically with refuse=0.95, the test below would expect
     // distinct path. We expect defaults to apply → confirm band.
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'x',
         similarity: 0.83,
@@ -442,7 +442,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   })
 
   it('inverted override (refuse < confirm) is rejected; defaults applied', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'x',
         similarity: 0.92,
@@ -506,7 +506,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
   // -------------------------------------------------------------------------
 
   it('findSimilar throw degrades to normal store (non-fatal)', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockRejectedValue(new Error('vectorSearch crashed'))
+    (graph as any).findSimilar = jest.fn().mockRejectedValue(new Error('vectorSearch crashed'))
 
     const tool = makeTool()
     const result = await tool.store({
