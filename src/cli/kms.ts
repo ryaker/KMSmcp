@@ -32,6 +32,7 @@ import { MongoDBStorage } from '../storage/MongoDBStorage.js'
 import type { GraphStorage } from '../types/index.js'
 import { SparrowDBStorage } from '../storage/SparrowDBStorage.js'
 import { resolveSparrowDBPath } from '../storage/sparrowDbPath.js'
+import { isSparrowdbPackageNotInstalled } from '../storage/nativeLoaderGuard.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
@@ -317,6 +318,19 @@ async function loadSparrowDBNative(): Promise<any> {
   try {
     return require('sparrowdb')
   } catch (err) {
+    // A declared, pinned dependency that fails to load for any reason OTHER
+    // than "not installed" is a broken install (corrupt node_modules, ABI
+    // mismatch after a Node upgrade, missing platform binary) — falling
+    // through to an unpinned dev-tree binary below would silently run
+    // untested code against the live database instead of saying so. #99.
+    if (!isSparrowdbPackageNotInstalled(err)) {
+      throw new Error(
+        `sparrowdb is installed but failed to load: ${(err as Error).message.split('\n')[0]}\n` +
+        `This is a broken install, not a missing dependency — run \`npm ci\` to reinstall ` +
+        `rather than relying on a dev-tree fallback.`,
+        { cause: err }
+      )
+    }
     attempted.push(`sparrowdb (node_modules): ${(err as Error).message.split('\n')[0]}`)
   }
 

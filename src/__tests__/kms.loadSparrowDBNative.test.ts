@@ -40,6 +40,23 @@ function extractFunctionBody(source: string, name: string): string {
 describe('loadSparrowDBNative prefers the installed npm dependency', () => {
   const body = extractFunctionBody(SOURCE, 'loadSparrowDBNative')
 
+  it('fails loudly (does not fall through) when sparrowdb is installed but broken (#99)', () => {
+    // isSparrowdbPackageNotInstalled's own real-error-shape behaviour is
+    // covered directly in nativeLoaderGuard.test.ts; this only guards that
+    // loadSparrowDBNative actually gates on it before reaching the
+    // dev-tree fallback, rather than falling through unconditionally as it
+    // used to (issue #99).
+    expect(SOURCE).toMatch(/import \{ isSparrowdbPackageNotInstalled \} from ['"]\.\.\/storage\/nativeLoaderGuard\.js['"]/)
+    const npmIdx = body.search(/require\(\s*['"]sparrowdb['"]\s*\)/)
+    const guardIdx = body.indexOf('isSparrowdbPackageNotInstalled(err)')
+    const fallbackIdx = body.indexOf('candidatePaths')
+    expect(guardIdx).toBeGreaterThan(npmIdx)
+    expect(guardIdx).toBeLessThan(fallbackIdx)
+    // The guarded branch must throw, not silently continue past it.
+    const guardBlockEnd = body.indexOf('attempted.push', guardIdx)
+    expect(body.slice(guardIdx, guardBlockEnd)).toMatch(/throw new Error/)
+  })
+
   it('calls require(\'sparrowdb\') — not a reconstructed node_modules path or a hardcoded platform filename', () => {
     expect(body).toMatch(/require\(\s*['"]sparrowdb['"]\s*\)/)
     // Regression guard scoped to the npm-preferring section only (up to the
