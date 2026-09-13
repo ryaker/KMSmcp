@@ -76,7 +76,7 @@ describe('SparrowDBStorage constructor is wired to the shared resolver', () => {
   const SOURCE = readFileSync(join(__dirname, '..', 'storage', 'SparrowDBStorage.ts'), 'utf8')
 
   it('constructor delegates to resolveSparrowDBPath(config?.dbPath)', () => {
-    const ctorMatch = SOURCE.match(/constructor\(config\?: SparrowDBConfig\) \{([\s\S]*?)\n  \}/)
+    const ctorMatch = SOURCE.match(/constructor\(config\?: SparrowDBConfig\) \{([\s\S]*?)\n {2}\}/)
     expect(ctorMatch).not.toBeNull()
     const ctorBody = ctorMatch![1]
     expect(ctorBody).toMatch(/resolveSparrowDBPath\(config\?\.dbPath\)/)

@@ -211,7 +211,7 @@ describe('DG-T1-A — UnifiedStoreTool embedding-on-write (issue #43)', () => {
   })
 
   it('store succeeds when SparrowDB.storeEmbedding throws (graph write error)', async () => {
-    ;(graph as any).storeEmbedding = jest.fn().mockRejectedValue(new Error('graph SET failed'))
+    (graph as any).storeEmbedding = jest.fn().mockRejectedValue(new Error('graph SET failed'))
 
     const tool = new UnifiedStoreTool(
       router, { mongodb: mongo, graph, mem0 }, cache, null, null, embedder

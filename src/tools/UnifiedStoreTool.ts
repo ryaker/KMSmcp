@@ -289,7 +289,7 @@ export class UnifiedStoreTool {
     }
 
     // Apply smart inference if needed
-    let enrichedArgs = { ...args }
+    const enrichedArgs = { ...args }
     const inference = ContentInference.analyze(args.content)
 
     // Use inference to fill in missing parameters
