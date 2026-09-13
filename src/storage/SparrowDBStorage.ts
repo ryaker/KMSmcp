@@ -80,7 +80,7 @@ import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/Emb
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { GraphEdgeIndex } from './GraphEdgeIndex.js'
 import { isSparrowdbPackageNotInstalled } from './nativeLoaderGuard.js'
-import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
+import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 import { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME } from './sparrowDbPath.js'
 
 // Re-exported for backward compatibility — the canonical definitions now
@@ -444,7 +444,7 @@ export class SparrowDBStorage implements StorageSystem {
           // inside the MERGE pattern's literal property dict. Compound
           // MERGE+SET parses but the SET clause silently no-ops in 0.1.22
           // (verified — see channel msg #202 to SparrowDB session).
-          ;(this.db as any).executeWithParams(
+          (this.db as any).executeWithParams(
             `MERGE (k:Knowledge {` +
             `  id: ${cypherStr(knowledge.id)},` +
             `  contentType: ${cypherStr(knowledge.contentType)},` +
@@ -588,7 +588,7 @@ export class SparrowDBStorage implements StorageSystem {
       // embedding MUST go through executeWithParams (PR #409). The engine
       // coerces JS Array → engine List → Vec<f32> for HNSW index population.
       // String props (embedderId) still work via literal SET.
-      ;(this.db as any).executeWithParams(
+      (this.db as any).executeWithParams(
         `MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(id)}}) ` +
         `SET k.${SparrowDBStorage.VECTOR_PROPERTY} = $emb, ` +
         `    k.embedderId = ${cypherStr(embedderId)}`,

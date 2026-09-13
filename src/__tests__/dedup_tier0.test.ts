@@ -335,7 +335,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
 
   it('does not hit Tier 0 across different userIds (falls through)', async () => {
     // Mock findByFingerprint to scope by userId (this is what real impl does).
-    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
     // Tier 1 returns nothing either, so the write should succeed.
     ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
 
@@ -453,7 +453,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
   // -------------------------------------------------------------------------
 
   it('stamps metadata.fingerprint on the stored entry', async () => {
-    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
     ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
 
     const tool = makeTool()
@@ -484,7 +484,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
   })
 
   it('preserves the subject facet in the stamped fingerprint', async () => {
-    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
 
     const tool = makeTool()
     await tool.store({
@@ -510,7 +510,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
   // -------------------------------------------------------------------------
 
   it('Tier 0 hit short-circuits before the embedder is called', async () => {
-    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue({
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue({
       id: 'tier0-hit',
       content: 'C',
       contentType: 'fact',
@@ -543,7 +543,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
     // Real impl filters out flagged entries internally. Here we simulate a
     // backend that returned the flagged entry (defensive: the gate itself
     // also checks `existing.flag` before refusing).
-    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue({
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue({
       id: 'flagged-old-entry',
       content: 'old content',
       contentType: 'fact',
@@ -658,7 +658,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
   // -------------------------------------------------------------------------
 
   it('findByFingerprint throw degrades to Tier 1 (non-fatal)', async () => {
-    ;(graph as any).findByFingerprint = jest.fn().mockImplementation(() => {
+    (graph as any).findByFingerprint = jest.fn().mockImplementation(() => {
       throw new Error('sidecar load failed')
     })
     ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
@@ -713,7 +713,7 @@ describe('DG-T0 — UnifiedStoreTool Tier 0 dedup gate', () => {
   // -------------------------------------------------------------------------
 
   it('Tier 0 miss falls through to Tier 1 (existing dedup gate intact)', async () => {
-    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
     ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'tier1-near-dup',

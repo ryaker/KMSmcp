@@ -16,7 +16,7 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:ci": "jest --ci --coverage --watchAll=false",
-    "lint": "eslint src/**/*.ts",
+    "lint": "eslint 'src/**/*.ts'",
     "lint:fix": "eslint src/**/*.ts --fix",
     "clean": "rm -rf dist",
     "auth0:cleanup": "tsx scripts/cleanup-auth0-clients.ts",
@@ -33,7 +33,6 @@
     "ai",
     "cache",
     "mongodb",
-    "neo4j",
     "mem0"
   ],
   "author": "Richard Yaker",
@@ -52,7 +51,6 @@
     "jwks-rsa": "^3.0.0",
     "mem0ai": "^3.0.2",
     "mongodb": "^6.21.0",
-    "neo4j-driver": "^5.15.0",
     "node-fetch": "^3.3.0",
     "sparrowdb": "^0.1.27"
   },
