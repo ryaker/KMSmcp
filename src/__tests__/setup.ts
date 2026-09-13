@@ -75,6 +75,7 @@ global.testUtils = {
 
 // Type declarations for global test utilities
 declare global {
+  // eslint-disable-next-line no-var -- `declare global` requires `var`; let/const are invalid here.
   var testUtils: {
     createMockAuthContext: (overrides?: any) => any
     createMockOAuthConfig: (overrides?: any) => any

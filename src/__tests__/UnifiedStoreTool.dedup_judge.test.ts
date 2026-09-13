@@ -118,7 +118,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('calls classify() for confirm-band candidate with new + candidate content', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'existing-fact',
         similarity: 0.83,  // confirm band: 0.78 ≤ 0.83 < 0.88
@@ -156,7 +156,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('refuse-band candidates get llm_relation=duplicate without calling classify()', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       {
         id: 'existing-fact',
         similarity: 0.95,  // refuse band: ≥ 0.88
@@ -188,7 +188,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('with mixed-similarity candidates, only confirm-band ones call classify()', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       // Top is refuse-band → triggers gate
       { id: 'high', similarity: 0.91, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'high-sim content' },
       // Confirm-band → judge called
@@ -229,7 +229,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('per-candidate classify() throw → that candidate=null, others classified', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       // Both in confirm band — both should be classified in parallel.
       // Top is the one we'll have classify() reject for.
       { id: 'a', similarity: 0.85, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'A content' },
@@ -313,7 +313,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('llmJudge=null → no Tier 2 attempted; refuse-band still gets "duplicate"', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       { id: 'high', similarity: 0.91, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'high' },
       { id: 'mid',  similarity: 0.82, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'mid'  },
     ])
@@ -342,7 +342,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('classifies multiple confirm-band candidates in parallel (Promise.allSettled)', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       { id: 'a', similarity: 0.85, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'A' },
       { id: 'b', similarity: 0.83, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'B' },
       { id: 'c', similarity: 0.80, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'C' },
@@ -385,7 +385,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
   // -------------------------------------------------------------------------
 
   it('distinct candidate (sim < 0.78) → no gate, no judge', async () => {
-    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
       { id: 'a', similarity: 0.5, contentType: 'fact', source: 'technical', created: '2026-04-01T00:00:00Z', flag: null, content_preview: 'A' },
     ])
 
