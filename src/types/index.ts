@@ -163,6 +163,20 @@ export interface GraphStorage extends StorageSystem {
     labels: string[]
     aliases: string[]
   }>>
+  /**
+   * Ontology-aware entity retrieval (Person / Organization / Event / …).
+   *
+   * Optional: a graph backend with no ontology omits it, and `UnifiedSearchTool` then
+   * behaves exactly as it did before entity search existed. Results carry their REAL
+   * `nodeLabels` and an `_ontologyScore` in [0, 1] — the arm's own match strength,
+   * which the ranker uses as a relevance floor because an entity card shares almost no
+   * tokens with the question that asked for it ("my dad" → "Charles Jack Yaker").
+   */
+  searchOntology?(
+    query: string,
+    maxResults?: number,
+    options?: { includeRelationships?: boolean }
+  ): Promise<any[]>
   createAboutRelationships(sourceId: string, targetEntityIds: string[]): Promise<void>
   // Corrective operations — implemented by SparrowDBStorage. Optional on the
   // interface so future graph backends can omit them; callers should check for
