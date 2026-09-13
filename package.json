@@ -50,7 +50,7 @@
     "jsonwebtoken": "^9.0.0",
     "jwks-rsa": "^3.0.0",
     "mem0ai": "^3.0.2",
-    "mongodb": "^6.0.0",
+    "mongodb": "^6.21.0",
     "node-fetch": "^3.3.0",
     "sparrowdb": "^0.1.27"
   },
