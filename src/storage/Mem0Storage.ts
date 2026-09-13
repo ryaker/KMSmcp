@@ -151,8 +151,25 @@ export class Mem0Storage implements StorageSystem {
         userId: r.userId ?? r.user_id
       }))
 
-      console.log(`🧠 Mem0 found ${processedResults.length} results`)
-      return processedResults
+      // minConfidence is applied HERE, not server-side: Mem0's search API rejects
+      // a bare `min_confidence` filter key outright (see buildMem0Filters below) — it
+      // has no confidence predicate at all. Confidence comes from metadata.confidence
+      // at store time, falling back to the relevance score, matching how `confidence`
+      // is derived above.
+      const minConfidence = query.filters?.minConfidence
+      const filtered = typeof minConfidence === 'number'
+        ? processedResults.filter(r => r.confidence >= minConfidence)
+        : processedResults
+
+      if (filtered.length !== processedResults.length) {
+        console.log(
+          `🧠 Mem0 minConfidence>=${minConfidence} dropped ` +
+          `${processedResults.length - filtered.length} of ${processedResults.length}`
+        )
+      }
+
+      console.log(`🧠 Mem0 found ${filtered.length} results`)
+      return filtered
     } catch (error) {
       console.warn('⚠️ Mem0 search error:', error)
       return []
@@ -380,7 +397,16 @@ export class Mem0Storage implements StorageSystem {
       // Step 3: call Mem0 update with the resolved internal id.
       try {
         logger.debug(`[Mem0Storage.update] Updating Mem0 entry mem0Id=${mem0Id} for kms_id=${id}`)
-        await this.client.update(mem0Id, content)
+        // SDK signature is update(memoryId, { text, metadata, timestamp }). This
+        // passed `content` as a bare string — does not typecheck (TS2559) and
+        // fails at runtime (mem0ai throws "At least one of text, metadata, or
+        // timestamp must be provided" since destructuring a string yields
+        // undefined for all three), so kms_update has never propagated content
+        // to Mem0. The error doesn't match the 404 probe-and-skip regex below,
+        // so it fell through to the outer catch and returned false silently —
+        // every kms_update result showed backends:["sparrowdb"] and never mem0,
+        // which read as "not routed to Mem0" rather than "the write is broken."
+        await this.client.update(mem0Id, { text: content })
         logger.debug(`[Mem0Storage.update] Successfully propagated kms_update to Mem0 (kms_id=${id}, mem0Id=${mem0Id})`)
         return true
       } catch (updateError) {
@@ -431,28 +457,43 @@ export class Mem0Storage implements StorageSystem {
   private buildMem0Filters(filters?: KnowledgeQuery['filters']): any {
     if (!filters) return {}
 
-    const mem0Filters: any = {}
+    // Custom fields MUST be nested under `metadata`. Mem0 rejects unknown
+    // top-level filter keys outright — the server's own error names what it
+    // accepts: ['AND','NOT','OR','agent_id','app_id','categories','created_at',
+    // 'keywords','memory_ids','metadata','run_id','text','timestamp',
+    // 'updated_at','user_id'].
+    //
+    // This was sending content_type/source/min_confidence BARE, so every search
+    // carrying one of those filters threw ValidationError inside search()'s try
+    // block and was swallowed by its catch, returning [] — Mem0 contributed
+    // NOTHING to those queries, silently, with no error surfaced to the caller.
+    //
+    // Verified empirically against the live API (v2 search, user richard_yaker):
+    //   { user_id, content_type: 'fact' }              -> REJECT ValidationError
+    //   { user_id, metadata: { content_type: 'fact' } } -> 10 results
+    // and it genuinely discriminates rather than being accepted-and-ignored: a
+    // nonsense value returns 0 while a real one returns 10.
+    const metadata: Record<string, any> = {}
 
     if (filters.contentType) {
-      mem0Filters.content_type = filters.contentType
+      metadata.content_type = filters.contentType
     }
 
     if (filters.source) {
-      mem0Filters.source = filters.source
+      metadata.source = filters.source
     }
 
-    if (filters.minConfidence) {
-      mem0Filters.min_confidence = filters.minConfidence
-    }
-
-    // Subject facet (DG-FACET-A). Mem0 stores arbitrary fields under metadata.*
-    // when we pass them via options.metadata at store time (see store()), so
-    // filtering on `subject` here surfaces only entries with the matching facet.
+    // Subject facet (DG-FACET-A). Stored inside options.metadata at write time
+    // (see store()), so it filters here for the same reason content_type does.
     if (filters.subject !== undefined) {
-      mem0Filters.subject = filters.subject
+      metadata.subject = filters.subject
     }
 
-    return mem0Filters
+    // minConfidence is deliberately NOT sent. Mem0 has no server-side confidence
+    // predicate — `min_confidence` is not in the allowed-key list above and was
+    // being rejected. Confidence lives in metadata.confidence, so it is applied
+    // client-side in search() after results come back.
+    return Object.keys(metadata).length > 0 ? { metadata } : {}
   }
 
   private getKnownUserIds(): string[] {
