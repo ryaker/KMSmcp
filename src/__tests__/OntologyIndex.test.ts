@@ -263,6 +263,13 @@ describe('OntologyIndex', () => {
       expect(index.search('my mom')[0].entity.id).toBe('deborah_yaker')
     })
 
+    it('scores both relatives when two cues fire in the same query', () => {
+      const { index } = buildIndex()
+      const matches = ids(index.search('tell me about my mom and dad'))
+      expect(matches).toContain('charles_yaker')
+      expect(matches).toContain('deborah_yaker')
+    })
+
     it('walks two hops for grandparents', () => {
       const { index } = buildIndex()
       // Sol states no relationship at all — only PARENT_OF → PARENT_OF plus sex reaches him.
