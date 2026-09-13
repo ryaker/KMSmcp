@@ -13,7 +13,6 @@ import { randomUUID, createHash } from 'node:crypto'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { AuthContext } from '../auth/types.js'
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
 import {
   getSessionStats,

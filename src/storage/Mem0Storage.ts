@@ -22,7 +22,7 @@
  *  - Live `kms_ping` previously threw on getStats top-level user_id (caught + fixed 2026-05-07)
  */
 
-import { MemoryClient, Memory } from 'mem0ai'
+import { MemoryClient } from 'mem0ai'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
 import { logger } from '../logger.js'
 

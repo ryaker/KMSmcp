@@ -16,7 +16,7 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:ci": "jest --ci --coverage --watchAll=false",
-    "lint": "eslint src/**/*.ts",
+    "lint": "eslint 'src/**/*.ts'",
     "lint:fix": "eslint src/**/*.ts --fix",
     "clean": "rm -rf dist",
     "auth0:cleanup": "tsx scripts/cleanup-auth0-clients.ts",
