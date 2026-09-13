@@ -79,6 +79,7 @@ import { fileURLToPath } from 'url'
 import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js'
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { GraphEdgeIndex } from './GraphEdgeIndex.js'
+import { isSparrowdbPackageNotInstalled } from './nativeLoaderGuard.js'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPersonEntry, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 import { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME } from './sparrowDbPath.js'
 
@@ -171,11 +172,27 @@ interface ContentEntry {
 
 function loadNativeBinding(): SparrowDBModule {
   const require = createRequire(import.meta.url)
-  // Prefer npm package; fall back to local dev builds
+  // Prefer npm package; fall back to local dev builds — but ONLY when the
+  // package is genuinely absent. A declared, pinned dependency that fails to
+  // load for any OTHER reason (corrupt install, ABI mismatch, bad binary) is
+  // a broken install, and silently falling through to an unpinned,
+  // unversioned dev-tree binary makes that worse, not better — the failure
+  // mode issue #99 exists to prevent. Same fix as loadSparrowDBNative() in
+  // src/cli/kms.ts.
   try {
     return require('sparrowdb') as SparrowDBModule
-  } catch {
-    // npm package not installed — try local dev paths
+  } catch (err) {
+    if (!isSparrowdbPackageNotInstalled(err)) {
+      throw new Error(
+        `SparrowDBStorage: the 'sparrowdb' package is installed but failed to load ` +
+        `(${err instanceof Error ? err.message.split('\n')[0] : String(err)}). ` +
+        `This is a broken install, not a missing dependency — falling back to an ` +
+        `unpinned dev-tree binary would silently run untested code against the ` +
+        `live database. Run \`npm ci\` to reinstall, or investigate the error above.`,
+        { cause: err }
+      )
+    }
+    // Package genuinely not installed — the local-dev-build case below.
   }
   const candidates = [
     join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
