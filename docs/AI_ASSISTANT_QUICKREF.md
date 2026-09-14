@@ -1,8 +1,16 @@
 # Unified KMS MCP Server - AI Assistant Quick Reference
 
+> **HISTORICAL DOCUMENT — verify against `src/` before relying on any detail here.**
+>
+> **`neo4j` is retired.** Every `neo4j` reference below predates the SparrowDB
+> cutover and is kept only as a record of the original design. The live storage
+> target is **`graph`** — see `src/types/index.ts`, where the type is
+> `'mem0' | 'graph' | 'mongodb'`. There is no `neo4j` member. Read `neo4j` here as
+> "the graph backend, then Neo4j Aura, now SparrowDB".
+
 ## Project Context
 
-You are implementing a Unified Knowledge Management System (KMS) MCP Server that treats databases as "AI brain memory" rather than traditional data storage. This system intelligently routes knowledge to Mem0 (semantic memory), Neo4j (relationships), or MongoDB (structured data) while maintaining sub-100ms response times.
+You are implementing a Unified Knowledge Management System (KMS) MCP Server that treats databases as "AI brain memory" rather than traditional data storage. This system intelligently routes knowledge to Mem0 (semantic memory), SparrowDB/graph (relationships), or MongoDB (structured data) while maintaining sub-100ms response times.
 
 ## Key Differences from Traditional Approaches
 

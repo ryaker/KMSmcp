@@ -105,7 +105,7 @@ This is the only file created by this plan. No code, no hooks, no schema migrati
 
 ## §1 Context & current state (½ page)
 
-- The polyglot architecture (Mem0 / Neo4j / MongoDB) and where injection happens (`kms-context-fetch.py` → `unified_search` → prepended to UserPromptSubmit).
+- The polyglot architecture (Mem0 / SparrowDB (graph) / MongoDB) and where injection happens (`kms-context-fetch.py` → `unified_search` → prepended to UserPromptSubmit).
 - The corrective tools that already exist: update/delete/flag/supersede/reap in `src/tools/UnifiedStoreTool.ts:404-619`. Reference, don't restate.
 - What we don't have: any measurement, any feedback loop, any signal back to ranking.
 - Anecdotal baseline: **~22% on-topic injection rate**. Flag this as anecdotal — leg 1 produces the real number.
@@ -210,7 +210,7 @@ Discovery rate goes up because the agent doesn't have to remember to correct —
 |---|---|---|---|---|
 | **Leg 0 — Measurement only** | Stop-hook scorer + `kms_quality_log` + rollup, no ranking change | spec signed off | 7 days of clean data, judge prompt validated against 50 hand-labeled turns (>85% agreement) | Scorer adds >500ms latency to Stop hook; judge agreement <70% |
 | **Leg 1 — Mem0 leg of feedback loop** | `effective_confidence` applied to Mem0 results only in `rankResults` | leg 0 exit met | 7 days; Mem0 on-topic rate improves by ≥10pp; usage rate improves by ≥5pp; no regression in contradiction rate | Any of: Mem0 on-topic drops, latency p95 >150ms, false-flag rate >10% (good entries demoted then resurrected) |
-| **Leg 2 — Neo4j leg** | Same mechanism, Neo4j results | leg 1 exit met | same thresholds | same |
+| **Leg 2 — graph leg (SparrowDB)** | Same mechanism, graph results | leg 1 exit met | same thresholds | same |
 | **Leg 3 — MongoDB leg + closed corrective loop** | MongoDB + §5 suggestion surfacing | leg 2 exit met | overall on-topic ≥80%, discovery rate ≥70% | regressions or judge drift |
 
 Each leg gets a **1-week measurement window minimum**. The spec is explicit: if a leg regresses, revert (one config flag), don't patch in flight. Rethink before re-attempting.

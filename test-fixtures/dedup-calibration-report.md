@@ -15,7 +15,7 @@
 | **Refuse threshold** (Tier 1 reject) | **0.88** | Lowest threshold with zero false positives in calibration set; catches 56% of duplicates outright. |
 | **Confirm threshold** (Tier 1 → require LLM judge) | **0.78** | Below this, dups are rare enough that vector dedup isn't worthwhile; above 0.78 sits the borderline cluster where Tier 2 LLM judgment is essential. |
 | **Embedder** | nomic-embed-text @ 768d | Already running; matches DG-INV-1 decision. |
-| **Per-contentType override** | Lower the refuse threshold for `procedure` & `pattern` types | Insights and procedures cluster more tightly when restating the same fact; see §2.4. |
+| **Per-contentType override** | Lower the refuse threshold for `procedure`; raise it for `pattern` | Procedures cluster more tightly when restating the same fact; patterns cluster even tighter, so refuse only near-exact matches; see §2.4. |
 
 These supersede the spec's initial guesses of **0.90 / 0.75**:
 - 0.90 was too high (loses 78% of real duplicates including all 8 supersede chains)
@@ -66,7 +66,7 @@ node test-fixtures/analyze-thresholds.mjs
 
 ### 2.1 Distribution stats
 
-```
+```text
 duplicate_pairs:  n=32  min=0.724  p10=0.843  p25=0.868  median=0.881  p75=0.898  p90=0.952  max=1.000  mean=0.884
 distinct_pairs:   n=34  min=0.424  p10=0.473  p25=0.562  median=0.584  p75=0.637  p90=0.865  max=0.875  mean=0.620
 ```
@@ -75,7 +75,7 @@ Mean separation: **0.264** (duplicates 0.884, distincts 0.620). Strong overall s
 
 ### 2.2 Histograms
 
-```
+```text
 duplicate_pairs cosine distribution (n=32, range [0.5-1], 20 bins)
   0.700–0.725    1 ███
   0.725–0.750    1 ███
@@ -102,7 +102,7 @@ The dual-mode structure of `distinct_pairs` (one peak around 0.57, another near 
 
 ### 2.3 Threshold sweep
 
-```
+```text
 threshold  TP   FN   FP   precision   recall   F1
 0.950      4    28   0    1.000       0.125    0.222
 0.920      7    25   0    1.000       0.219    0.359
@@ -110,8 +110,8 @@ threshold  TP   FN   FP   precision   recall   F1
 0.880     18    14   0    1.000       0.563    0.720    ← ZERO-FP frontier
 0.870     22    10   2    0.917       0.688    0.786
 0.850     27    5    6    0.818       0.844    0.831
-0.840     27    5    6    0.818       0.844    0.831    ← 90%-recall frontier
-0.820     29    3    6    0.829       0.906    0.866
+0.840     27    5    6    0.818       0.844    0.831
+0.820     29    3    6    0.829       0.906    0.866    ← 90%-recall frontier
 0.780     29    3    6    0.829       0.906    0.866
 0.750     30    2    6    0.833       0.938    0.882
 0.720     32    0    6    0.842       1.000    0.914    ← Best F1
@@ -131,7 +131,7 @@ threshold  TP   FN   FP   precision   recall   F1
 
 ### 2.4 Per-contentType breakdown
 
-```
+```text
 fact:       dup median=0.877  distinct median=0.593  (separation 0.284) — clean
 procedure:  dup median=0.865  distinct median=0.572  (separation 0.293) — clean BUT 2 dups at 0.72-0.75 (refutation rewrites)
 insight:    dup median=0.876  distinct median=0.611  (separation 0.265) — tighter dup cluster, narrower zone
@@ -220,7 +220,7 @@ Test script: `/tmp/audit_hook2.mjs` (not committed; ephemeral)
 
 While building the calibration corpus, I found that **4 of 12 SUPERSEDED entries in `unified_knowledge` point to a `superseded_by` ID that does not exist in MongoDB**:
 
-```
+```text
 098b161d-6bba-482f-8256-e907ebed129e → 08db7041-9bb1-4668-aab1-c7702b3b4dcc (target missing)
 6e8ea2a3-16e4-4bce-9cf2-ca20d66aea12 → 4c818c4e-2867-4cd4-ac24-329a455fafca (target missing)
 25452fb4-6d62-4ae0-ab84-042f054ae55b → 0fe29b17-9646-483c-99ad-9e1b562079d5 (target missing)

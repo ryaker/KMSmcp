@@ -1,5 +1,13 @@
 # Unified KMS Technical Specification: genai-toolbox Pattern Adoption
 
+> **HISTORICAL DOCUMENT — verify against `src/` before relying on any detail here.**
+>
+> **`neo4j` is retired.** Every `neo4j` reference below predates the SparrowDB
+> cutover and is kept only as a record of the original design. The live storage
+> target is **`graph`** — see `src/types/index.ts`, where the type is
+> `'mem0' | 'graph' | 'mongodb'`. There is no `neo4j` member. Read `neo4j` here as
+> "the graph backend, then Neo4j Aura, now SparrowDB".
+
 ## Executive Summary
 
 This specification details how to adopt architectural patterns from Google's genai-toolbox while maintaining our vision of AI memory that evolves rather than static database queries.

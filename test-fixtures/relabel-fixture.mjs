@@ -83,9 +83,27 @@ async function main() {
     })
   }
 
+  let missing = []
+
   for (const rl of RELABELS) {
     const [pa, pb] = rl.ids
     let found = false
+
+    // Idempotency (issue #63 finding #4): a pair already carrying a
+    // human-curated provenance was applied by a prior run of this script.
+    // Re-confirming it every run would flip 'human_curated_relabel' to
+    // 'human_curated_confirmed' on the second pass for no reason — skip
+    // entirely so re-running against an already-curated fixture is a no-op.
+    const alreadyApplied = (pairs) => {
+      const idx = findPair(pairs, pa, pb)
+      if (idx < 0) return false
+      const prov = pairs[idx].provenance
+      return prov === 'human_curated_relabel' || prov === 'human_curated_confirmed'
+    }
+    if (alreadyApplied(fixture.distinct_pairs) || alreadyApplied(fixture.duplicate_pairs)) {
+      found = true
+      continue
+    }
 
     // Look in distinct first (more common case)
     let idx = findPair(fixture.distinct_pairs, pa, pb)
@@ -150,8 +168,18 @@ async function main() {
     }
 
     if (!found) {
-      console.warn(`  ⚠️  pair not found for relabel: ${pa} ↔ ${pb}`)
+      missing.push(`${pa} ↔ ${pb}`)
     }
+  }
+
+  // Issue #63 finding #5: a missing relabel target used to just warn and
+  // write a partial fixture. A curated pair absent from the corpus means the
+  // fixture regenerated differently than expected (corpus drift, a changed
+  // id) — that invalidates this relabel list silently. Fail the run instead.
+  if (missing.length > 0) {
+    console.error(`❌ ${missing.length} relabel target(s) not found in the fixture — refusing to write a partial result:`)
+    for (const m of missing) console.error(`   - ${m}`)
+    process.exit(1)
   }
 
   fixture.notes = [

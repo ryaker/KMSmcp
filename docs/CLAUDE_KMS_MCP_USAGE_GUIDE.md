@@ -1,8 +1,16 @@
 # Claude KMS MCP Usage Guide
 
+> **HISTORICAL DOCUMENT — verify against `src/` before relying on any detail here.**
+>
+> **`neo4j` is retired.** Every `neo4j` reference below predates the SparrowDB
+> cutover and is kept only as a record of the original design. The live storage
+> target is **`graph`** — see `src/types/index.ts`, where the type is
+> `'mem0' | 'graph' | 'mongodb'`. There is no `neo4j` member. Read `neo4j` here as
+> "the graph backend, then Neo4j Aura, now SparrowDB".
+
 ## Overview
 
-The KMS MCP Server provides Claude with intelligent, multi-dimensional knowledge management across Mem0, Neo4j, and MongoDB. This unified system allows Claude to seamlessly store and retrieve the same memories that are accessible through the Mem0 MCP tools, but with enhanced routing and cross-system integration.
+The KMS MCP Server provides Claude with intelligent, multi-dimensional knowledge management across Mem0, SparrowDB (graph), and MongoDB. This unified system allows Claude to seamlessly store and retrieve the same memories that are accessible through the Mem0 MCP tools, but with enhanced routing and cross-system integration.
 
 ## Quick Reference
 
