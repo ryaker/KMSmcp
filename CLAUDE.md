@@ -96,6 +96,8 @@ The more you search and find useful previous knowledge, the more natural it beco
 
 ## Correcting Wrong Entries — Use the Corrective Tools, Not Additive Store
 
+**The Dedup Gate (see below) is the primary mechanism now.** Every `unified_store` call is checked against near-duplicates automatically — if you're writing something that's an update, correction, or restatement of an existing entry, the gate will most likely catch it and return `dedup_required` before you ever need to reach for a corrective tool by hand. This section covers the tools the gate dispatches to (`kms_supersede`/`kms_update`/`kms_delete`/`kms_flag`), and the manual path for the case the gate doesn't catch: you already know the exact `old_id` and want to correct it directly without writing a new near-duplicate first.
+
 **Critical rule**: If you're about to store a fact that contradicts or replaces a previous one, **do not call `unified_store` again**. That additively stores the new one alongside the wrong one, and both leak into context injection on every future session.
 
 KMS has five corrective tools. Pick the right one:
