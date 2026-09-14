@@ -2,8 +2,6 @@
  * Main Unified KMS MCP Server
  * Orchestrates all components into a single, powerful MCP server
  */
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, } from '@modelcontextprotocol/sdk/types.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -18,7 +16,7 @@ import { EnrichmentQueue } from './inference/EnrichmentQueue.js';
 import { EntityLinker } from './inference/EntityLinker.js';
 import { OllamaEmbeddingService } from './embedding/EmbeddingService.js';
 import { AnthropicHaikuJudge } from './embedding/AnthropicHaikuJudge.js';
-import { MongoDBStorage, Mem0Storage, SparrowDBStorage } from './storage/index.js';
+import { MongoDBStorage, Mem0Storage, SparrowDBStorage, resolveSparrowDBPath } from './storage/index.js';
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js';
 export class UnifiedKMSServer {
     config;
@@ -86,7 +84,7 @@ export class UnifiedKMSServer {
         // Graph backend: SparrowDB (default — embedded, ~5ms read latency).
         // Legacy Neo4j and Shadow modes were removed in the SparrowDB cutover;
         // the env vars KMS_STORAGE_BACKEND / KMS_SHADOW_MODE are now no-ops.
-        const sparrowPath = process.env.SPARROWDB_PATH || join(homedir(), '.kms-sparrowdb-v2');
+        const sparrowPath = resolveSparrowDBPath();
         console.log(`⚡ Graph backend: SparrowDB (path: ${sparrowPath})`);
         const graphBackend = new SparrowDBStorage({ dbPath: sparrowPath });
         const graphBackendName = 'SparrowDB';
@@ -149,7 +147,10 @@ export class UnifiedKMSServer {
         console.log('🛠️  Initializing Tools...');
         this.tools = {
             store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue, embeddingService, llmJudge),
-            search: new UnifiedSearchTool(this.storage, this.factCache),
+            // The search tool shares the store tool's embedder so the hybrid retrieval arm
+            // (KMS_HYBRID_RETRIEVAL=1, default off) reuses one `isAvailable()` probe cache
+            // instead of re-probing Ollama on every search.
+            search: new UnifiedSearchTool(this.storage, this.factCache, embeddingService),
             instructions: new KMSInstructionsTool(),
             documentStore: new DocumentStoreTool(this.storage.mongodb)
         };
@@ -450,7 +451,7 @@ export class UnifiedKMSServer {
             },
             {
                 name: 'unified_search',
-                description: 'Search across all KMS systems with FACT caching and intelligent ranking',
+                description: 'Search across all KMS systems with FACT caching and intelligent ranking. Also returns ontology entities (Person, Organization, Project, Event, …) with their real nodeLabels and 1-hop relationships, so questions about people and things ("my dad", "who is Eddie Yaker", "what happened July 12 2023") reach the graph rather than only the stored notes.',
                 inputSchema: {
                     type: 'object',
                     properties: {
@@ -913,6 +914,30 @@ export class UnifiedKMSServer {
         // Slot label is now `graph`. The actual implementation name (sparrowdb,
         // neo4j fallback, shadow) is reported via storage.<impl>.name when needed.
         const graphKey = 'graph';
+        // Vector-index health. Not part of the original analytics because nothing
+        // ever measured it — which is how ~1150 vectors were lost on 2026-08-01
+        // without anyone noticing. Reported unconditionally so a MISSING index shows
+        // up on any analytics call rather than only when someone goes looking.
+        let vectorIndex = { status: 'unknown', reason: 'graph backend exposes no probe' };
+        try {
+            const graph = this.storage.graph;
+            if (typeof graph?.getVectorIndexHealth === 'function') {
+                const report = graph.getVectorIndexHealth();
+                vectorIndex = report;
+                // Escalate rather than bury. A degraded or missing index is silent by
+                // nature: writes keep returning success and searches just come back thin.
+                if (report.status === 'missing')
+                    console.error(`🚨 ${report.alert}`);
+                else if (report.status === 'degraded')
+                    console.warn(`⚠️  ${report.alert}`);
+                else if (report.status === 'unknown' && report.alert)
+                    console.warn(`⚠️  ${report.alert}`);
+            }
+        }
+        catch (e) {
+            // A monitoring probe must never break the thing it monitors.
+            vectorIndex = { status: 'unknown', reason: e instanceof Error ? e.message : String(e) };
+        }
         const analytics = {
             timestamp: new Date().toISOString(),
             cache: cacheStats.status === 'fulfilled' ? cacheStats.value : { error: cacheStats.reason },
@@ -921,6 +946,7 @@ export class UnifiedKMSServer {
                 [graphKey]: graphStats.status === 'fulfilled' ? graphStats.value : { error: graphStats.reason },
                 mem0: mem0Stats.status === 'fulfilled' ? mem0Stats.value : { error: mem0Stats.reason }
             },
+            vectorIndex,
             routing: this.tools.store.getRoutingStats(),
             overall: {
                 systemsHealthy: [mongoStats, graphStats, mem0Stats].filter(s => s.status === 'fulfilled').length,

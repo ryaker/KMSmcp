@@ -399,6 +399,75 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
     expect(isDedupRequired(result)).toBe(false)
     expect(judge.classify).not.toHaveBeenCalled()
   })
+
+  // -------------------------------------------------------------------------
+  // 10. DG-T2-B (issue #50) — contradicts gets a distinct response shape
+  // -------------------------------------------------------------------------
+
+  it('contradicts candidate flags contradicts_detected and reorders retry_with', async () => {
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
+      {
+        id: 'existing-fact',
+        similarity: 0.83,
+        contentType: 'fact',
+        source: 'technical',
+        created: '2026-04-01T00:00:00Z',
+        flag: null,
+        content_preview: 'EXISTING says X is true'
+      }
+    ])
+
+    judge.classify.mockResolvedValue('contradicts')
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'NEW says X is false',
+      contentType: 'fact',
+      userId: 'richard_yaker'
+    })
+
+    expect(isDedupRequired(result)).toBe(true)
+    if (!isDedupRequired(result)) return
+
+    expect(result.contradicts_detected).toBe(true)
+    expect(result.contradicting_ids).toEqual(['existing-fact'])
+    expect(result.message).toMatch(/CONTRADICTION/)
+    expect(result.message).toMatch(/existing-fact/)
+    // Only supersede/force-new are offered — update/complement don't fit a contradiction.
+    expect(result.retry_with).toHaveLength(2)
+    expect(result.retry_with[0]).toMatch(/^action=supersede&old_id=existing-fact&reason=/)
+    expect(result.retry_with[1]).toMatch(/^action=force-new&reason=.*does NOT actually contradict/)
+  })
+
+  it('non-contradicts confirm-band response omits contradicts_detected', async () => {
+    (graph as any).findSimilar = jest.fn().mockResolvedValue([
+      {
+        id: 'existing-fact',
+        similarity: 0.83,
+        contentType: 'fact',
+        source: 'technical',
+        created: '2026-04-01T00:00:00Z',
+        flag: null,
+        content_preview: 'EXISTING CONTENT preview'
+      }
+    ])
+
+    judge.classify.mockResolvedValue('complement')
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'NEW CONTENT for the gate',
+      contentType: 'fact',
+      userId: 'richard_yaker'
+    })
+
+    expect(isDedupRequired(result)).toBe(true)
+    if (!isDedupRequired(result)) return
+
+    expect(result.contradicts_detected).toBeUndefined()
+    expect(result.contradicting_ids).toBeUndefined()
+    expect(result.retry_with).toHaveLength(4)
+  })
 })
 
 // ===========================================================================

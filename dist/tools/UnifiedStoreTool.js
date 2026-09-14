@@ -99,7 +99,7 @@ export class UnifiedStoreTool {
             // args; fall through to the normal store path with the modified args.
         }
         // Apply smart inference if needed
-        let enrichedArgs = { ...args };
+        const enrichedArgs = { ...args };
         const inference = ContentInference.analyze(args.content);
         // Use inference to fill in missing parameters
         if (!args.contentType) {
@@ -416,6 +416,10 @@ export class UnifiedStoreTool {
                             }
                         }
                         const oldIdHint = top.id;
+                        const contradictingIds = candidates
+                            .filter((_, idx) => llmRelations[idx] === 'contradicts')
+                            .map(c => c.id);
+                        const hasContradiction = contradictingIds.length > 0;
                         const response = {
                             status: 'dedup_required',
                             candidates: candidates.map((c, idx) => ({
@@ -429,15 +433,26 @@ export class UnifiedStoreTool {
                                 flag: c.flag ?? null,
                                 llm_relation: llmRelations[idx]
                             })),
-                            message: msg,
-                            retry_with: [
-                                `action=supersede&old_id=${oldIdHint}&reason=<...>`,
-                                `action=update&old_id=${oldIdHint}&reason=<...>`,
-                                `action=complement&related_to=${oldIdHint}`,
-                                `action=force-new&reason=<justification>`
-                            ],
+                            message: hasContradiction
+                                ? `⚠️ CONTRADICTION, not a duplicate: candidate ${contradictingIds[0]} states the opposite of this new entry (cos=${top.similarity.toFixed(3)}). ` +
+                                    `Only one can be true. Do NOT pick an action blindly — read both, determine which is correct, then act.`
+                                : msg,
+                            retry_with: hasContradiction
+                                ? [
+                                    `action=supersede&old_id=${contradictingIds[0]}&reason=<why the existing entry ${contradictingIds[0]} is wrong>`,
+                                    `action=force-new&reason=<why this does NOT actually contradict ${contradictingIds[0]} — required, not a generic justification>`
+                                ]
+                                : [
+                                    `action=supersede&old_id=${oldIdHint}&reason=<...>`,
+                                    `action=update&old_id=${oldIdHint}&reason=<...>`,
+                                    `action=complement&related_to=${oldIdHint}`,
+                                    `action=force-new&reason=<justification>`
+                                ],
                             band,
-                            thresholds: { refuse: refuseThreshold, confirm: confirmThreshold }
+                            thresholds: { refuse: refuseThreshold, confirm: confirmThreshold },
+                            ...(hasContradiction
+                                ? { contradicts_detected: true, contradicting_ids: contradictingIds }
+                                : {})
                         };
                         debug(`🛑 DEDUP GATE refused write (${band}): top sim=${top.similarity.toFixed(3)} ` +
                             `against id=${top.id}; ${candidates.length} candidate(s)`);

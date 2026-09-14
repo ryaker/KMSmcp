@@ -104,8 +104,15 @@ export class HttpTransport {
         // this unconditionally on reconnect). Without these stubs, Express returns
         // its default HTML 404 body, which the MCP client tries to parse as JSON and
         // crashes with "SyntaxError: Unrecognized token '<'". The stubs return a
-        // well-formed JSON 404/501 so the client's OAuth probe completes cleanly
+        // well-formed JSON 404 so the client's OAuth probe completes cleanly
         // and falls back to unauthenticated connection.
+        //
+        // Return 404 (not 501) on /register — Claude Code's MCP SDK treats 501 as a
+        // fatal DCR-rejected error ("SDK auth failed: Dynamic client registration is
+        // not supported…"), but 404 as "no such endpoint, fall through to
+        // unauthenticated." Routing /register through the same handler as the
+        // .well-known endpoints gives a single, consistent "no OAuth, anywhere"
+        // signal to the SDK.
         //
         // Info-disclosure hardening: the detailed error_description and the
         // `mcp_auth: "tunnel-delegated"` debug field ONLY ship on localhost
@@ -136,21 +143,7 @@ export class HttpTransport {
         this.app.get('/.well-known/oauth-authorization-server', oauthNotSupported);
         this.app.get('/.well-known/oauth-protected-resource', oauthNotSupported);
         this.app.get('/.well-known/openid-configuration', oauthNotSupported);
-        this.app.post('/register', (req, res) => {
-            if (isLocalRequest(req)) {
-                res.status(501).json({
-                    error: 'registration_not_supported',
-                    error_description: 'Dynamic client registration is not supported by this MCP server. Auth is tunnel-delegated — connect without OAuth.',
-                    mcp_auth: 'tunnel-delegated'
-                });
-            }
-            else {
-                res.status(501).json({
-                    error: 'registration_not_supported',
-                    error_description: 'Dynamic client registration is not supported.'
-                });
-            }
-        });
+        this.app.post('/register', oauthNotSupported);
         // MCP endpoints - No internal auth, trust the tunnel
         this.app.post('/mcp', this.handleMcpPostRequest.bind(this));
         this.app.get('/mcp', this.handleMcpGetRequest.bind(this));
@@ -248,6 +241,10 @@ export class HttpTransport {
                 console.log('[json-bridge] JSON-only client detected — SSE→JSON bridge active');
             }
             const sessionId = req.headers['mcp-session-id'];
+            const method = req.body?.method || (Array.isArray(req.body) ? `batch(${req.body.length})` : '(no-method)');
+            const reqId = req.body?.id ?? (Array.isArray(req.body) ? 'batch' : null);
+            console.log(`🛰️  MCP POST method=${method} id=${reqId} session=${sessionId ? sessionId.slice(0, 8) + '…' : 'none'} ` +
+                `accept=${wantsSSE ? 'sse' : 'json'} ua=${String(req.headers['user-agent'] || '').slice(0, 60)}`);
             if (req.body?.method === 'initialize') {
                 const clientInfo = req.body?.params?.clientInfo;
                 console.log(`📱 MCP Client connecting:`, {
@@ -308,10 +305,12 @@ export class HttpTransport {
                 return;
             }
             else {
+                console.warn(`⚠️  MCP POST rejected (no valid session) method=${method} sessionHeader=${sessionId || 'none'} ` +
+                    `knownSessions=${this.transports.size}`);
                 res.status(400).json({
                     jsonrpc: '2.0',
                     error: { code: -32000, message: 'Bad Request: No valid session ID' },
-                    id: null,
+                    id: req.body?.id ?? null,
                 });
                 return;
             }

@@ -3,14 +3,45 @@
  */
 import crypto from 'crypto';
 import { FACTCache } from '../cache/FACTCache.js';
+import { OllamaEmbeddingService } from '../embedding/EmbeddingService.js';
+import { fuseWithRRF, isHybridRetrievalEnabled, VECTOR_SOURCE_SYSTEM, } from '../retrieval/hybrid.js';
+import { ENTITY_LABELS, OPERATIONAL_LABELS } from '../storage/OntologyIndex.js';
 const debug = (...args) => { if (process.env.KMS_DEBUG)
     console.error(...args); };
 export class UnifiedSearchTool {
     storage;
     cache;
-    constructor(storage, cache) {
+    /** Injected embedder for the vector arm. Only ever touched when the hybrid flag is on. */
+    embeddingService;
+    /** Memoised lazy fallback embedder — see `getEmbeddingService()`. */
+    lazyEmbeddingService = null;
+    constructor(storage, cache, embeddingService) {
         this.storage = storage;
         this.cache = cache; // Now using real cache
+        this.embeddingService = embeddingService ?? null;
+    }
+    /**
+     * The embedder for the vector arm.
+     *
+     * Prefers the injected instance — sharing one instance with `UnifiedStoreTool` also
+     * shares its `isAvailable()` cache, so a search does not re-probe Ollama that a store
+     * just probed. Construction is otherwise deferred to first use so that every call site
+     * that never enables hybrid retrieval (the CLI, every existing test) pays nothing and
+     * never opens a socket.
+     */
+    getEmbeddingService() {
+        if (this.embeddingService)
+            return this.embeddingService;
+        if (!this.lazyEmbeddingService) {
+            try {
+                this.lazyEmbeddingService = new OllamaEmbeddingService();
+            }
+            catch (e) {
+                debug(`⚠️ hybrid: could not construct fallback embedder: ${e instanceof Error ? e.message : String(e)}`);
+                return null;
+            }
+        }
+        return this.lazyEmbeddingService;
     }
     /**
      * Search across all KMS systems with intelligent caching
@@ -44,7 +75,24 @@ export class UnifiedSearchTool {
         const cacheKey = this.cache ? FACTCache.generateSearchKey(args.query, args.filters, args.options) : '';
         const cached = this.cache ? await this.cache.get(cacheKey) : null;
         const cacheCheckTime = Date.now() - cacheCheckStart;
-        if (cached && query.options?.cacheStrategy !== 'realtime') {
+        const wantsEvalCapture = process.env.KMS_EVAL_CAPTURE === '1';
+        const hybridEnabled = isHybridRetrievalEnabled();
+        // A cache entry written before KMS_EVAL_CAPTURE was set (or by a run with it off)
+        // has no _evalCapture. Serving it as a hit would silently hand the harness a
+        // response with no candidate pool. Treat that case as a miss so the full search
+        // path runs and captures fresh.
+        //
+        // The same argument applies to the hybrid flag, and more sharply: the cache key is a
+        // hash of query+filters+options only, so a lexical-only response and a fused response
+        // collide on it. Serving one for the other would make an A/B measurement of the two
+        // rankers silently compare a ranker against a cached copy of its rival. Treat a
+        // mode mismatch as a miss. (Entries written before this field existed have it
+        // undefined, which correctly reads as "lexical".)
+        const cachedIsHybrid = cached?._hybridRetrieval === true;
+        if (cached &&
+            query.options?.cacheStrategy !== 'realtime' &&
+            (!wantsEvalCapture || cached._evalCapture) &&
+            cachedIsHybrid === hybridEnabled) {
             debug(`⚡ CACHE HIT - Returning cached results`);
             return {
                 query: query.query,
@@ -58,16 +106,21 @@ export class UnifiedSearchTool {
                     searchTime: 0,
                     mergingTime: 0,
                     totalTime: Date.now() - startTime
-                }
+                },
+                ...(cached._evalCapture ? { _evalCapture: cached._evalCapture } : {}),
+                ...(cached._hybridRetrieval ? { _hybridRetrieval: true } : {})
             };
         }
         debug(`💾 Cache miss - Searching all systems...`);
         // Step 2: Search across all systems in parallel
         const searchStart = Date.now();
-        const [mem0Results, graphResults, mongoResults] = await Promise.allSettled([
+        // The fourth (vector) arm is appended only when the flag is on, so with the flag off
+        // this is the same three-way allSettled it has always been.
+        const [mem0Results, graphResults, mongoResults, vectorSettled] = await Promise.allSettled([
             this.searchMem0(query),
             this.searchGraph(query),
-            this.searchMongoDB(query)
+            this.searchMongoDB(query),
+            ...(hybridEnabled ? [this.searchVector(query)] : [])
         ]);
         const searchTime = Date.now() - searchStart;
         // Step 3: Process and merge results
@@ -75,24 +128,79 @@ export class UnifiedSearchTool {
         const processedResults = {
             mem0: mem0Results.status === 'fulfilled' ? mem0Results.value : [],
             graph: graphResults.status === 'fulfilled' ? graphResults.value : [],
-            mongodb: mongoResults.status === 'fulfilled' ? mongoResults.value : []
+            mongodb: mongoResults.status === 'fulfilled' ? mongoResults.value : [],
+            // `searchVector` already swallows its own failures and returns []; this second
+            // guard covers a rejection it could not anticipate. Either way the lexical arms
+            // still produce a result set — a search that fails because the embedder is down
+            // would be far worse than one without semantic recall.
+            vector: vectorSettled?.status === 'fulfilled' ? vectorSettled.value : []
         };
         debug(`📊 Results found:`);
         debug(`   Mem0: ${processedResults.mem0.length}`);
         debug(`   Graph: ${processedResults.graph.length}`);
         debug(`   MongoDB: ${processedResults.mongodb.length}`);
-        // Merge all results
+        if (hybridEnabled)
+            debug(`   Vector: ${processedResults.vector.length}`);
+        // Merge all results. Vector hits join the SAME pool as the lexical ones and go
+        // through deduplicateResults with them, so an item both arms found stays one
+        // candidate (and, in fusion, one that scores in both ranked lists).
         const allResults = [
             ...processedResults.mem0.map(r => ({ ...r, sourceSystem: 'mem0' })),
             ...processedResults.graph.map(r => ({ ...r, sourceSystem: 'graph' })),
-            ...processedResults.mongodb.map(r => ({ ...r, sourceSystem: 'mongodb' }))
+            ...processedResults.mongodb.map(r => ({ ...r, sourceSystem: 'mongodb' })),
+            ...processedResults.vector.map(r => ({ ...r, sourceSystem: VECTOR_SOURCE_SYSTEM }))
         ];
         // Remove duplicates (same ID from different systems)
         const uniqueResults = this.deduplicateResults(allResults);
         // Sort by relevance and confidence
         const maxResults = query.options?.maxResults ?? 10;
-        const sortedResults = this.rankResults(uniqueResults, args.query)
-            .slice(0, maxResults);
+        const rankedResults = hybridEnabled
+            ? this.rankResultsHybrid(uniqueResults, args.query)
+            : this.rankResults(uniqueResults, args.query);
+        const sortedResults = rankedResults.slice(0, maxResults);
+        // Eval capture (KMS_EVAL_CAPTURE=1). Off by default and zero-cost when off.
+        //
+        // Why this exists: three baseline runs on 2026-08-01 measured retrieval getting
+        // WORSE after two ranking changes shipped (P@5 0.54 -> 0.43), and the cause could
+        // not be attributed — the ranker and the corpus had both changed, and every
+        // measurement only ever saw the ranker's OWN top-N. You cannot compare two rankers
+        // on a set that one of them selected.
+        //
+        // Capturing the deduplicated pool BEFORE slicing fixes that: any scorer can be
+        // replayed over the identical candidate set offline, so ranker changes become
+        // measurable instead of arguable.
+        const evalCapture = wantsEvalCapture
+            ? {
+                poolSize: uniqueResults.length,
+                rawCount: allResults.length,
+                candidates: rankedResults.map(r => ({
+                    id: r.id,
+                    content: r.content,
+                    confidence: r.confidence,
+                    timestamp: r.timestamp,
+                    contentType: r.contentType,
+                    sourceSystem: r.sourceSystem,
+                    _sourceSystems: r._sourceSystems,
+                    subject: r.metadata?.subject ?? null,
+                    extractedBy: r.metadata?.extractedBy ?? null,
+                    _score: r._score,
+                    _relevance: r._relevance,
+                    _recency: r._recency,
+                    // Hybrid signals. Emitted only under the flag so a flag-off capture is
+                    // byte-identical to what the harness recorded before this change. The
+                    // eval harness replays rankers off these fields, so the fusion has to be
+                    // reconstructible from the capture alone: _lexicalRank + _vectorRank + the
+                    // published k are exactly enough to recompute _rrf offline.
+                    ...(hybridEnabled ? {
+                        _lexicalScore: r._lexicalScore,
+                        _lexicalRank: r._lexicalRank,
+                        _vectorRank: r._vectorRank,
+                        _vectorSimilarity: r._vectorSimilarity,
+                        _rrf: r._rrf,
+                    } : {}),
+                })),
+            }
+            : undefined;
         const mergingTime = Date.now() - mergingStart;
         // Step 4: Context expansion — entity cards + triggered actions
         // Runs AFTER merging so we know which entities surfaced before deciding what to expand.
@@ -121,7 +229,8 @@ export class UnifiedSearchTool {
             sources: {
                 mem0: processedResults.mem0.length,
                 graph: processedResults.graph.length,
-                mongodb: processedResults.mongodb.length
+                mongodb: processedResults.mongodb.length,
+                ...(hybridEnabled ? { vector: processedResults.vector.length } : {})
             },
             performance: {
                 cacheCheckTime,
@@ -130,7 +239,9 @@ export class UnifiedSearchTool {
                 totalTime: Date.now() - startTime
             },
             entity_context,
-            triggered_actions
+            triggered_actions,
+            ...(evalCapture ? { _evalCapture: evalCapture } : {}),
+            ...(hybridEnabled ? { _hybridRetrieval: true } : {})
         };
         // Step 5: Cache the results
         if (this.cache && query.options?.cacheStrategy !== 'realtime') {
@@ -156,15 +267,18 @@ export class UnifiedSearchTool {
      * Returns entity_context (brief cards keyed by ID) and triggered_actions.
      */
     async expandWithEntityContext(results, query) {
-        // Node types that warrant an entity card — operational/system nodes are returned as triggers instead
-        const ENTITY_LABELS = new Set(['Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service', 'Event']);
-        const OPERATIONAL_LABELS = new Set(['ContextTrigger', 'ToolRoute', 'ResourceMap', 'QueryType', 'System', 'MemoryTier']);
+        // Node types that warrant an entity card — operational/system nodes are returned as
+        // triggers instead. Both sets come from OntologyIndex, which is what actually
+        // produces the labels: a private copy here is how this gate ended up filtering for
+        // labels no search arm ever emitted.
+        const entityLabels = new Set(ENTITY_LABELS);
+        const operationalLabels = new Set(OPERATIONAL_LABELS);
         // Collect entity IDs from graph results
         const entityIds = new Set();
         for (const r of results.graph) {
             const labels = r.nodeLabels || [];
-            const hasEntityLabel = labels.some(l => ENTITY_LABELS.has(l));
-            const hasOperationalLabel = labels.some(l => OPERATIONAL_LABELS.has(l));
+            const hasEntityLabel = labels.some(l => entityLabels.has(l));
+            const hasOperationalLabel = labels.some(l => operationalLabels.has(l));
             if (hasEntityLabel && !hasOperationalLabel && r.id) {
                 entityIds.add(r.id);
             }
@@ -276,12 +390,58 @@ export class UnifiedSearchTool {
     // Private search methods for each system
     async searchMem0(query) {
         try {
-            return await this.storage.mem0.search(query);
+            return this.dropShardsOfFlaggedParents(await this.storage.mem0.search(query), query);
         }
         catch (error) {
             console.warn('⚠️ Mem0 search failed:', error instanceof Error ? error.message : String(error));
             return [];
         }
+    }
+    /**
+     * Mem0 stores an LLM-extracted fan-out of each `unified_store` write: several
+     * "User described…" shards, each its own searchable row carrying
+     * `metadata.kms_id` back to the KMS entry it was derived from.
+     *
+     * Mem0 has no flag concept, so `kms_supersede` / `kms_delete` flag the graph and
+     * MongoDB copies and leave every shard live. Measured 2026-08-01: three
+     * freshly-flagged parents still had 11 shards surfacing in the top-15 across six
+     * queries, carrying the exact content the supersede was written to retire — a
+     * retracted claim about a retrieval regression kept being served after its parent
+     * was superseded. CLAUDE.md's promise that superseding a fact "stops it leaking
+     * into every future session's context automatically" was false for this path.
+     *
+     * The shards already carry the join key, so honour the parent's flag at read time.
+     * Doing it here rather than in Mem0 also covers shards written before the flag
+     * existed, which no write-time fix could reach.
+     */
+    dropShardsOfFlaggedParents(results, query) {
+        if (query.options?.includeFlagged)
+            return results;
+        const graph = this.storage.graph;
+        // Optional on the GraphStorage interface — a backend that cannot answer must not
+        // cause every Mem0 result to be dropped.
+        if (typeof graph?.findById !== 'function')
+            return results;
+        const parentFlagged = new Map();
+        return results.filter(r => {
+            const parentId = r?.metadata?.kms_id;
+            // No join key, or the shard IS the parent: nothing to inherit.
+            if (!parentId || parentId === r.id)
+                return true;
+            if (!parentFlagged.has(parentId)) {
+                let flagged = false;
+                try {
+                    // findById returns null for a parent this backend has never seen; an unknown
+                    // parent is not evidence of retraction, so keep the shard either way.
+                    flagged = Boolean(graph.findById(parentId)?.flag);
+                }
+                catch {
+                    flagged = false;
+                }
+                parentFlagged.set(parentId, flagged);
+            }
+            return !parentFlagged.get(parentId);
+        });
     }
     async searchGraph(query) {
         try {
@@ -302,56 +462,375 @@ export class UnifiedSearchTool {
         }
     }
     /**
+     * The vector arm (KMS_HYBRID_RETRIEVAL=1 only).
+     *
+     * Embeds the query and asks the graph backend's HNSW index for nearest neighbours —
+     * the index that `unified_store`'s dedup gate has been populating and maintaining all
+     * along, and that the read path never once consulted.
+     *
+     * Every failure mode here degrades to `[]`, never to a thrown error:
+     *   - no `findSimilar` on the backend (older binding, non-vector graph store)
+     *   - no embedder available at all
+     *   - Ollama down / timing out (`isAvailable()` is a short probe, cached ~30 s)
+     *   - embed throws (dim mismatch, empty query, HTTP error)
+     *   - `findSimilar` throws
+     * A search returning fewer results is a degradation; a search that 500s because the
+     * embedder is down is an outage. Only the first is acceptable.
+     *
+     * An empty return is also the *expected* case for much of the corpus right now: 806 of
+     * 2761 entries in the live store carry an embedder id (counted 2026-08-01, ~29%), so
+     * unembedded entries simply cannot be reached by this arm and will keep arriving
+     * lexically. That is a backfill gap, not a bug in this code path.
+     */
+    async searchVector(query) {
+        const graph = this.storage.graph;
+        // Optional on the GraphStorage interface — a backend without a vector index must
+        // leave the lexical arms completely untouched.
+        if (typeof graph?.findSimilar !== 'function') {
+            debug('🧭 hybrid: graph backend exposes no findSimilar — vector arm skipped');
+            return [];
+        }
+        const embedder = this.getEmbeddingService();
+        if (!embedder) {
+            debug('🧭 hybrid: no embedding service — vector arm skipped');
+            return [];
+        }
+        try {
+            if (typeof embedder.isAvailable === 'function' && !(await embedder.isAvailable())) {
+                debug('🧭 hybrid: embedder unavailable — falling back to lexical only');
+                return [];
+            }
+            const embedding = await embedder.embed(query.query);
+            const filters = query.filters ?? {};
+            const userId = filters.userId || process.env.KMS_DEFAULT_USER_ID || 'personal';
+            // `findSimilar` takes ONE contentType and ONE subject, while the query filters are
+            // multi-valued. Push a filter down only when it is single-valued (so the HNSW
+            // post-filter does the narrowing and the over-fetch budget is spent on candidates
+            // that can actually survive); otherwise filter here, after retrieval.
+            const contentTypes = Array.isArray(filters.contentType) ? filters.contentType : undefined;
+            const subjects = typeof filters.subject === 'string'
+                ? [filters.subject]
+                : Array.isArray(filters.subject) ? filters.subject : undefined;
+            // `findSimilar` has no `source` parameter at all (unlike contentType/subject, it
+            // cannot be pushed down even in the single-valued case), so this is always a
+            // post-filter. Without it a caller filtering on `source` would get vector hits from
+            // sources it explicitly excluded — the lexical arms already honour this filter
+            // (MongoDBStorage/Mem0Storage/SparrowDBStorage.search all do `$in`/equality checks
+            // on `filters.source`), so the vector arm must match rather than silently ignore it.
+            const sources = Array.isArray(filters.source) && filters.source.length > 0 ? filters.source : undefined;
+            const maxResults = query.options?.maxResults ?? 10;
+            // Over-fetch relative to the returned window: fusion needs enough of the vector
+            // ranking to be meaningful, and a candidate the lexical arm also found consumes a
+            // slot in both lists.
+            const topK = Math.min(50, Math.max(10, maxResults * 2));
+            const hits = await graph.findSimilar(embedding, {
+                userId,
+                contentType: contentTypes?.length === 1 ? contentTypes[0] : undefined,
+                subject: subjects?.length === 1 ? subjects[0] : undefined,
+                topK,
+                includeFlagged: query.options?.includeFlagged === true
+            });
+            if (!Array.isArray(hits) || hits.length === 0)
+                return [];
+            const minConfidence = typeof filters.minConfidence === 'number' ? filters.minConfidence : undefined;
+            const out = [];
+            for (const hit of hits) {
+                if (!hit || typeof hit.id !== 'string')
+                    continue;
+                if (contentTypes && contentTypes.length > 1 && !contentTypes.includes(hit.contentType))
+                    continue;
+                if (subjects && subjects.length > 1 && !subjects.includes(hit.subject ?? ''))
+                    continue;
+                if (sources && !sources.includes(hit.source))
+                    continue;
+                // `findSimilar` returns a 200-char preview, not the entry. Rehydrate through the
+                // backend's own index so a vector-only hit is a first-class result rather than a
+                // truncated stub — and so dedup's longest-content merge is not skewed by a
+                // preview masquerading as the whole entry.
+                const full = this.hydrateFromGraph(hit.id);
+                const confidence = typeof full?.confidence === 'number' ? full.confidence : 0;
+                if (minConfidence !== undefined && confidence < minConfidence)
+                    continue;
+                out.push({
+                    id: hit.id,
+                    content: full?.content ?? hit.content_preview,
+                    contentType: full?.contentType ?? hit.contentType,
+                    source: full?.source ?? hit.source,
+                    timestamp: full?.timestamp ?? hit.created,
+                    confidence,
+                    metadata: full?.metadata ?? (hit.subject ? { subject: hit.subject } : {}),
+                    relationships: full?.relationships ?? [],
+                    _vectorSimilarity: Number(hit.similarity.toFixed(4))
+                });
+            }
+            debug(`🧭 hybrid: vector arm returned ${out.length} candidate(s)`);
+            return out;
+        }
+        catch (error) {
+            console.warn('⚠️ Vector search arm failed (continuing lexical-only):', error instanceof Error ? error.message : String(error));
+            return [];
+        }
+    }
+    /**
+     * Best-effort full-entry lookup for a vector hit. Synchronous on the SparrowDB
+     * backend (an in-memory index read); anything else — missing method, a thenable, a
+     * throw — yields null and the caller keeps the preview.
+     */
+    hydrateFromGraph(id) {
+        const graph = this.storage.graph;
+        if (typeof graph?.findById !== 'function')
+            return null;
+        try {
+            const entry = graph.findById(id);
+            if (!entry || typeof entry.then === 'function')
+                return null;
+            return entry;
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
      * Remove duplicate results based on content similarity
+     */
+    /**
+     * Collapse the same knowledge item returned by more than one backend.
+     *
+     * `unified_store` dual-writes an entry to graph + mem0 + mongodb under one id, so a
+     * single fact routinely arrives here 2-3 times. The copies are NOT interchangeable:
+     * only the graph copy carries `relationships`, and each backend reports a different
+     * `confidence` — the graph's is a *lexical match score* (matchedTerms/totalTerms,
+     * usually < 1) while MongoDB's is the *stored, author-assigned* confidence (usually
+     * exactly 1).
+     *
+     * Keeping "the highest confidence copy" therefore compared two different quantities
+     * and reliably discarded the graph copy — the only one with relationships. That is
+     * why searches reported `sources: {graph: N}` while every returned result had
+     * `relationships: []`: the graph hits were fetched, then dropped right here.
+     *
+     * Now the copies are MERGED rather than raced. Fields present on one backend and
+     * absent on another are unioned, so relationships survive regardless of which
+     * backend "wins" the scalar fields.
      */
     deduplicateResults(results) {
         const unique = new Map();
         for (const result of results) {
             // Use ID if available, otherwise use content hash
+            // Every merged/inserted entry gets a stable string id, even when the source
+            // backend supplied none — callers (the eval capture in particular) join
+            // candidates back to relevance labels by id, so `undefined` here makes an
+            // entry silently unjoinable.
             const key = result.id || crypto.createHash('md5').update(result.content).digest('hex');
-            // Keep the result with highest confidence
-            if (!unique.has(key) || (result.confidence > unique.get(key).confidence)) {
-                unique.set(key, result);
+            const existing = unique.get(key);
+            if (!existing) {
+                unique.set(key, result.id ? result : { ...result, id: key });
+                continue;
             }
+            // Prefer the longer content — a backend may store a truncated projection.
+            const base = (result.content?.length ?? 0) > (existing.content?.length ?? 0) ? result : existing;
+            const other = base === result ? existing : result;
+            const merged = { ...other, ...base, id: base.id || other.id || key };
+            // Union the fields that only some backends populate, preferring whichever
+            // copy actually has them rather than whichever copy won on content length.
+            const rels = (base.relationships?.length ? base.relationships : other.relationships) ?? [];
+            if (rels.length)
+                merged.relationships = rels;
+            // entityRefs drive downstream entity-context linking (search()'s linkedEntityIds
+            // annotation and expandWithEntityContext). Union them the same way as relationships,
+            // or whichever copy loses on content length silently drops its refs.
+            //
+            // metadata itself is merged unconditionally (not only when entityRefs is
+            // non-empty) — subject/extractedBy are per-copy fields too, and the eval capture
+            // reads them straight off this merged object. Merging only on the entityRefs
+            // branch meant a subject/extractedBy present solely on the losing copy was
+            // dropped whenever neither copy had entityRefs.
+            const entityRefs = Array.from(new Set([
+                ...(base.metadata?.entityRefs ?? []),
+                ...(other.metadata?.entityRefs ?? []),
+            ]));
+            merged.metadata = { ...other.metadata, ...base.metadata };
+            if (entityRefs.length)
+                merged.metadata.entityRefs = entityRefs;
+            // Keep the stored confidence (the author's), not a per-backend match score.
+            merged.confidence = Math.max(base.confidence ?? 0, other.confidence ?? 0);
+            // Record every backend this item came from — previously the surviving copy
+            // claimed a single source, which made `sources` counts unreconcilable with
+            // the returned set.
+            const sourceSystems = new Set([
+                ...(base._sourceSystems ?? [base.sourceSystem]),
+                ...(other._sourceSystems ?? [other.sourceSystem]),
+            ].filter(Boolean));
+            merged._sourceSystems = Array.from(sourceSystems);
+            unique.set(key, merged);
         }
         return Array.from(unique.values());
     }
     /**
-     * Rank results by relevance and confidence
+     * Rank results by a composite relevance score.
+     *
+     * The previous implementation sorted by `confidence` FIRST and only fell through
+     * to text relevance when two results differed by more than 0.1. Every stored entry
+     * carries confidence 1 (it is the author's stated confidence in the fact, not a
+     * retrieval score), so that branch never fired and the tie-breaker did all the work
+     * unaided — while genuinely irrelevant entries that happened to share a word with
+     * the query ranked alongside exact topical matches.
+     *
+     * Scoring is now explicit and inspectable: lexical relevance, recency, and a small
+     * confidence contribution, combined into `_score` and attached to each result so a
+     * caller can see WHY something ranked where it did.
      */
     rankResults(results, query) {
-        return results.sort((a, b) => {
-            // Primary sort by confidence
-            const confidenceDiff = (b.confidence || 0) - (a.confidence || 0);
-            if (Math.abs(confidenceDiff) > 0.1) {
-                return confidenceDiff;
-            }
-            // Secondary sort by content relevance
-            const aRelevance = this.calculateRelevance(a.content, query);
-            const bRelevance = this.calculateRelevance(b.content, query);
-            return bRelevance - aRelevance;
+        const scored = results.map(r => {
+            const relevance = this.effectiveRelevance(r, query);
+            const recency = this.calculateRecency(r.timestamp);
+            // Relevance dominates; recency breaks ties between comparably relevant hits
+            // (memory is corrected over time, so newer entries about the same topic usually
+            // supersede older ones). Confidence contributes only marginally — it is nearly
+            // always 1 and carries almost no ranking signal.
+            const score = relevance * 0.70 + recency * 0.25 + (r.confidence ?? 0) * 0.05;
+            return { ...r, _score: Number(score.toFixed(4)), _relevance: Number(relevance.toFixed(4)), _recency: Number(recency.toFixed(4)) };
         });
+        return scored.sort((a, b) => b._score - a._score);
     }
     /**
-     * Calculate content relevance to query
+     * Hybrid ranking (KMS_HYBRID_RETRIEVAL=1 only) — Reciprocal Rank Fusion of the lexical
+     * ordering and the vector ordering.
+     *
+     * The lexical composite is computed exactly as `rankResults` computes it, but it is no
+     * longer the final score: it becomes the lexical arm's *ranking key*, published as
+     * `_lexicalScore`. Fusion then works on ranks, because the two arms' scores are not on
+     * a comparable scale (see `src/retrieval/hybrid.ts` for the full argument).
+     *
+     * `_score` is set to the fused value so that the value the service ordered by is the
+     * value the eval harness's `shippedRanker` re-sorts by — otherwise the harness would
+     * silently replay the lexical ordering and report it as the shipped one.
+     */
+    rankResultsHybrid(results, query) {
+        const scored = results.map(r => {
+            const relevance = this.effectiveRelevance(r, query);
+            const recency = this.calculateRecency(r.timestamp);
+            const lexicalScore = relevance * 0.70 + recency * 0.25 + (r.confidence ?? 0) * 0.05;
+            return {
+                ...r,
+                _relevance: Number(relevance.toFixed(4)),
+                _recency: Number(recency.toFixed(4)),
+                _lexicalScore: Number(lexicalScore.toFixed(4))
+            };
+        });
+        return fuseWithRRF(scored).map(r => ({ ...r, _score: r._rrf }));
+    }
+    /**
+     * Relevance used for ranking — lexical, floored by the ontology arm's own match score.
+     *
+     * An ontology entity card almost never shares tokens with the question that retrieved
+     * it. "my dad" reaches `charles_yaker` by walking `PARENT_OF` from the self node, and
+     * the card it produces ("Charles Jack Yaker (Charlie) — Person / relationship:
+     * father …") contains neither "my" nor "dad", so `calculateRelevance` scores it ~0 and
+     * the composite buries it under every incidental keyword hit. That is precisely the
+     * failure this arm exists to fix, and it would survive the fix unless the score the
+     * ontology arm already computed is allowed to stand in.
+     *
+     * A floor, not a bonus: a candidate is ranked on the BETTER of its two independently
+     * bounded [0, 1] signals, so nothing can exceed what a perfect lexical match already
+     * scores, and a result with no `_ontologyScore` — every Knowledge, Mem0, MongoDB and
+     * vector hit — is scored exactly as before.
+     */
+    effectiveRelevance(result, query) {
+        const lexical = this.calculateRelevance(result?.content, query);
+        const ontology = typeof result?._ontologyScore === 'number' && Number.isFinite(result._ontologyScore)
+            ? Math.min(1, Math.max(0, result._ontologyScore))
+            : 0;
+        return Math.max(lexical, ontology);
+    }
+    /**
+     * Lexical relevance of content to the query, in [0, 1].
+     *
+     * Word-boundary matched rather than substring matched: the old `includes(term)`
+     * scored an insurance doc about a *session* timeout as relevant to a query about
+     * an *Ollama* timeout, because "timeout" appeared somewhere in the text. Coverage
+     * (what fraction of query terms appear at all) is the dominant signal, with bounded
+     * bonuses for repetition and for the full query appearing as a phrase.
      */
     calculateRelevance(content, query) {
         if (!content || !query)
             return 0;
         const contentLower = content.toLowerCase();
-        const queryLower = query.toLowerCase();
-        const queryTerms = queryLower.split(/\s+/);
-        let score = 0;
-        queryTerms.forEach(term => {
-            if (contentLower.includes(term)) {
-                score += 1;
-                // Bonus for exact matches
-                if (contentLower.includes(queryLower)) {
-                    score += 0.5;
-                }
+        const queryLower = query.trim().toLowerCase();
+        // Drop stopwords and 1-char fragments so common filler does not inflate coverage.
+        const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'is', 'it']);
+        const terms = Array.from(new Set(queryLower.split(/[^a-z0-9_.-]+/).filter(t => t.length > 1 && !STOP.has(t))));
+        if (terms.length === 0)
+            return 0;
+        let matched = 0;
+        let density = 0;
+        for (const term of terms) {
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            // Bounded on BOTH sides. A leading \b alone still prefix-matches, so "timeout"
+            // would score against "timeoutvalue" — the substring defect this function exists
+            // to remove, in its prefix form.
+            //
+            // A short inflectional suffix is allowed so "timeout" matches "timeouts" and
+            // "abort" matches "aborted"; that is real recall, not accidental overlap. Terms
+            // ending in "e" get that "e" made optional so "route" also reaches "routing"
+            // (rout + ing). Anything beyond these suffixes must clear its own word boundary.
+            const stem = escaped.endsWith('e') ? `${escaped.slice(0, -1)}e?` : escaped;
+            const occurrences = (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length;
+            if (occurrences > 0) {
+                matched++;
+                // Diminishing returns — a term repeated 20x is not 20x more relevant.
+                density += Math.min(occurrences, 5) / 5;
             }
-        });
-        return score / queryTerms.length;
+        }
+        const coverage = matched / terms.length; // how much of the query is present
+        const densityScore = density / terms.length; // how emphatically
+        // Phrase bonus must be word-boundary matched too. A plain includes() would fire on
+        // "value" inside "timeoutvalue" — the same substring bug this rewrite exists to fix,
+        // reintroduced one line lower.
+        let phraseBonus = 0;
+        if (queryLower.length > 3) {
+            const escapedPhrase = queryLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (new RegExp(`\\b${escapedPhrase}\\b`).test(contentLower))
+                phraseBonus = 0.15;
+        }
+        const raw = Math.min(1, coverage * 0.7 + densityScore * 0.15 + phraseBonus);
+        // Length normalisation. Without it, long multi-topic entries dominate unrelated
+        // queries: a 3,000-char "everything I did today" note is keyword-dense enough to
+        // contain an incidental hit for almost any query, and if it is also recent it
+        // scores near-maximum on recency too — so it parks at the top of searches it has
+        // nothing to do with. A retrieval baseline over 20 real queries (P@5 0.54) named
+        // this as one of four causes.
+        //
+        // Damping is deliberately gentle and floored at 0.6: length correlates with
+        // substance as well as with noise, and a hard penalty would bury genuinely
+        // detailed entries. A ~500-char entry is unpenalised; the floor activates at
+        // ~2,321 chars, past which every length flattens to the same 0.6 factor — a
+        // 3,000-char entry already sits on that floor, a 40% reduction, enough to
+        // lose a tie to a short exact match without being excluded.
+        const len = content.length;
+        const NEUTRAL_LEN = 500;
+        const damping = len <= NEUTRAL_LEN
+            ? 1
+            : Math.max(0.6, 1 / (1 + Math.log10(len / NEUTRAL_LEN)));
+        return raw * damping;
+    }
+    /**
+     * Recency weight in [0, 1] with a 90-day half-life.
+     *
+     * Stored knowledge is corrected over time — today's entry about a subject usually
+     * supersedes April's. Ranking previously ignored timestamps entirely, so stale
+     * entries interleaved with current ones on the same topic.
+     */
+    calculateRecency(timestamp) {
+        if (!timestamp)
+            return 0.5; // unknown age — neutral, neither boosted nor buried
+        const t = new Date(timestamp).getTime();
+        if (!Number.isFinite(t))
+            return 0.5;
+        const ageDays = (Date.now() - t) / 86_400_000;
+        if (ageDays < 0)
+            return 1; // clock skew / future-dated
+        const HALF_LIFE_DAYS = 90;
+        return Math.pow(0.5, ageDays / HALF_LIFE_DAYS);
     }
     /**
      * Get cache TTL based on strategy
