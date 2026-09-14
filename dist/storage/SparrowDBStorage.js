@@ -12,15 +12,41 @@
  *
  * Known SparrowDB constraints handled here:
  *
- *   STRING TRUNCATION (current build limitation):
- *     The current sparrowdb.node binary truncates string property values to 7
- *     characters when decoding from the CSR node store. This is a bug in the
- *     NAPI value decoding path (tracked as SPA issue). Workaround: all full-
- *     length string content is stored in a JSON sidecar file (`content-index.json`)
- *     alongside the SparrowDB directory. The sidecar is loaded at startup and
- *     consulted for search. Graph structure (IDs, labels, relationships, short
- *     metadata) is stored in SparrowDB itself.
+ *   CONTENT SIDECAR (not a truncation workaround):
+ *     Full entry content lives in a JSON sidecar (`content-index.json`) beside
+ *     the SparrowDB directory, loaded at startup and consulted for search.
+ *     The reason is that this build has no Node-reachable fulltext index
+ *     (see below), not that SparrowDB mangles strings. Graph structure (IDs,
+ *     labels, relationships, short metadata) lives in SparrowDB itself, and
+ *     sidecar lookups are exact by id — the graph stores whole ids.
  *
+ *     There is NO 7-character string truncation. A comment here used to claim
+ *     the NAPI decode path truncated string properties to 7 chars; it was a
+ *     misdiagnosis and it cost real work (a prefix-matching "resolver" written
+ *     to compensate, plus two invalid review findings on PR #87). Verified
+ *     2026-07-31 three ways — scratch DB, a copy of the live store, and the
+ *     exact query GraphEdgeIndex.readEdges() issues:
+ *       MATCH (k:Knowledge) RETURN k.id            → full 36-char UUIDs
+ *       MATCH (a)-[r:R]->(b) RETURN a.id, b.id     → full UUIDs on both ends
+ *     On the live store (2542 Knowledge nodes) 2483 ids read back at exactly
+ *     36 chars and not one value of any length is 7 chars. Ids shorter than 36
+ *     are genuinely short ids (`caryn_yaker`, `test-set-1778114586557`), not
+ *     clipped UUIDs.
+ *
+ *   - RETURN aliases on a node-scan projection read the WRONG property, or
+ *     null. In a plain `MATCH (n:Label) … RETURN` the engine resolves each
+ *     property column by its OUTPUT NAME, not by the projected expression:
+ *       RETURN k.id                       → correct
+ *       RETURN k.id AS id                 → correct (alias == property name)
+ *       RETURN k.id AS zzz                → null
+ *       RETURN k.id AS contentType        → silently returns k.contentType (!)
+ *     Adding anything that forces the node to materialise — `id(k)`,
+ *     `labels(k)`, or the bare node variable `k`, in any position — makes
+ *     aliases resolve correctly, which is why `_ensureInternalIdMap` (it
+ *     projects `id(k)`) is unaffected. Relationship-expansion projections
+ *     (`MATCH (a)-[r:T]->(b) RETURN a.id AS f`) are unaffected too. Rule for
+ *     new queries here: either project properties unaliased, or alias them to
+ *     their own property name.
  *   - Floats are bit-cast to i64 when stored via literal float syntax;
  *     workaround: store confidence as a string property.
  *   - No MERGE … SET support — upserts use DELETE + CREATE.
@@ -38,28 +64,55 @@
  *
  * Environment variables:
  *   KMS_STORAGE_BACKEND=sparrowdb   (switches graph backend from Neo4j to SparrowDB)
- *   SPARROWDB_PATH=/path/to/kms.db  (default: ~/.kms-sparrowdb)
+ *   SPARROWDB_PATH=/path/to/kms.db  (default: ~/.kms-sparrowdb-v2)
+ *   KMS_SELF_ENTITY_ID=<node id>    (the Person node that "my dad"/"my wife" resolve
+ *                                    against; falls back to KMS_DEFAULT_USER_ID, then
+ *                                    to `richard_yaker` — and only when such a node
+ *                                    actually exists. See OntologyIndex.)
  */
 import { createRequire } from 'module';
 import { logger } from '../logger.js';
+import { probeVectorIndex } from './vectorIndexHealth.js';
+import { classifyEmbeddingWriteError, lostUpdateMessage } from './embeddingWriteError.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { PENDING_EMBEDDING_KEY, PENDING_EMBEDDER_ID_KEY } from '../embedding/EmbeddingService.js';
 import { computeFingerprint } from '../dedup/Fingerprint.js';
+import { GraphEdgeIndex } from './GraphEdgeIndex.js';
+import { OntologyIndex } from './OntologyIndex.js';
+import { isSparrowdbPackageNotInstalled } from './nativeLoaderGuard.js';
+import { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME } from './sparrowDbPath.js';
+// Re-exported for backward compatibility — the canonical definitions now
+// live in sparrowDbPath.ts (see that file's header for why), which has no
+// `import.meta.url` dependency and can be unit tested on its own.
+export { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME };
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // ---------------------------------------------------------------------------
 // Load the native .node module
 // ---------------------------------------------------------------------------
 function loadNativeBinding() {
     const require = createRequire(import.meta.url);
-    // Prefer npm package; fall back to local dev builds
+    // Prefer npm package; fall back to local dev builds — but ONLY when the
+    // package is genuinely absent. A declared, pinned dependency that fails to
+    // load for any OTHER reason (corrupt install, ABI mismatch, bad binary) is
+    // a broken install, and silently falling through to an unpinned,
+    // unversioned dev-tree binary makes that worse, not better — the failure
+    // mode issue #99 exists to prevent. Same fix as loadSparrowDBNative() in
+    // src/cli/kms.ts.
     try {
         return require('sparrowdb');
     }
-    catch {
-        // npm package not installed — try local dev paths
+    catch (err) {
+        if (!isSparrowdbPackageNotInstalled(err)) {
+            throw new Error(`SparrowDBStorage: the 'sparrowdb' package is installed but failed to load ` +
+                `(${err instanceof Error ? err.message.split('\n')[0] : String(err)}). ` +
+                `This is a broken install, not a missing dependency — falling back to an ` +
+                `unpinned dev-tree binary would silently run untested code against the ` +
+                `live database. Run \`npm ci\` to reinstall, or investigate the error above.`, { cause: err });
+        }
+        // Package genuinely not installed — the local-dev-build case below.
     }
     const candidates = [
         join(homedir(), 'Dev', 'SparrowDB', 'npm', 'sparrowdb', 'sparrowdb.node'),
@@ -117,11 +170,18 @@ export class SparrowDBStorage {
     // When false, storeEmbedding becomes a no-op so the dedup gate degrades to
     // "graph-only" rather than crashing the store path.
     vectorIndexAvailable = false;
+    // Whole-graph adjacency, built lazily on first relationship read and then
+    // maintained incrementally. Replaces a per-node, per-label query fan-out that
+    // cost ~7 Cypher round-trips per search hit while only ever seeing two of the
+    // graph's relationship types. See GraphEdgeIndex.
+    edgeIndex = null;
+    // Ontology entity index (Person/Organization/Event/…). Built lazily on first
+    // ontology-aware read. Separate from the Knowledge sidecar because these nodes
+    // are not Knowledge entries at all: they have no content string, no userId and no
+    // contentType, and before this existed the search path could not see them.
+    ontologyIndex = null;
     constructor(config) {
-        this.dbPath =
-            config?.dbPath ||
-                process.env.SPARROWDB_PATH ||
-                join(homedir(), '.kms-sparrowdb');
+        this.dbPath = resolveSparrowDBPath(config?.dbPath);
         this.sidecarPath = join(this.dbPath, 'content-index.json');
     }
     // -------------------------------------------------------------------------
@@ -134,6 +194,10 @@ export class SparrowDBStorage {
         }
         const native = loadNativeBinding();
         this.db = native.SparrowDB.open(this.dbPath);
+        // A re-initialize points at a different handle — the adjacency index built
+        // from the previous one no longer describes this graph. Same for the ontology.
+        this.edgeIndex = null;
+        this.ontologyIndex = null;
         // Load content sidecar
         this._loadSidecar();
         // Load identity registry
@@ -144,6 +208,35 @@ export class SparrowDBStorage {
         this._initializeVectorIndex();
         logger.debug(`✅ SparrowDB opened — ${this.contentIndex.size} content entries in sidecar, ` +
             `vectorIndex=${this.vectorIndexAvailable ? 'ready' : 'unavailable'}`);
+    }
+    /**
+     * Report whether the HNSW vector index is actually usable.
+     *
+     * Nothing measured this before; the 2026-08-01 loss of ~1150 vectors went
+     * unnoticed until a retrieval investigation stumbled on it, and the repair that
+     * followed was a manual one-off. See ./vectorIndexHealth.ts for why the MISSING
+     * case is treated as critical rather than as "no data".
+     *
+     * Safe against the live store: on bindings that expose it, vectorIndexHealth()
+     * routes through get_vector_index(), a pure in-memory RwLock read with zero I/O,
+     * so it cannot quarantine the index it is measuring. Verified by execution.
+     */
+    getVectorIndexHealth() {
+        // Count the nodes that SHOULD carry a vector, from the GRAPH not the index.
+        // This is the only signal that catches embeddings which never reached the
+        // index at all — every other signal is index-derived, so an index that simply
+        // never received the data looks perfectly healthy to all of them.
+        let expected = null;
+        try {
+            const rows = this.db.execute(`MATCH (k:${SparrowDBStorage.VECTOR_LABEL}) RETURN count(k)`)?.rows;
+            const v = rows?.[0] && Object.values(rows[0])[0];
+            if (typeof v === 'number')
+                expected = v;
+        }
+        catch {
+            // Corpus count is best-effort; its absence must not break the probe.
+        }
+        return probeVectorIndex(this.db, SparrowDBStorage.VECTOR_LABEL, SparrowDBStorage.VECTOR_PROPERTY, expected);
     }
     _initializeVectorIndex() {
         if (typeof this.db.createVectorIndex !== 'function') {
@@ -184,10 +277,20 @@ export class SparrowDBStorage {
     async store(knowledge) {
         logger.debug(`⚡ Storing in SparrowDB: ${knowledge.id}`);
         // Delete any existing node (upsert via DELETE+CREATE, since MERGE+SET is unsupported).
+        // Mirrors delete(): SparrowDB refuses to DELETE a node with incident edges, so
+        // relationships must go first or the DELETE below throws (silently, into this
+        // catch), the stale node survives, and the CREATE further down duplicates it
+        // under the same id. removeNode() then keeps the in-memory adjacency in sync
+        // with what was just deleted from the graph.
+        try {
+            this.db.execute(`MATCH (k:Knowledge {id: ${cypherStr(knowledge.id)}})-[r]-() DELETE r`);
+        }
+        catch { /* may have no relationships */ }
         try {
             this.db.execute(`MATCH (k:Knowledge {id: ${cypherStr(knowledge.id)}}) DELETE k`);
         }
         catch { /* node may not exist */ }
+        this._edges().removeNode(knowledge.id);
         const ts = knowledge.timestamp instanceof Date
             ? knowledge.timestamp.toISOString()
             : String(knowledge.timestamp);
@@ -220,7 +323,6 @@ export class SparrowDBStorage {
                     // inside the MERGE pattern's literal property dict. Compound
                     // MERGE+SET parses but the SET clause silently no-ops in 0.1.22
                     // (verified — see channel msg #202 to SparrowDB session).
-                    ;
                     this.db.executeWithParams(`MERGE (k:Knowledge {` +
                         `  id: ${cypherStr(knowledge.id)},` +
                         `  contentType: ${cypherStr(knowledge.contentType)},` +
@@ -342,17 +444,24 @@ export class SparrowDBStorage {
             // embedding MUST go through executeWithParams (PR #409). The engine
             // coerces JS Array → engine List → Vec<f32> for HNSW index population.
             // String props (embedderId) still work via literal SET.
-            ;
             this.db.executeWithParams(`MATCH (k:${SparrowDBStorage.VECTOR_LABEL} {id: ${cypherStr(id)}}) ` +
                 `SET k.${SparrowDBStorage.VECTOR_PROPERTY} = $emb, ` +
                 `    k.embedderId = ${cypherStr(embedderId)}`, { emb: Array.from(embedding) });
         }
         catch (e) {
-            // The most common failure is "node not found" — happens for the ~185
-            // sidecar-orphan entries that exist in the JSON sidecar but never got
-            // a graph node (pre-cutover legacy). Logged at debug, not warn.
-            logger.debug(`storeEmbedding: graph SET failed for ${id} (likely sidecar-orphan): ` +
-                `${e instanceof Error ? e.message : String(e)}`);
+            const msg = e instanceof Error ? e.message : String(e);
+            // Default LOUD, downgrade only what is known benign. See
+            // ./embeddingWriteError.ts for why this stopped being a debug-level concern.
+            switch (classifyEmbeddingWriteError(msg)) {
+                case 'lost-update':
+                    logger.error(lostUpdateMessage(id, msg));
+                    break;
+                case 'sidecar-orphan':
+                    logger.debug(`storeEmbedding: no graph node for ${id} (sidecar-orphan): ${msg}`);
+                    break;
+                default:
+                    logger.warn(`storeEmbedding: graph SET failed for ${id} (unclassified): ${msg}`);
+            }
             return false;
         }
         // Mirror the bookkeeping into the in-memory sidecar so consumers can check
@@ -425,20 +534,21 @@ export class SparrowDBStorage {
         if (this.internalIdMapLoaded)
             return;
         try {
-            const res = this.db.execute(`MATCH (k:Knowledge) RETURN id(k) AS nid, k.id AS short_id`);
+            // `id(k)` is load-bearing twice over: it is the key we are mapping, and
+            // its presence is what makes the aliased `k.id` column resolve at all
+            // (see the RETURN-alias note in the file header).
+            const res = this.db.execute(`MATCH (k:Knowledge) RETURN id(k) AS nid, k.id AS node_id`);
             for (const row of res.rows) {
                 const nid = row['nid'];
-                const shortId = row['short_id'];
+                const uuid = row['node_id'];
                 if (nid === null || nid === undefined)
                     continue;
-                const internalId = String(nid);
-                const prefix = String(shortId ?? '');
-                // Resolve possibly-truncated short_id to the full UUID via sidecar prefix lookup.
-                // SparrowDB 0.1.22 truncates string properties to 7 chars on read; the sidecar
-                // is the authoritative source for full UUIDs.
-                const entry = this._findEntryByPrefix(prefix);
+                // The graph stores whole ids, so this is an exact sidecar lookup. Nodes
+                // absent from the sidecar stay unmapped: a vector hit we cannot join to
+                // content is not returnable anyway.
+                const entry = this.contentIndex.get(String(uuid ?? ''));
                 if (entry) {
-                    this.internalIdToUuid.set(internalId, entry.id);
+                    this.internalIdToUuid.set(String(nid), entry.id);
                 }
             }
             this.internalIdMapLoaded = true;
@@ -553,6 +663,7 @@ export class SparrowDBStorage {
             this.db.execute(`MATCH (k:Knowledge {id: ${cypherStr(id)}}) DELETE k`);
         }
         catch { /* node may not exist */ }
+        this._edges().removeNode(id);
         if (hadEntry) {
             this.contentIndex.delete(id);
             this._saveSidecar();
@@ -839,13 +950,53 @@ export class SparrowDBStorage {
                     relationships
                 };
             }));
-            logger.debug(`⚡ SparrowDB found ${results.length} results`);
-            return results;
+            const ontologyResults = await this._ontologyArm(query, results);
+            logger.debug(`⚡ SparrowDB found ${results.length} knowledge + ${ontologyResults.length} ontology results`);
+            return [...results, ...ontologyResults];
         }
         catch (error) {
             logger.warn('⚠️ SparrowDB search error:', error);
             return [];
         }
+    }
+    /**
+     * The ontology arm of `search`.
+     *
+     * Runs alongside the Knowledge sidecar scan rather than instead of it: "who is Eddie
+     * Yaker" should return the Person node AND whatever notes mention him, and a purely
+     * technical query should return neither an entity nor a degraded Knowledge ranking.
+     *
+     * Skipped outright when the caller's filters could not possibly be satisfied by an
+     * entity — an ontology node has no `contentType`, no `metadata.subject` and no
+     * authored `confidence`, so honouring those filters means standing down, not
+     * pretending the fields exist.
+     */
+    async _ontologyArm(query, knowledgeResults) {
+        const filters = query.filters ?? {};
+        if (filters.contentType && filters.contentType.length > 0 && !filters.contentType.includes('entity')) {
+            return [];
+        }
+        if (filters.subject !== undefined)
+            return [];
+        if (filters.source && filters.source.length > 0 && !filters.source.includes('personal'))
+            return [];
+        if (!query.query?.trim())
+            return [];
+        const maxResults = Math.floor(query.options?.maxResults ?? 10);
+        // Relationships are the point of an entity result — "Person + 1-hop edges" is what
+        // makes "my dad" answerable — but a caller that explicitly opted out gets the same
+        // answer it asked for here as on the Knowledge path, and skips the adjacency build.
+        const hits = await this.searchOntology(query.query, Math.max(1, Math.min(5, maxResults)), { includeRelationships: query.options?.includeRelationships !== false });
+        // An id already returned as Knowledge must not come back a second time as an
+        // entity; dedup downstream would merge them, but on `content` length, which would
+        // hand the caller whichever copy happened to be wordier.
+        const seen = new Set(knowledgeResults.map(r => r.id));
+        let out = hits.filter(h => !seen.has(h.id));
+        if (filters.minConfidence !== undefined) {
+            const min = filters.minConfidence;
+            out = out.filter(h => h.confidence >= min);
+        }
+        return out;
     }
     // -------------------------------------------------------------------------
     // StorageSystem.getStats
@@ -856,7 +1007,9 @@ export class SparrowDBStorage {
             const totalNodes = Number(nodeResult.rows[0]?.['count(n)'] ?? 0);
             const relResult = this.db.execute(`MATCH ()-[r]->() RETURN count(r) AS cnt`);
             const totalRelationships = Number(relResult.rows[0]?.['cnt'] ?? 0);
-            // Content type distribution from sidecar (authoritative — SparrowDB strings truncated).
+            // Content type distribution from the sidecar: it is the only place every
+            // entry's contentType is guaranteed present (the graph node carries it
+            // only for entries written through the current upsert path).
             const contentTypes = {};
             for (const entry of this.contentIndex.values()) {
                 contentTypes[entry.contentType] = (contentTypes[entry.contentType] ?? 0) + 1;
@@ -929,16 +1082,8 @@ export class SparrowDBStorage {
             // Partial match — only safe if exactly one result (ambiguous = skip)
             const partial = this.db.execute(`MATCH (n:Person) WHERE toLower(n.name) CONTAINS '${safeNorm}' RETURN n.id LIMIT 5`);
             if (partial.rows.length === 1) {
-                const rawId = String(partial.rows[0]['n.id'] ?? '').trim();
-                if (!rawId)
-                    return null;
-                // SparrowDB may truncate string properties to 7 chars — try to expand prefix
-                if (this.knownPeople && rawId.length <= 7) {
-                    const matches = Object.keys(this.knownPeople.people).filter(id => id.startsWith(rawId));
-                    if (matches.length === 1)
-                        return matches[0];
-                }
-                return rawId || null;
+                // Whole id — the graph does not clip strings.
+                return String(partial.rows[0]['n.id'] ?? '').trim() || null;
             }
         }
         catch (e) {
@@ -981,13 +1126,14 @@ export class SparrowDBStorage {
                     const edgeStrength = rawStrength != null
                         ? Math.round(parseFloatSafe(rawStrength)) / 100
                         : undefined;
-                    // rawId may be truncated to 7 chars — use prefix search to
-                    // resolve all matching sidecar entries.
-                    const matches = this._findAllEntriesByPrefix(rawId);
-                    const toProcess = matches.length > 0
-                        ? matches
-                        : [{ id: rawId, content: '', confidence: 0, contentType: '',
-                                source: '', userId: '', timestamp: '', metadata: {} }];
+                    // rawId is the neighbour's whole id. Traverse it even when the
+                    // sidecar has no entry — the edge is still a real hop — but do not
+                    // invent extra neighbours for it.
+                    const match = this.contentIndex.get(rawId);
+                    const toProcess = [
+                        match ?? { id: rawId, content: '', confidence: 0, contentType: '',
+                            source: '', userId: '', timestamp: '', metadata: {} }
+                    ];
                     for (const fullEntry of toProcess) {
                         const fullId = fullEntry.id;
                         if (!fullId || visited.has(fullId))
@@ -1014,60 +1160,65 @@ export class SparrowDBStorage {
             return [];
         }
     }
+    /**
+     * A brief card for one node — what `unified_search` returns as `entity_context`.
+     *
+     * Previously this re-queried the graph for a fixed property list and then threw the
+     * result away: `name` was the first three words of the sidecar entry (null for a
+     * Person, which has no sidecar entry), `key_props` was always `{}`, and
+     * `top_relationships` read only `RELATED_TO`, so a Person's `PARENT_OF` /
+     * `SIBLING_OF` edges never appeared. The ontology index already holds the node's real
+     * name, labels and properties, and the edge index already holds every typed edge, so
+     * the card is assembled from those.
+     */
     async getEntitySummary(id) {
-        // Check sidecar first for full content.
+        const entity = this._ontology().get(id);
         const entry = this.contentIndex.get(id);
-        // Try each label in the graph.
-        for (const label of ['Knowledge', 'Person', 'Organization', 'Project',
-            'Technology', 'Concept', 'Service', 'Event']) {
-            let result;
+        if (entity) {
+            let top_relationships = [];
             try {
-                result = this.db.execute(`MATCH (n:${label} {id: ${cypherStr(id)}}) ` +
-                    `RETURN n.id, n.name, n.description, n.notes, n.headline, ` +
-                    `       n.profession, n.career, n.purpose, n.industry, ` +
-                    `       n.expertise, n.role, n.status, n.domain, n.taskPattern, ` +
-                    `       n.approach, n.path`);
+                top_relationships = this._edges().relationshipsFor(id).slice(0, 6).map(r => ({
+                    rel: r.relationship,
+                    direction: r.direction,
+                    id: r.relatedNode,
+                    name: this._ontology().get(r.relatedNode)?.name
+                        ?? this.contentIndex.get(r.relatedNode)?.content?.slice(0, 40)
+                        ?? r.relatedNode
+                }));
             }
-            catch {
-                continue;
+            catch (error) {
+                logger.debug(`entity summary relationships unavailable for ${id}: ${error}`);
             }
-            if (result.rows.length === 0)
-                continue;
-            // Strings from SparrowDB are truncated — use sidecar for content where available.
-            const summary = {
+            return {
                 id,
-                name: entry?.content?.split(' ').slice(0, 3).join(' ') ?? null,
-                type: [label],
-                summary: entry?.content?.slice(0, 200) ?? null,
-                key_props: {},
-                top_relationships: []
+                name: entity.name,
+                type: entity.labels,
+                summary: entity.content.slice(0, 400),
+                key_props: entity.props,
+                top_relationships
             };
-            // Best-effort: fetch up to 4 connected nodes.
-            try {
-                const rels = this.db.execute(`MATCH (n {id: ${cypherStr(id)}})-[:RELATED_TO]-(m) ` +
-                    `RETURN m.id LIMIT 4`);
-                summary.top_relationships = rels.rows
-                    .map(r => {
-                    const mid = String(r['m.id'] ?? '');
-                    const related = this._findEntryByPrefix(mid);
-                    return related
-                        ? { rel: 'RELATED_TO', name: related.content.slice(0, 40), id: related.id }
-                        : null;
-                })
-                    .filter(Boolean);
-            }
-            catch { /* ignore */ }
-            return summary;
         }
-        // Not in graph at all — return from sidecar only if available.
+        // Not an ontology entity — fall back to the Knowledge sidecar.
         if (entry) {
+            let top_relationships = [];
+            try {
+                top_relationships = this._edges().relationshipsFor(id).slice(0, 4).map(r => ({
+                    rel: r.relationship,
+                    direction: r.direction,
+                    id: r.relatedNode,
+                    name: r.relatedContent || this._ontology().get(r.relatedNode)?.name || r.relatedNode
+                }));
+            }
+            catch (error) {
+                logger.debug(`entity summary relationships unavailable for ${id}: ${error}`);
+            }
             return {
                 id,
                 name: null,
                 type: ['Knowledge'],
                 summary: entry.content.slice(0, 200),
                 key_props: {},
-                top_relationships: []
+                top_relationships
             };
         }
         return null;
@@ -1080,8 +1231,7 @@ export class SparrowDBStorage {
                     `RETURN n.id, n.type, n.name, n.description, n.taskPattern, n.actions`);
                 for (const row of r.rows) {
                     const nodeId = String(row['n.id'] ?? '');
-                    // Resolve full strings from sidecar.
-                    const entry = this._findEntryByPrefix(nodeId);
+                    const entry = this.contentIndex.get(nodeId);
                     results.push({
                         id: entry?.id ?? nodeId,
                         type: String(row['n.type'] ?? label),
@@ -1112,7 +1262,7 @@ export class SparrowDBStorage {
                     const rawId = String(row['n.id'] ?? '');
                     if (!rawId)
                         continue;
-                    const entry = this._findEntryByPrefix(rawId);
+                    const entry = this.contentIndex.get(rawId);
                     const id = entry?.id ?? rawId;
                     const name = String(row['n.name'] ?? entry?.content?.split(' ')[0] ?? '');
                     if (!name)
@@ -1160,6 +1310,7 @@ export class SparrowDBStorage {
                 this.db.execute(`MATCH (k:Knowledge {id: ${cypherStr(sourceId)}}), ` +
                     `(e {id: ${cypherStr(targetId)}}) ` +
                     `CREATE (k)-[:ABOUT {strength: 100}]->(e)`);
+                this._edges().addEdge(sourceId, targetId, 'ABOUT', 1);
             }
             catch (error) {
                 logger.warn(`⚠️ SparrowDB createAboutRelationships ${sourceId} → ${targetId}:`, error);
@@ -1170,43 +1321,6 @@ export class SparrowDBStorage {
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
-    /**
-     * Find a sidecar entry whose ID starts with the (possibly truncated) prefix.
-     * Returns the first match. When multiple IDs share the same 7-char prefix,
-     * disambiguation is impossible — this is a known limitation of the current
-     * SparrowDB build's 7-char string truncation.
-     */
-    _findEntryByPrefix(prefix) {
-        if (!prefix)
-            return undefined;
-        // Exact match first.
-        if (this.contentIndex.has(prefix))
-            return this.contentIndex.get(prefix);
-        // Prefix search (handles 7-char truncation from SparrowDB native binding).
-        for (const [key, entry] of this.contentIndex) {
-            if (key.startsWith(prefix))
-                return entry;
-        }
-        return undefined;
-    }
-    /**
-     * Find ALL sidecar entries whose ID starts with the given prefix.
-     * Used by findRelated to handle ambiguous 7-char truncated IDs.
-     */
-    _findAllEntriesByPrefix(prefix) {
-        if (!prefix)
-            return [];
-        if (this.contentIndex.has(prefix)) {
-            const e = this.contentIndex.get(prefix);
-            return e ? [e] : [];
-        }
-        const matches = [];
-        for (const [key, entry] of this.contentIndex) {
-            if (key.startsWith(prefix))
-                matches.push(entry);
-        }
-        return matches;
-    }
     async _createRelationship(sourceId, targetId, relationshipType, strength) {
         try {
             const safeRelType = relationshipType.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
@@ -1224,6 +1338,7 @@ export class SparrowDBStorage {
             this.db.execute(`MATCH (a:Knowledge {id: ${cypherStr(sourceId)}}), ` +
                 `(b:Knowledge {id: ${cypherStr(targetId)}}) ` +
                 `CREATE (a)-[:${safeRelType}${props}]->(b)`);
+            this._edges().addEdge(sourceId, targetId, safeRelType, strength !== undefined && strength >= 0 && strength <= 1 ? strength : null);
         }
         catch (error) {
             logger.warn(`⚠️ SparrowDB createRelationship ${relationshipType}:`, error);
@@ -1246,44 +1361,106 @@ export class SparrowDBStorage {
             logger.warn('⚠️ SparrowDB createSemanticRelationships:', error);
         }
     }
-    async _getRelationships(nodeId) {
-        const relationships = [];
+    /**
+     * The adjacency index, created on first use so it always wraps the current
+     * db handle (initialize() may replace it).
+     */
+    _edges() {
+        if (!this.edgeIndex) {
+            this.edgeIndex = new GraphEdgeIndex(this.db, 
+            // Ontology nodes are not in the Knowledge sidecar, so without the second
+            // lookup a `PARENT_OF` edge rendered as an id with an empty preview — the
+            // relationship was present and unreadable, which is barely better than absent.
+            (id) => this.contentIndex.get(id) ?? this._ontologyEntry(id), { debug: (m) => logger.debug(`⚡ SparrowDB ${m}`) });
+        }
+        return this.edgeIndex;
+    }
+    /** An ontology node in the shape GraphEdgeIndex's entry resolver expects. */
+    _ontologyEntry(id) {
+        const entity = this._ontology().get(id);
+        return entity ? { id: entity.id, content: entity.name } : undefined;
+    }
+    /**
+     * The ontology index, created on first use so it always wraps the current db handle.
+     *
+     * The adjacency is handed over so kinship cues ("my dad") can be resolved by walking
+     * `PARENT_OF` from the self node, and it is set lazily — constructing the edge index
+     * here would build the whole-graph adjacency on every search, including the ones that
+     * never ask for a relationship.
+     */
+    _ontology() {
+        if (!this.ontologyIndex) {
+            this.ontologyIndex = new OntologyIndex(this.db, {
+                edges: null,
+                debug: (m) => logger.debug(`⚡ SparrowDB ${m}`)
+            });
+        }
+        return this.ontologyIndex;
+    }
+    /**
+     * Entity candidates for a natural-language query — Person, Organization, Event, and
+     * every other ontology label, with their real labels and 1-hop relationships.
+     *
+     * Exposed on the GraphStorage interface (optionally) so callers other than `search`
+     * can reach the ontology directly, and so a graph backend that has no ontology simply
+     * omits the method rather than returning misleading empties.
+     */
+    async searchOntology(query, maxResults = 5, options = {}) {
         try {
-            const out = this.db.execute(`MATCH (a:Knowledge {id: ${cypherStr(nodeId)}})-[:RELATED_TO]->(b:Knowledge) ` +
-                `RETURN b.id`);
-            for (const row of out.rows) {
-                const rawId = String(row['b.id'] ?? '');
-                const target = this._findEntryByPrefix(rawId);
-                relationships.push({
-                    relationship: 'RELATED_TO',
-                    relatedNode: target?.id ?? rawId,
-                    relatedContent: (target?.content ?? '').slice(0, 80),
-                    strength: null
-                });
-            }
-            // ABOUT links to entity labels.
-            for (const label of ['Person', 'Organization', 'Project', 'Technology', 'Concept', 'Service']) {
-                try {
-                    const about = this.db.execute(`MATCH (k:Knowledge {id: ${cypherStr(nodeId)}})-[:ABOUT]->(e:${label}) ` +
-                        `RETURN e.id, e.name`);
-                    for (const row of about.rows) {
-                        relationships.push({
-                            relationship: 'ABOUT',
-                            relatedNode: String(row['e.id'] ?? ''),
-                            relatedContent: String(row['e.name'] ?? ''),
-                            strength: null
-                        });
-                    }
-                }
-                catch {
-                    continue;
-                }
-            }
+            const ontology = this._ontology();
+            ontology.setNeighbourReader(this._edges());
+            const matches = ontology.search(query, { limit: maxResults });
+            const withRelationships = options.includeRelationships !== false;
+            return matches.map(m => this._ontologyResult(m, withRelationships));
         }
         catch (error) {
-            logger.warn('⚠️ SparrowDB _getRelationships error:', error);
+            logger.warn('⚠️ SparrowDB ontology search error:', error);
+            return [];
         }
-        return relationships.filter(r => r.relatedNode);
+    }
+    /** One ontology match in the result shape every other search arm returns. */
+    _ontologyResult(match, includeRelationships = true) {
+        const { entity, score, reasons } = match;
+        let relationships = [];
+        if (includeRelationships) {
+            try {
+                relationships = this._edges().relationshipsFor(entity.id);
+            }
+            catch (error) {
+                logger.debug(`ontology relationships unavailable for ${entity.id}: ${error}`);
+            }
+        }
+        return {
+            id: entity.id,
+            content: entity.content,
+            confidence: score,
+            // Deliberately NOT a copy of `entity.props` — that is the same data the card
+            // already renders, and `index.ts` drops whole results when the response exceeds
+            // its byte budget, so duplicating content here would evict real hits. Structured
+            // properties reach callers through `entity_context[id].key_props`.
+            metadata: { ontology: true, matchReasons: reasons },
+            sourceSystem: 'sparrowdb',
+            // Ontology nodes carry no write timestamp; `calculateRecency` reads a missing
+            // one as neutral, which is right — an entity is neither fresh nor stale.
+            timestamp: undefined,
+            contentType: 'entity',
+            source: 'personal',
+            nodeLabels: entity.labels,
+            // The ontology arm's own match strength, kept distinct from `confidence` so the
+            // ranker can floor lexical relevance with it without conflating the two.
+            _ontologyScore: score,
+            relationships
+        };
+    }
+    /**
+     * Relationships incident to `nodeId`, outgoing first, then incoming.
+     *
+     * See GraphEdgeIndex for why this reads a whole-graph adjacency rather than
+     * querying per node: the per-node reader saw only two of the graph's ~45
+     * relationship types and only followed edges outward.
+     */
+    async _getRelationships(nodeId) {
+        return this._edges().relationshipsFor(nodeId);
     }
     // -------------------------------------------------------------------------
     // Identity registry

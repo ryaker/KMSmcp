@@ -108,7 +108,12 @@ export class Mem0Storage {
             // Previous implementation passed user_id at top level → SDK threw →
             // outer try/catch swallowed → returned [] → Mem0 dimension of dedup
             // gate has been silently dark since the 1.x→3.x cutover.
+            // `api_version: 'v2'` pins the search to /v2/memories/search/ for
+            // consistency with getAll() (which REQUIRES v2 — the v1 getAll path
+            // serializes options via URLSearchParams and stringifies nested
+            // `filters` to "[object Object]", causing a 400 from the server).
             const searchOptions = {
+                api_version: 'v2',
                 topK: query.options?.maxResults || 10,
                 filters: { user_id: userId, ...this.buildMem0Filters(query.filters) }
             };
@@ -127,8 +132,21 @@ export class Mem0Storage {
                 source: r.metadata?.source,
                 userId: r.userId ?? r.user_id
             }));
-            console.log(`🧠 Mem0 found ${processedResults.length} results`);
-            return processedResults;
+            // minConfidence is applied HERE, not server-side: Mem0's search API rejects
+            // a bare `min_confidence` filter key outright (see buildMem0Filters below) — it
+            // has no confidence predicate at all. Confidence comes from metadata.confidence
+            // at store time, falling back to the relevance score, matching how `confidence`
+            // is derived above.
+            const minConfidence = query.filters?.minConfidence;
+            const filtered = typeof minConfidence === 'number'
+                ? processedResults.filter(r => r.confidence >= minConfidence)
+                : processedResults;
+            if (filtered.length !== processedResults.length) {
+                console.log(`🧠 Mem0 minConfidence>=${minConfidence} dropped ` +
+                    `${processedResults.length - filtered.length} of ${processedResults.length}`);
+            }
+            console.log(`🧠 Mem0 found ${filtered.length} results`);
+            return filtered;
         }
         catch (error) {
             console.warn('⚠️ Mem0 search error:', error);
@@ -140,8 +158,16 @@ export class Mem0Storage {
             // v3 SDK: use getAll() with filters.user_id and page_size=1 to get the count.
             // user_id MUST be inside filters — getAll() throws via rejectTopLevelEntityParams
             // if it appears at top level (verified against mem0ai@3.0.2 source).
+            // `api_version: 'v2'` is REQUIRED here: the SDK's getAll() (mem0ai
+            // dist/index.js:249-281) defaults to /v1/memories/?<URLSearchParams>
+            // when api_version is unset. URLSearchParams stringifies nested
+            // `filters` to "[object Object]", so the v1 endpoint sees no entity
+            // param and returns 400 with "One of the filters: app_id, user_id,
+            // agent_id, run_id is required!". Only the v2 endpoint POSTs the
+            // options as JSON, preserving the nested filters object.
             const userId = this.config.defaultUserId || 'personal';
             const page = await this.client.getAll({
+                api_version: 'v2',
                 page: 1,
                 page_size: 1,
                 filters: { user_id: userId }
@@ -167,6 +193,7 @@ export class Mem0Storage {
     async getMemoriesForUser(userId, limit = 50) {
         try {
             const page = await this.client.getAll({
+                api_version: 'v2',
                 page: 1,
                 page_size: limit,
                 filters: { user_id: userId }
@@ -292,7 +319,10 @@ export class Mem0Storage {
                 // camelCase `topK` — which it converts to snake_case at the wire —
                 // is accepted. The SDK's published .d.ts only lists `top_k`; the
                 // runtime accepts both.
+                // `api_version: 'v2'` for consistency with getStats/getMemoriesForUser
+                // and to prevent the same regression class as the v1 URLSearchParams bug.
                 const searchOptions = {
+                    api_version: 'v2',
                     topK: 50,
                     filters: { user_id: resolvedUserId }
                 };
@@ -325,7 +355,16 @@ export class Mem0Storage {
             // Step 3: call Mem0 update with the resolved internal id.
             try {
                 logger.debug(`[Mem0Storage.update] Updating Mem0 entry mem0Id=${mem0Id} for kms_id=${id}`);
-                await this.client.update(mem0Id, content);
+                // SDK signature is update(memoryId, { text, metadata, timestamp }). This
+                // passed `content` as a bare string — does not typecheck (TS2559) and
+                // fails at runtime (mem0ai throws "At least one of text, metadata, or
+                // timestamp must be provided" since destructuring a string yields
+                // undefined for all three), so kms_update has never propagated content
+                // to Mem0. The error doesn't match the 404 probe-and-skip regex below,
+                // so it fell through to the outer catch and returned false silently —
+                // every kms_update result showed backends:["sparrowdb"] and never mem0,
+                // which read as "not routed to Mem0" rather than "the write is broken."
+                await this.client.update(mem0Id, { text: content });
                 logger.debug(`[Mem0Storage.update] Successfully propagated kms_update to Mem0 (kms_id=${id}, mem0Id=${mem0Id})`);
                 return true;
             }
@@ -373,23 +412,39 @@ export class Mem0Storage {
     buildMem0Filters(filters) {
         if (!filters)
             return {};
-        const mem0Filters = {};
+        // Custom fields MUST be nested under `metadata`. Mem0 rejects unknown
+        // top-level filter keys outright — the server's own error names what it
+        // accepts: ['AND','NOT','OR','agent_id','app_id','categories','created_at',
+        // 'keywords','memory_ids','metadata','run_id','text','timestamp',
+        // 'updated_at','user_id'].
+        //
+        // This was sending content_type/source/min_confidence BARE, so every search
+        // carrying one of those filters threw ValidationError inside search()'s try
+        // block and was swallowed by its catch, returning [] — Mem0 contributed
+        // NOTHING to those queries, silently, with no error surfaced to the caller.
+        //
+        // Verified empirically against the live API (v2 search, user richard_yaker):
+        //   { user_id, content_type: 'fact' }              -> REJECT ValidationError
+        //   { user_id, metadata: { content_type: 'fact' } } -> 10 results
+        // and it genuinely discriminates rather than being accepted-and-ignored: a
+        // nonsense value returns 0 while a real one returns 10.
+        const metadata = {};
         if (filters.contentType) {
-            mem0Filters.content_type = filters.contentType;
+            metadata.content_type = filters.contentType;
         }
         if (filters.source) {
-            mem0Filters.source = filters.source;
+            metadata.source = filters.source;
         }
-        if (filters.minConfidence) {
-            mem0Filters.min_confidence = filters.minConfidence;
-        }
-        // Subject facet (DG-FACET-A). Mem0 stores arbitrary fields under metadata.*
-        // when we pass them via options.metadata at store time (see store()), so
-        // filtering on `subject` here surfaces only entries with the matching facet.
+        // Subject facet (DG-FACET-A). Stored inside options.metadata at write time
+        // (see store()), so it filters here for the same reason content_type does.
         if (filters.subject !== undefined) {
-            mem0Filters.subject = filters.subject;
+            metadata.subject = filters.subject;
         }
-        return mem0Filters;
+        // minConfidence is deliberately NOT sent. Mem0 has no server-side confidence
+        // predicate — `min_confidence` is not in the allowed-key list above and was
+        // being rejected. Confidence lives in metadata.confidence, so it is applied
+        // client-side in search() after results come back.
+        return Object.keys(metadata).length > 0 ? { metadata } : {};
     }
     getKnownUserIds() {
         const defaultUserId = this.config.defaultUserId || 'personal';
@@ -400,7 +455,9 @@ export class Mem0Storage {
             console.log(`🧪 [Mem0Storage.testDirectSearch] Testing direct search for: "${query}" with user: ${userId}`);
             const searchQuery = query;
             // v3 SDK contract: user_id inside filters (see Mem0Storage.search above).
+            // `api_version: 'v2'` for consistency with the rest of this file.
             const searchOptions = {
+                api_version: 'v2',
                 topK: 10,
                 filters: { user_id: userId }
             };
