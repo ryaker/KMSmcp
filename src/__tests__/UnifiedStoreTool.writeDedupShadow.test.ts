@@ -223,6 +223,27 @@ describe('UnifiedStoreTool write-dedup shadow', () => {
     }
   })
 
+  // The dedup_required call site is inside the gate's own try/catch, whose handler means
+  // "findSimilar failed, write anyway". A throw while STARTING the shadow path (undici
+  // rejects a scheme-less proxy URI synchronously) must not be able to reach it.
+  it('a broken credential env cannot turn a refused write into a stored one', async () => {
+    const baseline = build(0.84)
+    const expected = await baseline.tool.store(storeArgs())
+
+    process.env.KMS_JEV_WRITE_DEDUP = '1'
+    process.env.ONECLI_TOKEN = 'placeholder'
+    process.env.ONECLI_GATEWAY = 'localhost:8080'
+    const built = build(0.84, { log: memoryLog().log })
+    const first = await built.tool.store(storeArgs())
+    const second = await built.tool.store(storeArgs())
+    await built.tool.awaitWriteDedupShadowIdle()
+
+    expect((first as any).status).toBe('dedup_required')
+    expect(first).toEqual(expected)
+    expect(second).toEqual(expected)
+    expect(writes(built).stores).toEqual([0, 0, 0])
+  })
+
   it('logs the caller\'s retry action as a resolution row, without the reason text', async () => {
     process.env.KMS_JEV_WRITE_DEDUP = '1'
     const { engine, evaluate } = engineSaying('duplicate')
