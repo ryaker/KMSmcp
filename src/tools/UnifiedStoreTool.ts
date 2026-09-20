@@ -287,42 +287,54 @@ export class UnifiedStoreTool {
   ): void {
     if (!isJevWriteDedupEnabled() || candidates.length === 0) return
 
-    if (this.decisionEngine === undefined) {
-      this.decisionEngine = createJevDecisionEngineFromEnv()
-      if (!this.decisionEngine) {
-        console.error(`⚠️ ${JEV_WRITE_DEDUP_FLAG}=1 but no Jev credential route (ONECLI_TOKEN+ONECLI_GATEWAY, or TYPESAFE_API_KEY) — write-dedup shadow disabled for this process`)
+    // Nothing in here may throw into store(). The `dedup_required` call site sits inside
+    // the gate's own try/catch, whose handler means "findSimilar failed, write anyway" —
+    // so a throw from, say, a malformed ONECLI_GATEWAY would not just lose a log row, it
+    // would turn a refused write into a stored one.
+    try {
+      if (this.decisionEngine === undefined) {
+        this.decisionEngine = null
+        this.decisionEngine = createJevDecisionEngineFromEnv()
+        if (!this.decisionEngine) {
+          console.error(`⚠️ ${JEV_WRITE_DEDUP_FLAG}=1 but no Jev credential route (ONECLI_TOKEN+ONECLI_GATEWAY, or TYPESAFE_API_KEY) — write-dedup shadow disabled for this process`)
+        }
+        if (isJevWriteDedupActRequested()) {
+          console.error(`⚠️ ${JEV_WRITE_DEDUP_ACT_FLAG}=1 is reserved and hard-disabled — write-dedup stays advisory (shadow_log only)`)
+        }
       }
-      if (isJevWriteDedupActRequested()) {
-        console.error(`⚠️ ${JEV_WRITE_DEDUP_ACT_FLAG}=1 is reserved and hard-disabled — write-dedup stays advisory (shadow_log only)`)
+      if (!this.decisionEngine) return
+      if (this.writeDedupLog === undefined) {
+        this.writeDedupLog = null
+        this.writeDedupLog = writeDedupLogFromEnv()
       }
-    }
-    if (!this.decisionEngine) return
-    if (this.writeDedupLog === undefined) this.writeDedupLog = writeDedupLogFromEnv()
 
-    const graph = this.storage.graph as { findById?: (id: string) => unknown }
-    this.track(runWriteDedupShadow({
-      engine: this.decisionEngine,
-      assertion: {
-        entryId: knowledge.id,
-        content: knowledge.content,
-        contentType: knowledge.contentType,
-        subject: typeof knowledge.metadata?.subject === 'string' ? knowledge.metadata.subject : undefined,
-        userId: knowledge.userId,
-      },
-      gate,
-      candidates,
-      hydrate: typeof graph.findById === 'function'
-        ? async id => (await graph.findById!(id)) as { content?: unknown; metadata?: unknown } | null
-        : undefined,
-      minSimilarity: jevWriteDedupMinSimilarity(),
-      actRequested: isJevWriteDedupActRequested(),
-      sink: this.writeDedupLog,
-    }).then(
-      () => undefined,
-      // runWriteDedupShadow turns per-candidate failures into rows, so reaching this means
-      // a bug in the shadow path itself. Still never the caller's problem.
-      e => { logger.warn(`decision: write-dedup shadow failed: ${e instanceof Error ? e.message : String(e)}`) }
-    ))
+      const graph = this.storage.graph as { findById?: (id: string) => unknown }
+      this.track(runWriteDedupShadow({
+        engine: this.decisionEngine,
+        assertion: {
+          entryId: knowledge.id,
+          content: knowledge.content,
+          contentType: knowledge.contentType,
+          subject: typeof knowledge.metadata?.subject === 'string' ? knowledge.metadata.subject : undefined,
+          userId: knowledge.userId,
+        },
+        gate,
+        candidates,
+        hydrate: typeof graph.findById === 'function'
+          ? async id => (await graph.findById!(id)) as { content?: unknown; metadata?: unknown } | null
+          : undefined,
+        minSimilarity: jevWriteDedupMinSimilarity(),
+        actRequested: isJevWriteDedupActRequested(),
+        sink: this.writeDedupLog,
+      }).then(
+        () => undefined,
+        // runWriteDedupShadow turns per-candidate failures into rows, so reaching this
+        // means a bug in the shadow path itself. Still never the caller's problem.
+        e => { logger.warn(`decision: write-dedup shadow failed: ${e instanceof Error ? e.message : String(e)}`) }
+      ))
+    } catch (e) {
+      logger.warn(`decision: write-dedup shadow could not start: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
   /**
@@ -331,12 +343,19 @@ export class UnifiedStoreTool {
    */
   private logWriteDedupResolution(args: { content: string; action: 'supersede' | 'update' | 'complement' | 'force-new'; old_id?: string; related_to?: string }): void {
     if (!isJevWriteDedupEnabled()) return
-    if (this.writeDedupLog === undefined) this.writeDedupLog = writeDedupLogFromEnv()
-    const sink = this.writeDedupLog
-    if (!sink) return
-    this.track(sink.write(buildWriteDedupResolution(args)).catch(e => {
-      logger.warn(`decision: could not write write-dedup resolution: ${e instanceof Error ? e.message : String(e)}`)
-    }))
+    try {
+      if (this.writeDedupLog === undefined) {
+        this.writeDedupLog = null
+        this.writeDedupLog = writeDedupLogFromEnv()
+      }
+      const sink = this.writeDedupLog
+      if (!sink) return
+      this.track(sink.write(buildWriteDedupResolution(args)).catch(e => {
+        logger.warn(`decision: could not write write-dedup resolution: ${e instanceof Error ? e.message : String(e)}`)
+      }))
+    } catch (e) {
+      logger.warn(`decision: could not log write-dedup resolution: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
   /**
