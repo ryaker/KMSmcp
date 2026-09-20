@@ -17,7 +17,10 @@ a replaceable `DecisionEngine`, and a shadow evaluation of `unified_search`'s or
 | `src/decision/decisionLog.ts` | Decision-log row schema + JSONL sink |
 
 `UnifiedSearchTool.search()` calls `startShadowRerank()` after the response is built and
-cached. It is not awaited and holds no reference to the response.
+cached. It is not awaited. It is handed the ranked pool, whose leading elements are the
+same objects the response returns — so the isolation is a rule (nothing under
+`src/decision/` assigns to a candidate, and a test holds that line), not a structural
+guarantee.
 
 ## Flags
 
@@ -42,8 +45,10 @@ Two routes, tried in order; with neither, the shadow path disables itself with o
    the gateway with the agent token (`Proxy-Authorization: Basic base64("<token>:")`); the
    gateway injects the real TypeSafe key for `*.typesafe.ai`. KMSmcp never holds the key.
    The proxy is scoped to this one client's `fetch` — not `HTTPS_PROXY` — so MongoDB, Mem0
-   and Ollama traffic is untouched. The agent the token belongs to must be granted the
-   TypeSafe secret in OneCLI, or the gateway answers `401 access_restricted`.
+   and Ollama traffic is untouched. On 2026-09-19 this route returned
+   `401 access_restricted` for the Mac-wide agent token. The gateway log shows the request
+   reaching `gateway::forward`; whether the gateway refused (agent not granted the
+   TypeSafe secret) or TypeSafe refused upstream was not established.
 2. **`TYPESAFE_API_KEY`** — direct, for environments without a gateway.
 
 ## What gets asked
