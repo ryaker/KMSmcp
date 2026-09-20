@@ -104,16 +104,17 @@ export interface ShadowRunRecord {
   candidates: CandidateDecisionRecord[]
 }
 
-export interface DecisionLogSink {
-  write(record: ShadowRunRecord): Promise<void>
+/** Where rows go. One sink per log file; the row type is that file's `kind`. */
+export interface DecisionLogSink<Row = ShadowRunRecord> {
+  write(record: Row): Promise<void>
 }
 
-export class JsonlDecisionLog implements DecisionLogSink {
+export class JsonlDecisionLog<Row = ShadowRunRecord> implements DecisionLogSink<Row> {
   private ready: Promise<void> | null = null
 
   constructor(private readonly filePath: string) {}
 
-  async write(record: ShadowRunRecord): Promise<void> {
+  async write(record: Row): Promise<void> {
     if (!this.ready) this.ready = this.prepare()
     await this.ready
     await fs.promises.appendFile(this.filePath, `${JSON.stringify(record)}\n`, { mode: 0o600 })

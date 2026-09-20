@@ -30,3 +30,19 @@ export {
   jevShadowTopK,
   runShadowRerank,
 } from './shadowRerank.js'
+export {
+  JEV_WRITE_DEDUP_ACT_FLAG,
+  JEV_WRITE_DEDUP_FLAG,
+  buildWriteDedupResolution,
+  isJevWriteDedupActRequested,
+  isJevWriteDedupEnabled,
+  jevWriteDedupMinSimilarity,
+  runWriteDedupShadow,
+  writeDedupLogFromEnv,
+  type WriteDedupGateOutcome,
+  type WriteDedupLogRow,
+  type WriteDedupResolutionRecord,
+  type WriteDedupRunRecord,
+  type WriteDedupShadowCandidate,
+} from './writeDedupShadow.js'
+export { WRITE_DEDUP_AUTO_ACTIONS, type WriteDedupProposal } from './writeDedupPolicy.js'

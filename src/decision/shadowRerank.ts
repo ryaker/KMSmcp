@@ -11,6 +11,7 @@
 import crypto from 'crypto'
 import { logger } from '../logger.js'
 import type { CandidateDecisionRecord, DecisionLogSink, ShadowAction, ShadowRunRecord } from './decisionLog.js'
+import { withEngineSlot } from './engineSlot.js'
 import {
   EVIDENCE_VALUE_LEVELS,
   RECALL_EVIDENCE_QUESTIONS,
@@ -32,34 +33,6 @@ export const JEV_SHADOW_TOPK_ENV = 'KMS_JEV_SHADOW_TOPK'
 export const JEV_SHADOW_TOPK_DEFAULT = 20
 /** Hard ceiling — one request per candidate, so this bounds the cost of any one search. */
 export const JEV_SHADOW_TOPK_MAX = 50
-
-/**
- * In-flight engine requests for the whole PROCESS, not per search. TypeSafe's own RAG
- * cookbook runs four at a time against the public endpoint's rate limit; there is no
- * reason for a shadow path to be greedier — and a per-search cap would let N concurrent
- * searches put 4×N requests on the gateway at once.
- */
-export const JEV_SHADOW_CONCURRENCY = 4
-
-let inFlight = 0
-const waiting: Array<() => void> = []
-
-/** Run `fn` once one of the process-wide slots is free. FIFO. */
-async function withEngineSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (inFlight >= JEV_SHADOW_CONCURRENCY) {
-    // The releasing call hands its slot over directly, so `inFlight` is not touched here.
-    await new Promise<void>(resolve => waiting.push(resolve))
-  } else {
-    inFlight++
-  }
-  try {
-    return await fn()
-  } finally {
-    const next = waiting.shift()
-    if (next) next()
-    else inFlight--
-  }
-}
 
 export function isJevShadowRerankEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env[JEV_SHADOW_RERANK_FLAG] === '1'

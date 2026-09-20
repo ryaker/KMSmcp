@@ -19,6 +19,22 @@ import {
 import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js'
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { logger } from '../logger.js'
+import {
+  JEV_WRITE_DEDUP_ACT_FLAG,
+  JEV_WRITE_DEDUP_FLAG,
+  buildWriteDedupResolution,
+  createJevDecisionEngineFromEnv,
+  isJevWriteDedupActRequested,
+  isJevWriteDedupEnabled,
+  jevWriteDedupMinSimilarity,
+  runWriteDedupShadow,
+  writeDedupLogFromEnv,
+  type DecisionEngine,
+  type DecisionLogSink,
+  type WriteDedupGateOutcome,
+  type WriteDedupLogRow,
+  type WriteDedupShadowCandidate,
+} from '../decision/index.js'
 
 const debug = (...args: unknown[]) => { if (process.env.KMS_DEBUG) console.error(...args) }
 
@@ -67,6 +83,21 @@ function resolveDedupThresholds(
     ? DEDUP_PER_TYPE_REFUSE[contentType]
     : DEDUP_DEFAULT_REFUSE
   return { refuse, confirm: DEDUP_DEFAULT_CONFIRM, usedOverride: false }
+}
+
+/** A `findSimilar` hit, copied into the shape the write-dedup shadow path takes. */
+function toShadowCandidate(
+  c: { id: string; similarity: number; content_preview: string; contentType: string; subject?: string },
+  tier2Relation: LLMRelation | null
+): WriteDedupShadowCandidate {
+  return {
+    id: c.id,
+    vectorSimilarity: c.similarity,
+    tier2Relation,
+    contentPreview: c.content_preview,
+    contentType: c.contentType,
+    subject: c.subject,
+  }
 }
 
 export interface DedupCandidate {
@@ -198,6 +229,15 @@ export class UnifiedStoreTool {
   private llmJudge: LLMJudgeService | null
   /** Tracks last known availability to detect transitions and log them. */
   private _lastEmbedderAvailable: boolean | null = null
+  /**
+   * Shadow write-dedup (KMS_JEV_WRITE_DEDUP=1 only). `undefined` = not resolved yet,
+   * `null` = resolved and unavailable. Resolved lazily so a process with the flag off
+   * never constructs a TypeSafe client or opens the decision log.
+   */
+  private decisionEngine: DecisionEngine | null | undefined
+  private writeDedupLog: DecisionLogSink<WriteDedupLogRow> | null | undefined
+  /** Every shadow run still in flight, so a test (or a draining shutdown) can await them. */
+  private pendingWriteDedupShadow = new Set<Promise<void>>()
 
   constructor(
     router: IntelligentStorageRouter,
@@ -206,7 +246,8 @@ export class UnifiedStoreTool {
     ollamaRouter?: OllamaStorageRouter | null,
     enrichmentQueue?: EnrichmentQueue | null,
     embeddingService?: EmbeddingService | null,
-    llmJudge?: LLMJudgeService | null
+    llmJudge?: LLMJudgeService | null,
+    decision?: { engine?: DecisionEngine | null, log?: DecisionLogSink<WriteDedupLogRow> | null }
   ) {
     this.router = router
     this.storage = storage
@@ -215,6 +256,87 @@ export class UnifiedStoreTool {
     this.enrichmentQueue = enrichmentQueue ?? null
     this.embeddingService = embeddingService ?? null
     this.llmJudge = llmJudge ?? null
+    this.decisionEngine = decision?.engine
+    this.writeDedupLog = decision?.log
+  }
+
+  /** Resolves once every write-dedup shadow run started so far has finished and been logged. */
+  async awaitWriteDedupShadowIdle(): Promise<void> {
+    while (this.pendingWriteDedupShadow.size > 0) await Promise.all(this.pendingWriteDedupShadow)
+  }
+
+  private track(run: Promise<void>): void {
+    this.pendingWriteDedupShadow.add(run)
+    void run.finally(() => this.pendingWriteDedupShadow.delete(run))
+  }
+
+  /**
+   * Start a shadow judgment of the dedup gate's candidates (Jev Experiment 2).
+   * Fire-and-forget, and called only AFTER the gate has made its decision: nothing it
+   * computes can reach the store result, and the write never waits on it.
+   *
+   * What it is given is deliberately narrow — copies of the candidate fields, the new
+   * assertion's text, and a READ-ONLY lookup. It has no handle that can store, flag,
+   * supersede or delete; "Jev never directly mutates storage" is structural here, not a
+   * convention.
+   */
+  private startWriteDedupShadow(
+    knowledge: UnifiedKnowledge,
+    gate: WriteDedupGateOutcome,
+    candidates: WriteDedupShadowCandidate[]
+  ): void {
+    if (!isJevWriteDedupEnabled() || candidates.length === 0) return
+
+    if (this.decisionEngine === undefined) {
+      this.decisionEngine = createJevDecisionEngineFromEnv()
+      if (!this.decisionEngine) {
+        console.error(`⚠️ ${JEV_WRITE_DEDUP_FLAG}=1 but no Jev credential route (ONECLI_TOKEN+ONECLI_GATEWAY, or TYPESAFE_API_KEY) — write-dedup shadow disabled for this process`)
+      }
+      if (isJevWriteDedupActRequested()) {
+        console.error(`⚠️ ${JEV_WRITE_DEDUP_ACT_FLAG}=1 is reserved and hard-disabled — write-dedup stays advisory (shadow_log only)`)
+      }
+    }
+    if (!this.decisionEngine) return
+    if (this.writeDedupLog === undefined) this.writeDedupLog = writeDedupLogFromEnv()
+
+    const graph = this.storage.graph as { findById?: (id: string) => unknown }
+    this.track(runWriteDedupShadow({
+      engine: this.decisionEngine,
+      assertion: {
+        entryId: knowledge.id,
+        content: knowledge.content,
+        contentType: knowledge.contentType,
+        subject: typeof knowledge.metadata?.subject === 'string' ? knowledge.metadata.subject : undefined,
+        userId: knowledge.userId,
+      },
+      gate,
+      candidates,
+      hydrate: typeof graph.findById === 'function'
+        ? async id => (await graph.findById!(id)) as { content?: unknown; metadata?: unknown } | null
+        : undefined,
+      minSimilarity: jevWriteDedupMinSimilarity(),
+      actRequested: isJevWriteDedupActRequested(),
+      sink: this.writeDedupLog,
+    }).then(
+      () => undefined,
+      // runWriteDedupShadow turns per-candidate failures into rows, so reaching this means
+      // a bug in the shadow path itself. Still never the caller's problem.
+      e => { logger.warn(`decision: write-dedup shadow failed: ${e instanceof Error ? e.message : String(e)}`) }
+    ))
+  }
+
+  /**
+   * Log which action the caller chose on a `dedup_required` retry — the label the shadow
+   * proposals are scored against. Same flag, same log, no engine call.
+   */
+  private logWriteDedupResolution(args: { content: string; action: 'supersede' | 'update' | 'complement' | 'force-new'; old_id?: string; related_to?: string }): void {
+    if (!isJevWriteDedupEnabled()) return
+    if (this.writeDedupLog === undefined) this.writeDedupLog = writeDedupLogFromEnv()
+    const sink = this.writeDedupLog
+    if (!sink) return
+    this.track(sink.write(buildWriteDedupResolution(args)).catch(e => {
+      logger.warn(`decision: could not write write-dedup resolution: ${e instanceof Error ? e.message : String(e)}`)
+    }))
   }
 
   /**
@@ -289,6 +411,9 @@ export class UnifiedStoreTool {
     // ---------------------------------------------------------------------
     if (args.action) {
       const dispatchResult = await this._dispatchAction(args)
+      if (dispatchResult === null || !('status' in dispatchResult && dispatchResult.status === 'invalid_action')) {
+        this.logWriteDedupResolution({ content: args.content, action: args.action, old_id: args.old_id, related_to: args.related_to })
+      }
       if (dispatchResult !== null) {
         // supersede / update / invalid_action all return a terminal result —
         // no fall-through to the normal store path.
@@ -720,8 +845,21 @@ export class UnifiedStoreTool {
               `🛑 DEDUP GATE refused write (${band}): top sim=${top.similarity.toFixed(3)} ` +
               `against id=${top.id}; ${candidates.length} candidate(s)`
             )
+            this.startWriteDedupShadow(
+              knowledge,
+              { outcome: 'dedup_required', band, thresholds: { refuse: refuseThreshold, confirm: confirmThreshold } },
+              candidates.map((c, idx) => toShadowCandidate(c, llmRelations[idx]))
+            )
             return response
           }
+
+          // Below the confirm band the gate lets the write through. Those are the pairs
+          // where its false negatives would be, so they are judged too (shadow only).
+          this.startWriteDedupShadow(
+            knowledge,
+            { outcome: 'proceeded', band: null, thresholds: { refuse: refuseThreshold, confirm: confirmThreshold } },
+            candidates.map(c => toShadowCandidate(c, null))
+          )
         }
       } catch (e) {
         // Non-fatal: degrade to "no dedup check" rather than blocking the write.
