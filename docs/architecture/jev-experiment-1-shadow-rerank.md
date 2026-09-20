@@ -13,7 +13,9 @@ a replaceable `DecisionEngine`, and a shadow evaluation of `unified_search`'s or
 | `src/decision/onecli.ts` | `fetch` routed through the OneCLI credential gateway |
 | `src/decision/recallEvidence.ts` | The three questions, the per-candidate state, the state fingerprint |
 | `src/decision/shadowPolicy.ts` | Deterministic policy: shadow score, protection rule, shadow ordering |
-| `src/decision/shadowRerank.ts` | Flags + the per-search fan-out (4 engine calls in flight, process-wide) |
+| `src/decision/shadowRerank.ts` | Flags + the per-search fan-out |
+| `src/decision/engineSlot.ts` | 4 engine calls in flight, process-wide — shared with [Experiment 2](./jev-experiment-2-write-dedup.md) |
+| `src/decision/stateFingerprint.ts` | Canonical-JSON sha256 behind the state fingerprint — shared with Experiment 2 |
 | `src/decision/decisionLog.ts` | Decision-log row schema + JSONL sink |
 
 `UnifiedSearchTool.search()` calls `startShadowRerank()` after the response is built and

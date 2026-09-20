@@ -12,7 +12,7 @@
  * and invalidating every logged answer.
  */
 
-import crypto from 'crypto'
+import { fingerprintState } from './stateFingerprint.js'
 import type {
   ChoiceDecisionQuestion,
   DecisionJson,
@@ -173,22 +173,8 @@ export function buildRecallState(query: string, candidate: RecallCandidate, now:
   }
 }
 
-/** JSON with object keys sorted at every depth, so equal values hash equally. */
-function canonicalJson(value: DecisionJson): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  return `{${Object.keys(value)
-    .sort()
-    .map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`)
-    .join(',')}}`
-}
-
 /**
- * Fingerprint of exactly what the engine was shown.
- *
- * The log stores this instead of the state: a decision row must be attributable to its
- * input without the log becoming a second, unflagged copy of the knowledge base — one
- * that `kms_supersede` and `kms_delete` would never reach.
+ * Fingerprint of exactly what the engine was shown (see `stateFingerprint.ts`).
  *
  * `today` is excluded. It is part of the state (the engine needs it to judge
  * "historical") but including it would make the same query over the same entry hash
@@ -196,9 +182,5 @@ function canonicalJson(value: DecisionJson): string {
  * rows judged the same input and disagreed.
  */
 export function fingerprintRecallState(state: DecisionJson): string {
-  const withoutClock =
-    state && typeof state === 'object' && !Array.isArray(state)
-      ? Object.fromEntries(Object.entries(state).filter(([k]) => k !== 'today'))
-      : state
-  return crypto.createHash('sha256').update(canonicalJson(withoutClock as DecisionJson)).digest('hex')
+  return fingerprintState(state, ['today'])
 }
