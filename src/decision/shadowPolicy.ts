@@ -99,8 +99,6 @@ export function protectionReason(c: ProtectionSignals): 'ontology_match' | 'lexi
 
 export interface ShadowOrderInput {
   id: string
-  /** 0-based position in the production ordering. */
-  productionIndex: number
   /** null when the evaluation failed — an unjudged candidate is never moved down. */
   shadowScore: number | null
   protected: boolean
@@ -109,29 +107,26 @@ export interface ShadowOrderInput {
 /**
  * The ordering the judgments would produce — always a permutation of the input.
  *
+ * `inputs` must be in production order, best first: a candidate's position in the array
+ * IS its production position. There is deliberately no separate rank field — one that
+ * could disagree with the array (duplicates, gaps) would make invariant 2 unfalsifiable.
+ *
  * Two invariants, both tested:
  *  1. Nothing is dropped. There is no score below which a candidate disappears; the
  *     worst a judgment can do is move it to the end.
  *  2. A pinned candidate — protected, or unjudged — ends at an index <= its production
- *     index. It may be promoted, never demoted.
+ *     position. It may be promoted, never demoted.
  *
  * Invariant 2 holds because pins are re-seated in ascending production order: moving a
  * candidate up to index j only shifts entries that sat between j and its old position,
  * and every pin already seated sits at an index below j.
  */
 export function shadowOrder(inputs: ShadowOrderInput[]): string[] {
-  const byProduction = [...inputs].sort((a, b) => a.productionIndex - b.productionIndex)
+  // Unjudged candidates have no score to sort on: send them to the end and let the pin
+  // pass below restore them. `sort` is stable, so ties keep production order.
+  const proposed = [...inputs].sort((a, b) => (b.shadowScore ?? -1) - (a.shadowScore ?? -1))
 
-  const proposed = [...byProduction].sort((a, b) => {
-    // Unjudged candidates have no score to sort on; hold their place among the judged by
-    // sorting them on production order alone, then let the pin pass below restore them.
-    const sa = a.shadowScore ?? -1
-    const sb = b.shadowScore ?? -1
-    if (sb !== sa) return sb - sa
-    return a.productionIndex - b.productionIndex
-  })
-
-  byProduction.forEach((candidate, target) => {
+  inputs.forEach((candidate, target) => {
     if (!candidate.protected && candidate.shadowScore !== null) return
     const at = proposed.indexOf(candidate)
     if (at > target) {

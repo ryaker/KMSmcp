@@ -15,8 +15,11 @@ import {
   type ShadowOrderInput,
 } from '../decision/shadowPolicy.js'
 
-const input = (id: string, productionIndex: number, score: number | null, isProtected = false): ShadowOrderInput =>
-  ({ id, productionIndex, shadowScore: score, protected: isProtected })
+// The second argument is the production position, kept at each call site so a test reads
+// as "candidate X, served at position N". It is documentation only: shadowOrder takes
+// production order from the array itself.
+const input = (id: string, _position: number, score: number | null, isProtected = false): ShadowOrderInput =>
+  ({ id, shadowScore: score, protected: isProtected })
 
 describe('shadowScore', () => {
   it('is 1 for a certain, current, direct answer and 0 for certain no-support', () => {
@@ -102,12 +105,19 @@ describe('shadowOrder', () => {
       const order = shadowOrder(inputs)
 
       expect([...order].sort()).toEqual(inputs.map(c => c.id).sort())
-      for (const c of inputs) {
+      inputs.forEach((c, productionPosition) => {
         if (c.protected || c.shadowScore === null) {
-          expect(order.indexOf(c.id)).toBeLessThanOrEqual(c.productionIndex)
+          expect(order.indexOf(c.id)).toBeLessThanOrEqual(productionPosition)
         }
-      }
+      })
     }
+  })
+
+  it('takes production order from the array — there is no separate rank a caller could get wrong', () => {
+    // Three protected candidates: each must stay at or above the slot it arrived in.
+    const order = shadowOrder([input('p1', 0, 0.1, true), input('p2', 1, 0.5, true), input('p3', 2, 0.9, true)])
+    expect(order).toEqual(['p1', 'p2', 'p3'])
+    expect(Object.keys(input('x', 0, 0.5))).toEqual(['id', 'shadowScore', 'protected'])
   })
 
   it('does not mutate its input', () => {

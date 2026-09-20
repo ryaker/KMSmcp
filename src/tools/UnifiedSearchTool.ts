@@ -56,8 +56,8 @@ export class UnifiedSearchTool {
    */
   private decisionEngine: DecisionEngine | null | undefined
   private decisionLog: DecisionLogSink | null | undefined
-  /** The most recent shadow run, so a test (or a draining shutdown) can await it. */
-  private pendingShadowRun: Promise<unknown> = Promise.resolve()
+  /** Every shadow run still in flight, so a test (or a draining shutdown) can await them. */
+  private pendingShadowRuns = new Set<Promise<void>>()
 
   constructor(
     storage: { mongodb: MongoDBStorage, graph: GraphStorage, mem0: Mem0Storage },
@@ -72,19 +72,24 @@ export class UnifiedSearchTool {
     this.decisionLog = decision?.log
   }
 
-  /** Resolves once the most recently started shadow run has finished and been logged. */
-  awaitShadowIdle(): Promise<void> {
-    return this.pendingShadowRun.then(() => undefined)
+  /** Resolves once every shadow run started so far has finished and been logged. */
+  async awaitShadowIdle(): Promise<void> {
+    while (this.pendingShadowRuns.size > 0) await Promise.all(this.pendingShadowRuns)
   }
 
   /**
    * Start a shadow evaluation of the ordering that was just served. Fire-and-forget.
    *
-   * Called AFTER the response object is built and cached, and handed only the ranked
-   * pool — it has no reference to the response, so it cannot alter it, and it is not
-   * awaited, so the N model calls it makes add nothing to the search's latency. The
-   * response is byte-identical whether the flag is on or off; that is asserted in
+   * Called AFTER the response object is built and cached, and not awaited, so the N
+   * model calls it makes add nothing to the search's latency. The response is identical
+   * whether the flag is on or off; that is asserted in
    * `UnifiedSearchTool.shadowRerank.test.ts`.
+   *
+   * It is handed the ranked pool, whose leading elements are THE SAME OBJECTS as
+   * `result.results` (and as whatever an in-memory cache now holds). The isolation is
+   * therefore a rule, not a structural guarantee: nothing under `src/decision/` may
+   * assign to a candidate. `runShadowRerank`'s "never mutates the ranked input" test is
+   * what holds that line.
    *
    * Cache hits do not trigger a run: the pool and the query are the ones a previous run
    * already judged, so a second row would be a duplicate measurement that cost money.
@@ -101,18 +106,24 @@ export class UnifiedSearchTool {
     if (!this.decisionEngine) return
     if (this.decisionLog === undefined) this.decisionLog = decisionLogFromEnv()
 
-    this.pendingShadowRun = runShadowRerank({
+    const run: Promise<void> = runShadowRerank({
       engine: this.decisionEngine,
       query,
       ranked: rankedResults,
       action: jevShadowAction(),
       topK: jevShadowTopK(),
       sink: this.decisionLog,
-    }).catch(e => {
-      // runShadowRerank is written not to throw; this is the guard that keeps a bug in it
-      // from becoming an unhandled rejection in the daemon.
-      debug(`⚠️ shadow rerank failed: ${e instanceof Error ? e.message : String(e)}`)
-    })
+    }).then(
+      () => undefined,
+      e => {
+        // runShadowRerank turns per-candidate failures into rows, so reaching this means
+        // a bug in it. Keep it from becoming an unhandled rejection in the daemon — and
+        // say so unconditionally: a search that silently produced no decision row would
+        // otherwise look, in the log, like a search that never happened.
+        console.error(`⚠️ shadow rerank failed, no decision row written: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    ).finally(() => { this.pendingShadowRuns.delete(run) })
+    this.pendingShadowRuns.add(run)
   }
 
   /**

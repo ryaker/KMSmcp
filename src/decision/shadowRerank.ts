@@ -34,10 +34,32 @@ export const JEV_SHADOW_TOPK_DEFAULT = 20
 export const JEV_SHADOW_TOPK_MAX = 50
 
 /**
- * In-flight requests per search. TypeSafe's own RAG cookbook runs four at a time against
- * the public endpoint's rate limit; there is no reason for a shadow path to be greedier.
+ * In-flight engine requests for the whole PROCESS, not per search. TypeSafe's own RAG
+ * cookbook runs four at a time against the public endpoint's rate limit; there is no
+ * reason for a shadow path to be greedier — and a per-search cap would let N concurrent
+ * searches put 4×N requests on the gateway at once.
  */
 export const JEV_SHADOW_CONCURRENCY = 4
+
+let inFlight = 0
+const waiting: Array<() => void> = []
+
+/** Run `fn` once one of the process-wide slots is free. FIFO. */
+async function withEngineSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (inFlight >= JEV_SHADOW_CONCURRENCY) {
+    // The releasing call hands its slot over directly, so `inFlight` is not touched here.
+    await new Promise<void>(resolve => waiting.push(resolve))
+  } else {
+    inFlight++
+  }
+  try {
+    return await fn()
+  } finally {
+    const next = waiting.shift()
+    if (next) next()
+    else inFlight--
+  }
+}
 
 export function isJevShadowRerankEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env[JEV_SHADOW_RERANK_FLAG] === '1'
@@ -87,19 +109,6 @@ function nameEvidenceLevels(byIndex: Record<string, number>): Record<string, num
   return named
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length)
-  let next = 0
-  const worker = async () => {
-    while (next < items.length) {
-      const index = next++
-      results[index] = await fn(items[index], index)
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
-  return results
-}
-
 function readJudgment(result: DecisionResult): NonNullable<CandidateDecisionRecord['jev']> {
   const answersQuery = result.answers.answers_query
   const status = result.answers.status
@@ -123,35 +132,47 @@ function readJudgment(result: DecisionResult): NonNullable<CandidateDecisionReco
 }
 
 /**
- * Evaluate the top candidates and log the run. Never throws: a failed candidate is a row
- * with `error` set, a failed log write is a warning. The search that triggered this has
- * already been answered by the time any of it matters.
+ * Evaluate the top candidates and log the run. A failed candidate — whether the engine
+ * failed or the candidate itself could not be read — is a row with `error` set; a failed
+ * log write is a warning. Neither rejects. The search that triggered this has already
+ * been answered by the time any of it matters.
  */
 export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowRunRecord> {
   const started = Date.now()
   const now = input.now ?? new Date()
   const evaluated = input.ranked.slice(0, input.topK ?? JEV_SHADOW_TOPK_DEFAULT)
 
-  const records = await mapWithConcurrency(evaluated, JEV_SHADOW_CONCURRENCY, async (candidate, index): Promise<CandidateDecisionRecord> => {
-    const state = buildRecallState(input.query, candidate, now)
-    const base = {
-      id: String(candidate.id ?? ''),
+  const records = await Promise.all(evaluated.map((candidate, index) => withEngineSlot(async (): Promise<CandidateDecisionRecord> => {
+    const callStarted = Date.now()
+    // Everything that touches the candidate is inside the try. A retrieval result is an
+    // untyped bag from three backends; one that throws while being read must cost one
+    // row, not reject the run and discard the judgments already paid for.
+    let base: Pick<CandidateDecisionRecord, 'id' | 'production_rank' | 'state_fingerprint' | 'content_truncated' | 'retrieval' | 'policy_protected' | 'policy_shadow_rank'> = {
+      id: '',
       production_rank: index + 1,
-      state_fingerprint: fingerprintRecallState(state),
-      content_truncated: (state as { candidate: { content_truncated: boolean } }).candidate.content_truncated,
-      retrieval: {
-        source_systems: candidate._sourceSystems ?? (candidate.sourceSystem ? [candidate.sourceSystem] : []),
-        retrieval_relevance: finiteOrNull(candidate._relevance),
-        vector_similarity: finiteOrNull(candidate._vectorSimilarity),
-        ontology_score: finiteOrNull(candidate._ontologyScore),
-        knowledge_confidence: finiteOrNull(candidate.confidence),
-      },
-      policy_protected: protectionReason(candidate),
+      state_fingerprint: '',
+      content_truncated: false,
+      retrieval: { source_systems: [], retrieval_relevance: null, vector_similarity: null, ontology_score: null, knowledge_confidence: null },
+      policy_protected: null,
       policy_shadow_rank: null,
     }
-
-    const callStarted = Date.now()
     try {
+      const state = buildRecallState(input.query, candidate, now)
+      base = {
+        ...base,
+        id: String(candidate.id ?? ''),
+        state_fingerprint: fingerprintRecallState(state),
+        content_truncated: (state as { candidate: { content_truncated: boolean } }).candidate.content_truncated,
+        retrieval: {
+          source_systems: candidate._sourceSystems ?? (candidate.sourceSystem ? [candidate.sourceSystem] : []),
+          retrieval_relevance: finiteOrNull(candidate._relevance),
+          vector_similarity: finiteOrNull(candidate._vectorSimilarity),
+          ontology_score: finiteOrNull(candidate._ontologyScore),
+          knowledge_confidence: finiteOrNull(candidate.confidence),
+        },
+        policy_protected: protectionReason(candidate),
+      }
+
       const result = await input.engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS })
       const jev = readJudgment(result)
       return {
@@ -184,7 +205,7 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
         error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
       }
     }
-  })
+  })))
 
   let order: string[] | null = null
   if (input.action === 'shadow_reorder') {
@@ -192,7 +213,6 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
     // even if a backend ever hands back two results with the same id.
     const positions = shadowOrder(records.map((r, i) => ({
       id: String(i),
-      productionIndex: i,
       shadowScore: r.policy_shadow_score,
       protected: r.policy_protected !== null,
     }))).map(Number)

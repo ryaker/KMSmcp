@@ -58,20 +58,26 @@ const answersQuery: NoulDecisionQuestion = {
   },
 }
 
+// The options are worded to be mutually exclusive, because two of the pairs are not
+// naturally so: an entry can be true today AND dispute the query's premise, and a
+// corrected entry necessarily describes the past. Each description therefore names the
+// neighbour it excludes, and the instructions give the precedence — otherwise which
+// bucket an ambiguous entry lands in is model idiosyncrasy, and `historical` (×0.8) vs
+// `superseded_context` (×0.5) is a real difference in the shadow score.
 const status: ChoiceDecisionQuestion = {
   type: 'choice',
   instructions:
-    'The candidate is a stored memory entry retrieved for `query`. `today` is the current date and `candidate.stored_at` is when the entry was written. Judged from the candidate\'s own wording and its metadata, what is the standing of this entry as evidence for the query?',
+    'The candidate is a stored memory entry retrieved for `query`. `today` is the current date and `candidate.stored_at` is when the entry was written. Judged from the candidate\'s own wording and its metadata, what is the standing of this entry as evidence for the query? Decide in this order and take the first that applies: irrelevant, then contradictory, then superseded_context, then historical, then current.',
   criteria: {
-    current:
-      'About the subject of the query, and presents its information as true or applicable now, with nothing indicating it has since changed.',
-    historical:
-      'About the subject of the query, but explicitly describes a past state, event, or dated measurement rather than how things stand now.',
-    superseded_context:
-      'About the subject of the query, but the entry itself or its metadata says it was corrected, replaced, retracted, or superseded, or it records a belief the entry says was later found wrong.',
-    contradictory:
-      'About the subject of the query, and conflicts with a factual premise stated in the query, or contains claims that conflict with each other on the point the query asks about.',
     irrelevant: 'Not about the subject of the query.',
+    contradictory:
+      'About the subject of the query, and conflicts with a factual premise stated in the query, or makes claims that conflict with each other on the point the query asks about. Applies whether or not the entry is itself up to date.',
+    superseded_context:
+      'About the subject of the query and consistent with its premise, but the entry itself or its metadata (`candidate.correction_flag`, `candidate.replaced_by_later_entry`) says it was corrected, replaced, retracted, or found wrong.',
+    historical:
+      'About the subject of the query and consistent with its premise, not marked as corrected or replaced, but explicitly describes a past state, event, or dated measurement rather than how things stand now.',
+    current:
+      'About the subject of the query and consistent with its premise, and presents its information as true or applicable now, with nothing indicating it has been corrected or has since changed.',
   },
 }
 

@@ -171,7 +171,7 @@ describe('runShadowRerank', () => {
       expect(request.questions).toBe(RECALL_EVIDENCE_QUESTIONS)
       expect(Object.keys(request.questions)).toEqual(['answers_query', 'status', 'evidence_value'])
     }
-    expect(Object.keys(RECALL_EVIDENCE_QUESTIONS.status.criteria)).toEqual([...RECALL_STATUS_OPTIONS])
+    expect(Object.keys(RECALL_EVIDENCE_QUESTIONS.status.criteria).sort()).toEqual([...RECALL_STATUS_OPTIONS].sort())
     expect(RECALL_EVIDENCE_QUESTIONS.evidence_value.criteria).toHaveLength(EVIDENCE_VALUE_LEVELS.length)
   })
 
@@ -321,6 +321,40 @@ describe('runShadowRerank', () => {
     const run = await runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_log', now: NOW })
     expect(run.candidates_failed).toBe(3)
     expect(run.candidates[0].error).toMatch(/wrong kind/)
+  })
+
+  it('a candidate that throws while being READ costs one row, not the run', async () => {
+    const { engine } = mockEngine(VERDICTS)
+    const { sink, rows } = memorySink()
+    const poisoned = { id: 'poisoned', content: 'unreadable', get timestamp(): string { throw new Error('boom: poisoned getter') } }
+    const run = await runShadowRerank({ engine, query: QUERY, ranked: [poisoned, ...RANKED], action: 'shadow_reorder', sink, now: NOW })
+
+    expect(run.candidates_failed).toBe(1)
+    expect(run.candidates[0]).toMatchObject({ production_rank: 1, jev: null, error: 'Error: boom: poisoned getter' })
+    // The judgments that were paid for are kept and logged.
+    expect(run.candidates.slice(1).map(c => c.error)).toEqual([null, null, null])
+    expect(rows).toHaveLength(1)
+    // Unjudged → pinned, like any other failure.
+    expect(run.shadow_order).toHaveLength(4)
+    expect(run.candidates[0].policy_shadow_rank).toBe(1)
+  })
+
+  it('caps in-flight engine calls across concurrent searches, not per search', async () => {
+    let inFlight = 0
+    let peak = 0
+    const evaluate = jest.fn(async (): Promise<DecisionResult> => {
+      peak = Math.max(peak, ++inFlight)
+      await new Promise(r => setTimeout(r, 5))
+      inFlight--
+      throw new Error('irrelevant to this test')
+    })
+    const engine: DecisionEngine = { provider: 'mock', requestedModel: 'm', evaluate }
+    const pool = (tag: string) => Array.from({ length: 10 }, (_, i) => ({ id: `${tag}${i}`, content: `content ${tag}${i}` }))
+
+    await Promise.all(['a', 'b', 'c'].map(tag => runShadowRerank({ engine, query: QUERY, ranked: pool(tag), action: 'shadow_log', now: NOW })))
+
+    expect(evaluate).toHaveBeenCalledTimes(30)
+    expect(peak).toBe(4)
   })
 
   it('evaluates only the top K, and caps in-flight calls', async () => {

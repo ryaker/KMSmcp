@@ -172,4 +172,29 @@ describe('JsonlDecisionLog', () => {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('tightens a log that ALREADY exists with loose permissions before appending to it', async () => {
+    // appendFile's `mode` only applies on creation, so a file left 0644 by a restore or a
+    // `touch` would otherwise stay readable while collecting query text.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kms-decision-log-'))
+    const file = path.join(dir, 'recall-shadow.jsonl')
+    try {
+      fs.writeFileSync(file, '{"run_id":"older"}\n', { mode: 0o644 })
+      fs.chmodSync(file, 0o644)
+      expect(fs.statSync(file).mode & 0o777).toBe(0o644)
+
+      await new JsonlDecisionLog(file).write({ kind: 'recall_shadow_run', run_id: 'new' } as any)
+
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
+      const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n')
+      expect(lines.map(l => JSON.parse(l).run_id)).toEqual(['older', 'new'])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects the write rather than logging to a file it cannot make private', async () => {
+    const log = new JsonlDecisionLog(path.join(os.tmpdir(), 'kms-no-such-dir', '\0bad', 'x.jsonl'))
+    await expect(log.write({ kind: 'recall_shadow_run' } as any)).rejects.toThrow()
+  })
 })

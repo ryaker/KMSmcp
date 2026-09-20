@@ -114,12 +114,26 @@ export class JsonlDecisionLog implements DecisionLogSink {
   constructor(private readonly filePath: string) {}
 
   async write(record: ShadowRunRecord): Promise<void> {
-    if (!this.ready) {
-      // 0700 / 0600: rows name which entries answered which (fingerprinted) query.
-      this.ready = fs.promises.mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 }).then(() => undefined)
-    }
+    if (!this.ready) this.ready = this.prepare()
     await this.ready
     await fs.promises.appendFile(this.filePath, `${JSON.stringify(record)}\n`, { mode: 0o600 })
+  }
+
+  /**
+   * Rows carry the query text, so the file must be owner-only. `appendFile`'s `mode`
+   * applies ONLY when it creates the file — a log left behind 0644 by a restore, a
+   * `touch`, or an older build would stay readable and keep collecting queries. So open
+   * it once up front and chmod unconditionally. A failure here rejects every write: a
+   * decision log that cannot be made private is not written at all.
+   */
+  private async prepare(): Promise<void> {
+    await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 })
+    const handle = await fs.promises.open(this.filePath, 'a', 0o600)
+    try {
+      await handle.chmod(0o600)
+    } finally {
+      await handle.close()
+    }
   }
 }
 

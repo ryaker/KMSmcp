@@ -199,6 +199,26 @@ describe('UnifiedSearchTool shadow rerank', () => {
     expect(rows[0].candidates_failed).toBe(2)
   })
 
+  it('awaitShadowIdle waits for EVERY in-flight run, not just the latest', async () => {
+    process.env.KMS_JEV_SHADOW_RERANK = '1'
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const evaluate = jest.fn(async () => { await gate; throw new Error('released') })
+    const { log, rows } = memoryLog()
+    const tool = buildTool({ engine: { provider: 'mock', requestedModel: 'm', evaluate }, log })
+
+    await tool.search({ query: QUERY })
+    await tool.search({ query: `${QUERY} again` })
+    let idle = false
+    const waiting = tool.awaitShadowIdle().then(() => { idle = true })
+    await new Promise(r => setTimeout(r, 10))
+    expect(idle).toBe(false)
+
+    release()
+    await waiting
+    expect(rows.map(r => r.query).sort()).toEqual([QUERY, `${QUERY} again`].sort())
+  })
+
   it('a failing engine cannot fail the search', async () => {
     process.env.KMS_JEV_SHADOW_RERANK = '1'
     const evaluate = jest.fn().mockRejectedValue(new Error('401 Unauthorized'))

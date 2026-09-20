@@ -13,7 +13,7 @@ a replaceable `DecisionEngine`, and a shadow evaluation of `unified_search`'s or
 | `src/decision/onecli.ts` | `fetch` routed through the OneCLI credential gateway |
 | `src/decision/recallEvidence.ts` | The three questions, the per-candidate state, the state fingerprint |
 | `src/decision/shadowPolicy.ts` | Deterministic policy: shadow score, protection rule, shadow ordering |
-| `src/decision/shadowRerank.ts` | Flags + the per-search fan-out |
+| `src/decision/shadowRerank.ts` | Flags + the per-search fan-out (4 engine calls in flight, process-wide) |
 | `src/decision/decisionLog.ts` | Decision-log row schema + JSONL sink |
 
 `UnifiedSearchTool.search()` calls `startShadowRerank()` after the response is built and
@@ -56,7 +56,10 @@ One request per candidate, three questions over `{ query, today, candidate }`:
 
 The state deliberately omits the candidate's rank, every retrieval score, and the stored
 `confidence`, so the judgment is independent of the ordering it is compared against and
-`knowledge_confidence` cannot leak into a `jev_*` signal. `contradictory` is judged
+`knowledge_confidence` cannot leak into a `jev_*` signal. The `status` options overlap
+naturally (a current entry can dispute the query's premise; a corrected entry describes
+the past), so the question fixes a precedence: irrelevant → contradictory →
+superseded_context → historical → current. `contradictory` is judged
 against the query's premise and the entry's own claims; cross-candidate contradiction
 needs pairwise state and is out of scope for v1.
 
@@ -71,7 +74,9 @@ for `status` and `evidence_value`, `jev_confidence`, `policy_protected`,
 `policy_shadow_score`, `policy_shadow_rank`, request id, latency, usage, cost, error.
 
 Candidate **content is never logged** — ids and fingerprints only — so the log cannot
-become a copy of the store that `kms_supersede` / `kms_delete` never reach.
+become a copy of the store that `kms_supersede` / `kms_delete` never reach. The query
+text is logged, so the file is forced to `0600` on first write even if it already existed
+with looser permissions; if that fails, nothing is written.
 
 ## Shadow ordering rules (`recall-shadow-policy/v1`)
 
