@@ -15,6 +15,17 @@ import {
   VECTOR_SOURCE_SYSTEM,
 } from '../retrieval/hybrid.js'
 import { ENTITY_LABELS, OPERATIONAL_LABELS } from '../storage/OntologyIndex.js'
+import {
+  createJevDecisionEngineFromEnv,
+  decisionLogFromEnv,
+  isJevShadowRerankEnabled,
+  jevShadowAction,
+  jevShadowTopK,
+  runShadowRerank,
+  JEV_SHADOW_RERANK_FLAG,
+  type DecisionEngine,
+  type DecisionLogSink,
+} from '../decision/index.js'
 
 /** Shape of the KMS_EVAL_CAPTURE payload — the deduplicated, ranked pool captured
  *  before `maxResults` slicing so a ranker can be replayed offline over the same set. */
@@ -37,15 +48,71 @@ export class UnifiedSearchTool {
   private embeddingService: EmbeddingService | null
   /** Memoised lazy fallback embedder — see `getEmbeddingService()`. */
   private lazyEmbeddingService: EmbeddingService | null = null
+  /**
+   * Shadow recall rerank (KMS_JEV_SHADOW_RERANK=1 only). `undefined` = not resolved yet,
+   * `null` = resolved and unavailable. Injected in tests; otherwise built from the
+   * environment on first use, so a process that never sets the flag never constructs a
+   * TypeSafe client or opens the decision log.
+   */
+  private decisionEngine: DecisionEngine | null | undefined
+  private decisionLog: DecisionLogSink | null | undefined
+  /** The most recent shadow run, so a test (or a draining shutdown) can await it. */
+  private pendingShadowRun: Promise<unknown> = Promise.resolve()
 
   constructor(
     storage: { mongodb: MongoDBStorage, graph: GraphStorage, mem0: Mem0Storage },
     cache: FACTCache | null,
-    embeddingService?: EmbeddingService | null
+    embeddingService?: EmbeddingService | null,
+    decision?: { engine?: DecisionEngine | null, log?: DecisionLogSink | null }
   ) {
     this.storage = storage
     this.cache = cache as FACTCache // Now using real cache
     this.embeddingService = embeddingService ?? null
+    this.decisionEngine = decision?.engine
+    this.decisionLog = decision?.log
+  }
+
+  /** Resolves once the most recently started shadow run has finished and been logged. */
+  awaitShadowIdle(): Promise<void> {
+    return this.pendingShadowRun.then(() => undefined)
+  }
+
+  /**
+   * Start a shadow evaluation of the ordering that was just served. Fire-and-forget.
+   *
+   * Called AFTER the response object is built and cached, and handed only the ranked
+   * pool — it has no reference to the response, so it cannot alter it, and it is not
+   * awaited, so the N model calls it makes add nothing to the search's latency. The
+   * response is byte-identical whether the flag is on or off; that is asserted in
+   * `UnifiedSearchTool.shadowRerank.test.ts`.
+   *
+   * Cache hits do not trigger a run: the pool and the query are the ones a previous run
+   * already judged, so a second row would be a duplicate measurement that cost money.
+   */
+  private startShadowRerank(query: string, rankedResults: any[]): void {
+    if (!isJevShadowRerankEnabled()) return
+
+    if (this.decisionEngine === undefined) {
+      this.decisionEngine = createJevDecisionEngineFromEnv()
+      if (!this.decisionEngine) {
+        console.error(`⚠️ ${JEV_SHADOW_RERANK_FLAG}=1 but no Jev credential route (ONECLI_TOKEN+ONECLI_GATEWAY, or TYPESAFE_API_KEY) — shadow rerank disabled for this process`)
+      }
+    }
+    if (!this.decisionEngine) return
+    if (this.decisionLog === undefined) this.decisionLog = decisionLogFromEnv()
+
+    this.pendingShadowRun = runShadowRerank({
+      engine: this.decisionEngine,
+      query,
+      ranked: rankedResults,
+      action: jevShadowAction(),
+      topK: jevShadowTopK(),
+      sink: this.decisionLog,
+    }).catch(e => {
+      // runShadowRerank is written not to throw; this is the guard that keeps a bug in it
+      // from becoming an unhandled rejection in the daemon.
+      debug(`⚠️ shadow rerank failed: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   /**
@@ -356,6 +423,9 @@ export class UnifiedSearchTool {
       await this.cache.set(cacheKey, result, ttl)
       debug(`💾 Results cached for ${Math.round(ttl/1000)}s`)
     }
+
+    // Shadow recall rerank — observes the ordering above, never feeds back into `result`.
+    this.startShadowRerank(args.query, rankedResults)
 
     debug(`\n✅ UNIFIED SEARCH COMPLETE`)
     debug(`   Found: ${sortedResults.length} unique results`)
