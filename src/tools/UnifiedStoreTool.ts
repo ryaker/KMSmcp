@@ -293,6 +293,8 @@ export class UnifiedStoreTool {
     // would turn a refused write into a stored one.
     try {
       if (this.decisionEngine === undefined) {
+        // Null FIRST: if construction throws, the path stays disabled for the process
+        // instead of re-throwing (and re-warning) on every subsequent write.
         this.decisionEngine = null
         this.decisionEngine = createJevDecisionEngineFromEnv()
         if (!this.decisionEngine) {
