@@ -95,6 +95,45 @@ with looser permissions; if that fails, nothing is written.
 
 Weights and multipliers are untuned starting values. Bump the version on any change.
 
+## Offline evaluation
+
+The log is only useful if something reads it. Two files, split at the same line the
+harvest pipeline uses — pure logic, then a thin CLI:
+
+| File | Role |
+|---|---|
+| `src/eval/shadowRunMetrics.ts` | Parsing, ordering metrics, the protection audit, the rate projection, the label join, and report rendering. No I/O |
+| `src/scripts/shadow-eval-report.ts` | Reads the logs, prints the report |
+
+```sh
+npx tsx src/scripts/shadow-eval-report.ts [--target 200] [--k 5] [--since <iso>] \
+    [--log <path> ...] [--labels <path>] [--json]
+```
+
+It reads `~/.kms/decision-log/recall-shadow.jsonl` and `eng-recall-shadow.jsonl` by
+default and reports each plus the combined set.
+
+**Query text is never printed.** The log is forced to `0600` because a query can carry
+anything the caller pasted, including a credential; the report is meant for a PR body or a
+chat message, so it identifies runs by id and `sha256` prefix instead.
+
+The report separates two kinds of number, and the distinction is the point:
+
+- **Invariants** — permutation, protection, signal consistency, provider faults. These are
+  falsifiable from the log alone, and a non-zero is a defect at *any* sample count.
+- **Quality** — reorder rate, top-1 / top-3 agreement, mean displacement. These measure how
+  much the policy *would* change what a reader sees. They say nothing about whether it is
+  better; that needs relevance labels the store does not have. With no labels the section
+  prints `NONE — quality delta NOT computed` rather than a zero, because a zero reads as a
+  measurement.
+
+Harvest Phase 0's `ClaudeLabels.*` entries are **not** a substitute — those are label
+*statements* addressed to no candidate id, so joining them to a run would invent a
+relevance judgment. `labelAgreement` returns `null` for that reason.
+
+At 200 samples, [the promote checklist](./jev-experiment-1-promote-checklist.md) is what a
+human works through. Nothing promotes automatically.
+
 ## Tests
 
 `npx jest src/__tests__/decision- src/__tests__/UnifiedSearchTool.shadowRerank` — all
