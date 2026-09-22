@@ -48,6 +48,8 @@ terraform*
 .DS_Store
 *.log
 logs/
+# Harvest dry-run output carries verbatim transcript excerpts — never commit.
+/*.jsonl
 tmp/
 temp/
 .cache/
