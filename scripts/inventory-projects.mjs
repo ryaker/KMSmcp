@@ -12,14 +12,24 @@ const rows = [];
 for (const d of fs.readdirSync(root, { withFileTypes: true })) {
   if (!d.isDirectory()) continue;
   const dir = path.join(root, d.name);
-  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+  let files;
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+  } catch (e) {
+    console.error("skip", d.name, e.message);
+    continue;
+  }
   if (files.length === 0) continue;
   let userLines = 0;
   for (const f of files) {
     // Count user-turn lines by substring: jsonl lines lead with uuid/parentUuid, not "type".
-    const buf = fs.readFileSync(path.join(dir, f), "utf8");
-    for (const line of buf.split("\n")) {
-      if (line.includes('"type":"user"')) userLines++;
+    try {
+      const buf = fs.readFileSync(path.join(dir, f), "utf8");
+      for (const line of buf.split("\n")) {
+        if (line.includes('"type":"user"')) userLines++;
+      }
+    } catch (e) {
+      console.error("skip", d.name + "/" + f, e.message);
     }
   }
   rows.push({ project: d.name, files: files.length, userLines });
