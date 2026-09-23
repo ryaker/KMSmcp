@@ -1,412 +1,82 @@
-# KMS Unified MCP - Claude Usage Instructions
+# KMS Unified MCP — Claude Instructions
 
-## Overview
+KMS stores and retrieves knowledge across Mem0 (episodic/preferences), SparrowDB (embedded
+graph, concept relationships), and MongoDB (structured/technical). `unified_store` routes
+each write; `unified_search` fans out across all three.
 
-This unified KMS MCP provides intelligent multi-dimensional memory storage and retrieval across Mem0, SparrowDB (graph), and MongoDB. Unlike siloed tools, this unified interface allows Claude to naturally store and retrieve knowledge that spans multiple datastores simultaneously.
+**Read on demand:**
+- `docs/sparrowdb-notes.md` — **before writing any SparrowDB query**, or anything about SparrowDB, into this file.
+- `docs/kms-internals.md` — supersede internals, Mem0 shard/timestamp behavior, the dedup
+  response shape, and how the judge model was chosen.
 
-## Core Principle: Multi-Dimensional Memory
+## Search first, store smart
 
-Memory is multi-dimensional and multi-modal. Rich information naturally has multiple aspects that benefit from different storage systems:
+- Search before storing, and before giving technical advice from memory.
+- Store novel, verified facts: decisions with their reasons, fixes, preferences, patterns. One fact per entry.
+- Set `metadata.subject` as a dotted facet (`Project.fact_name`, `Person.preferences.facet`).
+  Reuse it for every write about that fact: it scopes dedup and keeps supersede chains queryable
+  (`unified_search({ filters: { subject: "Phoenix.camera_count" } })`).
+- Pass `timestamp` (ISO or epoch seconds) when content is about a past date, so Mem0 doesn't
+  stamp the ingestion date into it.
 
-**Example: "Client responds really well to morning sessions and visualization techniques"**
-- **Memory/Preference** (Mem0): Client behavior patterns, personal responses
-- **Effectiveness Relationships** (SparrowDB / graph): Morning sessions ↔ Client engagement, Visualization ↔ Technique effectiveness
-- **Structured Data** (MongoDB): Session scheduling data, technique metadata, outcome tracking
+## Correcting wrong entries — never an additive store
 
-## Tools Available
+If a new fact contradicts or replaces a stored one, **do not call `unified_store` again**.
+Both entries would leak into every future session's injected context.
 
-### `unified_search` - Search Across All Systems
-Search existing knowledge before storing new information:
-```json
-{
-  "query": "client morning sessions visualization",
-  "filters": {
-    "contentType": ["memory", "insight", "relationship"],
-    "userId": "client_123"
-  },
-  "options": {
-    "includeRelationships": true,
-    "maxResults": 10
-  }
-}
-```
+| You want to... | Use |
+|---|---|
+| Correct a wrong fact (common case) | `kms_supersede(old_id, new_content, reason)` — atomic; old flagged SUPERSEDED, chain kept |
+| Minor edit to the same fact (typo, confidence, metadata) | `kms_update(id, content, reason)` |
+| Delete noise with no replacement | `kms_delete(id, reason)` — soft, reversible 90 days |
+| Mark partially wrong, no replacement | `kms_flag(id, 'RETRACTED' \| 'UNVERIFIED', note)` |
+| Hard-delete old flagged entries | `kms_reap({ olderThanDays: 90, dryRun: true })` — admin |
 
-### `unified_store` - Multi-Dimensional Storage
-Store knowledge across multiple systems based on its natural dimensions:
-```json
-{
-  "content": "Client breakthrough with morning visualization techniques",
-  "contentType": "insight",
-  "source": "coaching",
-  "userId": "client_123",
-  "relationships": [
-    {
-      "targetId": "morning-sessions",
-      "type": "ENHANCED_BY",
-      "strength": 0.9
-    }
-  ]
-}
-```
+Flagged entries are hidden from search and context injection, including Mem0 shards.
+Prefer supersede over delete: the mistake is data.
 
-## Making Memory Integration Natural
+## Dedup gate
 
-### 1. Automatic Search Triggers
+Every `unified_store` is checked against near-duplicates with the same `userId` +
+`contentType` (+ `metadata.subject` when set). Cosine on local `nomic-embed-text` embeddings:
 
-Develop these as second nature:
-- User mentions "remember when..." → **Search first**
-- Giving technical advice → **Search for previous solutions**
-- User shares preferences/decisions → **Search for related patterns**  
-- Something "connects" to prior conversations → **Search for those connections**
-- Starting complex problem-solving → **Search existing knowledge**
-
-### 2. Integrated Problem-Solving Flow
-
-**Old flow:** Question → Think → Answer
-
-**New flow:** Question → **Search existing knowledge** → Think + Previous context → Answer + **Store new insights**
-
-### 3. Natural Storage Moments
-
-Store when encountering:
-- **Breakthrough moments**: "I finally figured out...", "Aha!", "Now I understand..."
-- **Preferences expressed**: "I prefer...", "Works best when...", "I like..."
-- **Decisions with reasoning**: "Decided to use X because Y"
-- **Patterns discovered**: "Always happens when...", "Consistently see..."
-- **Technical solutions**: Bug fixes, configurations, workarounds
-- **Relationship insights**: "X connects to Y", "This relates to..."
-
-### 4. Multi-Dimensional Thinking
-
-When storing rich information, consider multiple aspects:
-
-**Technical breakthrough:** "Finally solved OAuth issue by updating JWKS endpoint"
-- **Mem0**: Personal breakthrough experience, problem-solving journey
-- **SparrowDB (graph)**: OAuth → JWKS → Authentication → Problem solving relationships
-- **MongoDB**: Technical solution details, configuration updates, troubleshooting steps
-
-**Client insight:** "Morning meditation helps client focus during difficult conversations"
-- **Mem0**: Client behavior pattern, personal response
-- **SparrowDB (graph)**: Meditation → Focus → Difficult conversations → Coping strategies
-- **MongoDB**: Session notes, timing data, technique effectiveness metrics
-
-### 5. Positive Reinforcement Loop
-
-The more you search and find useful previous knowledge, the more natural it becomes. When stored memories help future conversations, the value becomes clear.
-
-## Correcting Wrong Entries — Use the Corrective Tools, Not Additive Store
-
-**The Dedup Gate (see below) is the primary mechanism now.** Every `unified_store` call is checked against near-duplicates automatically — if you're writing something that's an update, correction, or restatement of an existing entry, the gate will most likely catch it and return `dedup_required` before you ever need to reach for a corrective tool by hand. This section covers the tools the gate dispatches to (`kms_supersede`/`kms_update`/`kms_delete`/`kms_flag`), and the manual path for the case the gate doesn't catch: you already know the exact `old_id` and want to correct it directly without writing a new near-duplicate first.
-
-**Critical rule**: If you're about to store a fact that contradicts or replaces a previous one, **do not call `unified_store` again**. That additively stores the new one alongside the wrong one, and both leak into context injection on every future session.
-
-KMS has five corrective tools. Pick the right one:
-
-| You want to... | Use | Effect |
+| Similarity | Band | Result |
 |---|---|---|
-| Correct a fact you previously stored wrong (the common case) | `kms_supersede(old_id, new_content, reason)` | Atomic: stores new entry with `metadata.supersedes=old_id`, flags old with `flag=SUPERSEDED, superseded_by=new_id`. Both preserved for audit; new one shows in search, old one hidden. Rolls back new if flag fails. |
-| Fix a typo / adjust confidence / tweak metadata (same fact, minor edit) | `kms_update(id, content, reason)` | In-place mutation. Bumps timestamp, appends reason to `metadata.update_history`. Not for retraction. |
-| Delete noise (test entry, accidental store, garbage — no replacement) | `kms_delete(id, reason)` | Soft-delete: flags `DELETED`. Reversible for 90 days. |
-| Mark an entry partially wrong without replacing it | `kms_flag(id, 'RETRACTED' \| 'UNVERIFIED', note)` | Hides from default reads; original content preserved for audit. Pass `flag=null` to un-flag. |
-| Clean up old flagged entries past the reversibility window | `kms_reap({olderThanDays: 90, dryRun: true})` | Dry-run by default. Set `dryRun: false` to hard-delete. Admin operation. |
+| `>= 0.88` (`procedure` 0.85, `pattern` 0.92) | refuse | `dedup_required` |
+| `0.78 – 0.88` | confirm | `dedup_required` + Tier 2 `llm_relation` |
+| `< 0.78` | — | stored |
 
-**How this interacts with context injection**: `unified_search` (and the `kms-context-fetch.py` UserPromptSubmit hook that calls it) default-exclude flagged entries, across all three backends including Mem0's fan-out shards. Superseding a wrong fact therefore stops it leaking into future sessions' context. Pass `options.includeFlagged: true` to see them (audit/reaper paths only).
+On `dedup_required`, retry the same call with exactly one `action`. Never repeat the original write:
 
-> This became true on 2026-08-01 (PR #91) and was **false** for the whole period before
-> it, in the way that mattered most. Mem0's extractor splits every `unified_store` write
-> into several "User described…" rows, each a separate searchable entry whose only link
-> back is `metadata.kms_id`. Mem0 has no flag concept, so `kms_supersede` / `kms_delete`
-> flagged the graph and MongoDB copies and left every shard live — and shards rank *well*,
-> because the extractor restates the source in query-like language. Measured immediately
-> after superseding 2 entries and deleting 5: three of those flagged parents still had 11
-> shards in the top-15 across six queries, serving the exact content the supersede was
-> written to retire. `searchMem0` now drops shards whose parent is flagged.
->
-> Two things this still does **not** do. It does not make Mem0-only entries correctable —
-> those have no parent to flag (see the corrective-tools gap). And it does not stop the
-> fan-out generating new shards on every write, so one careful `unified_store` still
-> becomes several retrievable rows.
-
-**Mem0 narrative timestamps (temporal-stamp fix).** `Mem0Storage.store()` passes the
-knowledge's `timestamp` as the add's top-level `timestamp` (epoch seconds) on every
-write. Without it, mem0's server-side extractor stamps the **ingestion** date into
-extracted shard text — measured 2026-09-22 in the DolphinBench ingestion probe: a
-2023-03-06 narrative event was rewritten to "September 22, 2026" (ingestion day), an
-active Class-E temporal-corruption risk for dated-history ingestion. The field threads
-to the wire unchanged via `_preparePayload` (verified against mem0ai@3.0.2
-`dist/index.mjs`: `add()` merges options verbatim; `timestamp` is already snake_case).
-The ISO timestamp stays in `metadata.timestamp` as before; the two are different
-fields on different layers and both are kept. Regression test:
-`src/__tests__/Mem0Storage.store.timestamp.test.ts`; live smoke (skipped unless
-`KMS_MEM0_LIVE_SMOKE=1`): `Mem0Storage.store.timestamp.live.test.ts`.
-
-**Scope caveat — this fixes the storage layer, not the tool path (yet).** The only
-production caller of `store()` is `UnifiedStoreTool`, which hardcodes
-`timestamp: new Date()` when constructing the knowledge entry, and the
-`unified_store` input schema has **no** `timestamp` property. Through the tool
-path, every entry's narrative timestamp *is* ingestion time, so today's writes
-are behaviorally unchanged — DolphinBench/harvest currently put the narrative
-date only in `metadata.claude_timestamp`, and dated-history ingestion stays
-unsafe through the tool path until callers can plumb a real narrative timestamp
-into `knowledge.timestamp` (follow-up: `timestamp` arg on the `unified_store`
-schema + harvest wiring). `Mem0Storage.update()` is a second, same-class
-follow-up: it passes only `{ text }` to mem0, so an update re-runs extraction
-without the event timestamp (SDK `update()` accepts `timestamp` per
-`dist/index.d.ts`).
-
-**When in doubt, prefer `kms_supersede` over `kms_delete`**. The mistake is data — future you or a future agent might want to trace why a conclusion changed. Supersede preserves the chain; delete is for actual garbage.
-
-**Example correction flow**:
-```json
-// Wrong fact stored earlier (id returned by unified_store)
-// { "id": "abc-123", "content": "Phoenix uses exactly 6 cameras", ... }
-
-// Later discovered to be wrong. Instead of storing a contradicting fact:
-kms_supersede({
-  "old_id": "abc-123",
-  "new_content": "Phoenix camera count is UNKNOWN pending canvas bounds verification. Prior 6-camera claim used wrong zoom config and A-only FOV.",
-  "contentType": "insight",
-  "reason": "Canvas bounds unverified and R_fold used config 0 not config 2"
-})
-// Now unified_search returns only the corrected version by default.
-```
-
-### How `kms_supersede` actually works (issue #62 fix)
-
-The storage router writes to `graph + mem0` for every entry, but only adds `mongodb` when the content is `procedure` / `source=technical` / matches a structured-content keyword pattern. So an `insight` entry routed to graph+mem0-only does **not** exist in MongoDB at all.
-
-Before issue #62 was fixed, supersede unconditionally required MongoDB.flag to succeed — for graph-only entries this silently failed (entry not in mongo), triggered rollback, and left 4/12 historical chains with orphan `superseded_by` IDs (DG-INV-2 audit).
-
-After the fix, supersede now:
-1. Probes each backend with `findById(old_id)` to determine where the entry actually lives.
-2. Builds a `requiredBackends` set from the probes (e.g. `[sparrowdb]` for graph-only, `[sparrowdb, mongodb]` for procedure/technical).
-3. Flags only those required backends. Backends that don't have the entry are skipped with a debug log, not failed.
-4. Succeeds only if **every required backend** flagged successfully. If any required flag fails, rolls back: hard-deletes the new entry and un-flags the partial successes.
-
-**Rare error you may see**: `supersede: old_id <id> not found in any backend (checked: sparrowdb, mongodb). Verify the id is correct.` This means the id is wrong (typo, deleted entry, etc.) — not a routing oddity. Look up the id with `kms_get_memory_by_id` or `unified_search` first.
-
-### Tag high-traffic entries with `metadata.subject` (DG-FACET-A)
-
-For long-running projects (Phoenix, L16, Rich's preferences, etc.), include an explicit `metadata.subject` facet on every `unified_store` call. The subject is a dotted path that names the *specific* fact, not the broad topic — `Phoenix.camera_count`, `L16.distribution_model`, `Rich.preferences.communication_style`. Stored verbatim, no transformation.
-
-Why it matters: subject is a first-class search filter (`unified_search({filters: {subject: "Phoenix.camera_count"}})`) so you can pull the chain of supersedes/updates for one specific fact without scrolling through every entry that mentions Phoenix. The upcoming dedup gate (DG-T1-B) uses subject to scope its similarity check, so subject-tagged entries get cleaner dedup behavior than entries that share only a broad topic.
-
-Naming convention: `Project.fact_name` or `Person.preferences.facet`. Reuse the same subject every time you write about that fact — that's how supersede chains stay queryable.
-
-```json
-{
-  "content": "Phoenix camera count is 6 per the Mar-2026 calibration session",
-  "contentType": "fact",
-  "metadata": { "subject": "Phoenix.camera_count" }
-}
-// Later, search just this fact's chain:
-// unified_search({ query: "phoenix cameras", filters: { subject: "Phoenix.camera_count" } })
-```
-
-When in doubt, omit subject — pure pass-through, no validation. But for any fact you expect to update or supersede later, set it.
-
-## Dedup Gate (Tier 1 — DG-T1-B + Tier 2 — DG-T2-A)
-
-**Episodic write mode (DG-EPISODIC).** For bulk/episodic ingestion (benchmark history, transcript imports, Granola loads) pass `writeMode: "episodic"` to `unified_store`: the gate then runs **Tier 0 exact-fingerprint only** — Tier 1 cosine and the Tier 2 LLM judge are skipped, so legitimate restatements are stored instead of refused (the interactive gate measured 25% refusals on chronological life history in the DolphinBench ingestion probe, 2026-09-22). Exact duplicates still refuse (retry with `action=force-new`), and the entry is tagged `metadata.write_mode: "episodic"`. Default (`standard`) keeps the full interactive gate. Explicit `options.skip_dedup` (admin) still wins and skips Tier 0 too. Two deliberate exclusions: episodic writes never reach the Jev write-dedup shadow (Experiment 2) because the shadow lives inside the Tier 1 block the mode skips — the shadow dataset does not see bulk-ingestion signal; and `action=supersede` retries do not forward `writeMode`, so a correction of an episodic entry is stored standard (corrections are interactive; the supersede chain is not mode-stable).
-
-When you call `unified_store`, the gate may refuse the write if a near-duplicate already exists for the same `userId` + `contentType` + (optional) `metadata.subject`. The response shape:
-
-```json
-{
-  "status": "dedup_required",
-  "candidates": [
-    {
-      "id": "abc-123",
-      "similarity": 0.91,
-      "content_preview": "Phoenix camera count is UNKNOWN pending canvas bounds verification...",
-      "contentType": "fact",
-      "subject": "Phoenix.camera_count",
-      "created": "2026-04-13T...",
-      "flag": null,
-      "llm_relation": "duplicate"
-    }
-  ],
-  "message": "Likely duplicate found (cos=0.91 >= 0.88). Retry with action.",
-  "retry_with": [
-    "action=supersede&old_id=abc-123&reason=<...>",
-    "action=update&old_id=abc-123&reason=<...>",
-    "action=complement&related_to=abc-123",
-    "action=force-new&reason=<justification>"
-  ],
-  "band": "refuse",
-  "thresholds": { "refuse": 0.88, "confirm": 0.78 }
-}
-```
-
-If you receive `dedup_required`, **choose ONE retry action**: `supersede`, `update`, `complement`, or `force-new`. Each requires a `reason` (except `complement`, which uses `related_to`). Do NOT just retry the original write — the gate will refuse again.
-
-**Thresholds (calibrated empirically against the real KMS corpus by DG-INV-2):**
-- `>= 0.88` (refuse band): likely duplicate — must choose explicit action
-- `0.78 – 0.88` (confirm band): borderline — must choose explicit action
-- `< 0.78`: distinct, proceeds normally
-
-Per-contentType overrides:
-- `procedure` → refuse threshold = 0.85 (refutation rewrites cluster lower)
-- `pattern` → refuse threshold = 0.92 (duplicates extremely tight)
-
-**Action dispatch is wired** (DG-T1-C, issue #46). When the gate returns `dedup_required`, retry the same `unified_store` call with one of the four `action` values rather than calling `kms_supersede` / `kms_update` separately. The dispatcher routes internally:
-
-| `action` | Required fields | Effect |
+| `action` | Needs | Effect |
 |---|---|---|
-| `supersede` | `old_id`, `reason` | Calls supersede() — atomic replace. Returns `{ status: 'superseded', success, id, old_id, backends, reason, error? }`. |
-| `update` | `old_id`, `reason` | Calls update() — in-place edit; appends to `metadata.update_history`. Returns `{ status: 'updated', success, id, backends, reason }`. |
-| `complement` | `related_to` | Stores a NEW entry with `metadata.related_to = [<related_to>]` (merged into any existing array). Bypasses the dedup gate. Returns the normal store result. |
-| `force-new` | `reason` | Stores a NEW entry with `metadata.force_new_reason = <reason>`. Bypasses the dedup gate. Returns the normal store result. |
+| `supersede` | `old_id`, `reason` | atomic replace |
+| `update` | `old_id`, `reason` | in-place edit |
+| `complement` | `related_to` | new entry linked to the old one |
+| `force-new` | `reason` | new entry, gate bypassed |
 
-If a required field is missing, you get `{ status: 'invalid_action', success: false, error: '...' }` and nothing is stored. The error message names the missing field. Pick another action or supply the field — do not just retry the original write.
+**Tier 2 `llm_relation`** — local Ollama judge on rym1 (`DEFAULT_OLLAMA_MODEL`, currently `gemma4:12b-mlx`):
 
-**The gate uses `metadata.subject` as a scope filter when present.** Two writes with the same `subject` get the tightest dedup check (narrowed to that facet of that topic). When you omit `subject`, the gate falls back to `userId + contentType` only — so writes without a subject still trigger dedup against any same-userId-same-contentType entry, not zero matches. Tag high-traffic facts with explicit `metadata.subject` (see preceding section) to scope the dedup check tighter and avoid false positives across unrelated facets of the same topic.
+| Relation | Do |
+|---|---|
+| `duplicate` | nothing to add — skip the write |
+| `supersedes` | `action=supersede` |
+| `supersedes-reverse` | existing entry is newer; don't write (maybe `kms_update` it) |
+| `complement` | `action=complement` |
+| `contradicts` | **STOP.** Surface it to the human; one side must be retracted (`kms_supersede` or `kms_flag RETRACTED`). `force-new` only with a reason arguing they are not actually opposed. |
+| `unrelated` | `action=force-new` — the embedder misfired |
 
-### Tier 2 — `llm_relation` (DG-T2-A, issue #49)
+If Ollama is unreachable, `llm_relation` is `null` and the gate runs on cosine alone. The
+embedder is also Ollama, so one outage disables both tiers. For bulk/episodic ingestion
+(transcripts, benchmark history), pass `writeMode: "episodic"`: only exact duplicates are refused.
 
-Each candidate in a `dedup_required` response now carries an `llm_relation` field populated by a **local Ollama model** (`DEFAULT_OLLAMA_MODEL` in `src/inference/OllamaInference.ts`, currently `gemma4:12b-mlx`; `OLLAMA_MODEL` overrides it) for confirm-band candidates. Model choice was measured, not picked from spec sheets: on 18 labeled cases the real judge scored gemma4:12b-mlx 15/18, qwen3.5:9b-mlx 13/18, qwen3:8b 9/18 — and qwen3:8b caught 0/3 `contradicts`, the one relation the gate treats as a hard stop (2026-09-23). The router and the judge share one model on purpose: rym1 (M1, 16 GB, also a CI host) cannot hold two ~8 GB models at once. Refuse-band candidates get the relation `"duplicate"` inline (free win — the embedder already agrees so strongly we skip the LLM call). The judge runs on the M1 mini alongside the embedder; no external API key is involved.
+## Operating the servers
 
-**Relation enum:**
-
-| Relation | Meaning | Recommended action |
-|---|---|---|
-| `duplicate` | Same fact expressed differently; no new information in NEW | `kms_delete` the new write (or skip) — nothing to add |
-| `supersedes` | NEW corrects/replaces the existing entry | `kms_supersede(old_id, new_content, reason)` |
-| `supersedes-reverse` | The existing entry is the more accurate one; NEW is outdated | Don't write NEW; consider `kms_update` on existing if NEW has incremental info |
-| `complement` | Both are true — different facets of related topic | `action=complement&related_to=<old_id>` (write both, link them) |
-| `contradicts` | **Factually opposed; only one can be true** | **STOP.** Do NOT proceed without explicit acknowledgement. Surface to the human; one of the two must be retracted via `kms_supersede` or `kms_flag(RETRACTED)`. |
-| `unrelated` | Different facts that happen to share keywords | Proceed with `action=force-new&reason=<...>` — the embedder mis-fired |
-
-**On `contradicts`:** treat as a hard stop. The new write directly opposes an existing fact. Either the existing entry is wrong (use `kms_supersede`) or the new claim is wrong (don't write it). Picking blindly creates two contradicting entries that both leak into context injection — exactly the failure mode the gate exists to prevent.
-
-**The `dedup_required` response marks this for you (DG-T2-B, issue #50):** when any candidate's `llm_relation` is `contradicts`, the response carries `contradicts_detected: true` and `contradicting_ids: [...]`, `message` is rewritten to say CONTRADICTION explicitly (not "likely duplicate"), and `retry_with` is narrowed to only the two actions that make sense here — `action=supersede&old_id=<id>&reason=<why the existing entry is wrong>` and `action=force-new&reason=<why this does NOT actually contradict — required>`. `update` and `complement` are omitted: neither fits a factual conflict. Do not treat a `force-new` reason on a contradiction as a generic justification — it must specifically argue the two claims aren't actually opposed (e.g., they're scoped to different time periods or contexts); if you can't make that argument, the right move is `supersede`, not `force-new`.
-
-**Graceful degradation:** when Ollama is unreachable, `llm_relation` is `null` for all confirm-band candidates and `"duplicate"` for refuse-band. The gate still works on Tier 1 cosine alone — Tier 2 is purely advisory enrichment. Note the shared dependency: the embedder and the judge are both local Ollama services, so one unreachable Ollama disables Tier 1 and Tier 2 together.
-
-**Cost & latency budget:** local inference, no per-call cost. 8 s per-candidate timeout. A cold load of gemma4:12b-mlx measured 45 s (first load after pull), so the first call after eviction degrades to `llm_relation: null`; rym1 sets `OLLAMA_KEEP_ALIVE=30m` so the model stays resident while KMS is active. Single-word forced response (~12 tokens) with `think: false` so a reasoning model does not spend its budget thinking. LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
-
-**Embedding writes work — the gate is live.** (Re-verified 2026-07-31.) An earlier
-revision of this file claimed the opposite: that the Node binding had no
-`execute_with_params`, that `SET k.embedding = [...]` silently failed, that the HNSW
-index stayed empty and the dedup gate was inert. **Every part of that is now false**, and
-it was quoted as a live blocker for months after it stopped being true. Current state:
-
-- The binding exposes `executeWithParams`, `createVectorIndex`, `vectorSearch`,
-  `addToVectorIndex`, `hybridSearch`, `fulltextSearch`.
-- `storeEmbedding` (`src/storage/SparrowDBStorage.ts:481-489`) was migrated off the
-  list-literal path to parameter binding in `30285ef8` (PR #69).
-- The live store at `$SPARROWDB_PATH` (`~/.kms-sparrowdb-v2`) has a populated HNSW
-  index — hundreds of vectors against real `nomic-embed-text:v1` embedder IDs.
-
-Only the *legacy* literal form still fails, and nothing calls it any more:
-`SET k.embedding = [0.1, 0.2]` → `invalid argument: SET property value must be a
-literal or $parameter`. Use `executeWithParams` with `$emb`.
-
-**Two real caveats that DO apply:**
-
-1. **`package.json` declares `sparrowdb: ^0.1.20`, and that is fiction.** The npm
-   tarball ships a Linux ELF that cannot `dlopen` on darwin-arm64, and published
-   0.1.20/0.1.21 have *no vector API at all* — upgrading to them is a severe
-   regression. The working artifact is a local build produced by
-   `scripts/build-sparrowdb-node.sh` from `~/Dev/SparrowDB/npm/sparrowdb` (0.1.22,
-   unpublished), which overwrites `node_modules/sparrowdb/sparrowdb.node`. **A plain
-   `npm ci` silently breaks vector support** until someone re-runs the build script.
-
-2. **A `RETURN` alias on a node scan reads the wrong property, or null.** In a plain
-   `MATCH (n:Label) … RETURN`, the engine resolves each property column by its
-   **output name**, not by the expression you projected:
-
-   | Query | Result |
-   |---|---|
-   | `MATCH (k:Knowledge) RETURN k.id` | correct |
-   | `MATCH (k:Knowledge) RETURN k.id AS id` | correct — alias equals the property name |
-   | `MATCH (k:Knowledge) RETURN k.id AS zzz` | `null` |
-   | `MATCH (k:Knowledge) RETURN k.id AS contentType` | **silently returns `k.contentType`** |
-
-   Projecting anything that materialises the node — `id(k)`, `labels(k)`, or the bare
-   variable `k`, in any position — restores correct resolution. Relationship-expansion
-   projections (`MATCH (a)-[r:T]->(b) RETURN a.id AS f`) are unaffected.
-
-   **Rule for new queries: project properties unaliased, or alias them to their own
-   property name.** `_ensureInternalIdMap` is safe because it projects `id(k)`.
-
-   Reproduction: `npx jest src/__tests__/SparrowDBBinding.reads.test.ts` — 15 assertions
-   against a real throwaway DB. Run it before writing anything else about SparrowDB
-   reads into this file.
-
-**Two claims that were in this section and were WRONG — do not reintroduce them:**
-
-- ~~"Reads return `null` unless `id(k)` is projected first."~~ False as stated, and
-  verified false 2026-07-31 on a scratch DB and on a copy of `~/.kms-sparrowdb-v2`:
-  `MATCH (k) RETURN k.id` and `MATCH (k) RETURN id(k), k.id` return **identical**
-  values — on the live copy, 2542 rows, 2497 non-null, same 45 nulls either way. Those
-  45 are genuinely property-less orphan nodes (internal ids 168–214, whole payload
-  `{col_0: 0}`), not a projection artifact. This claim is the alias defect above,
-  observed through an aliased query and then generalised to the wrong cause — which is
-  why one investigation saw nulls and another could not reproduce them.
-- ~~"SparrowDB truncates string properties to 7 characters on read."~~ False. Verified
-  three ways: scratch DB, live-store copy, and the exact query
-  `GraphEdgeIndex.readEdges()` issues (`MATCH (a)-[r:T]->(b) RETURN a.id, b.id,
-  r.strength` → whole 36-char UUIDs on both endpoints). On the live copy 2483 of 2497
-  readable ids are exactly 36 chars and **no** value of any length is 7 chars; the 14
-  shorter ones are genuinely short ids (`caryn_yaker`, `test-set-1778114586557`). This
-  one cost a prefix-matching resolver in `SparrowDBStorage` written to compensate for a
-  non-problem, plus two invalid review findings on PR #87. Removed in this PR.
-
-Before repeating any claim in this section, verify it — that is exactly how the
-superseded version above survived so long.
-
-## Best Practices
-
-### Search First, Store Smart
-1. Always search before storing to avoid duplicates
-2. Use search results to inform storage decisions
-3. Build on existing knowledge rather than creating isolated memories
-4. **If search returns a fact you're about to contradict, retry `unified_store` with `action=supersede` (or use `kms_supersede` directly) — do not issue a bare additive `unified_store` call**
-
-### Natural Language Processing
-- Use natural descriptions in storage
-- Let the MCP handle technical routing decisions
-- Focus on the conceptual connections and meaning
-
-### Context Awareness
-- Include user context when available
-- Reference related concepts and relationships
-- Consider temporal aspects (when did this happen/matter)
-
-### Multi-Dimensional Storage
-```json
-{
-  "content": "User prefers async communication over real-time meetings",
-  "contentType": "preference", 
-  "source": "personal",
-  "userId": "user_123",
-  "metadata": {
-    "communication_style": "asynchronous",
-    "meeting_preference": "scheduled",
-    "context": "work_efficiency"
-  },
-  "relationships": [
-    {
-      "targetId": "communication-preferences",
-      "type": "INSTANCE_OF",
-      "strength": 0.9
-    },
-    {
-      "targetId": "productivity-patterns", 
-      "type": "RELATES_TO",
-      "strength": 0.7
-    }
-  ]
-}
-```
-
-## Datastore Strengths
-
-**Mem0**: Personal experiences, preferences, episodic memories, user behavior patterns
-**SparrowDB (graph)**: Concept relationships, technique effectiveness, causal connections, knowledge graphs (embedded; replaced Neo4j Aura in the SparrowDB cutover — `storage.graph` slot, `storageDecision.primary: "graph"`)
-**MongoDB**: Structured data, configurations, session notes, quantitative tracking
-
-## Implementation Goals
-
-Make memory integration so smooth and natural that it becomes automatic - like how you naturally break down complex problems or connect related concepts. The unified MCP handles the technical complexity while you focus on the conceptual richness of multi-dimensional memory.
+- The live servers (`com.ryaker.kms-mcp-eng`, `com.ryaker.kms-mcp`) run
+  `node --watch dist/index.js` from **this checkout**. `npm run build` here deploys to production.
+- Doppler (`ry-local` `dev_eng` / `dev_personal`) injects env only at process start. A Doppler
+  change needs `launchctl kickstart -k gui/$(id -u)/<agent>`.
+- After a deploy, confirm with a real `unified_store`: the router should report
+  `llm(...)`, not `regex(confidence=0.50)`.
+- Never run Ollama inference on this Mac mini (16 GB, CI host). Local models run on rym1
+  (`OLLAMA_BASE_URL`, Tailscale `100.127.128.76:11434`).
