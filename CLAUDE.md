@@ -127,6 +127,33 @@ KMS has five corrective tools. Pick the right one:
 > fan-out generating new shards on every write, so one careful `unified_store` still
 > becomes several retrievable rows.
 
+**Mem0 narrative timestamps (temporal-stamp fix).** `Mem0Storage.store()` passes the
+knowledge's `timestamp` as the add's top-level `timestamp` (epoch seconds) on every
+write. Without it, mem0's server-side extractor stamps the **ingestion** date into
+extracted shard text — measured 2026-09-22 in the DolphinBench ingestion probe: a
+2023-03-06 narrative event was rewritten to "September 22, 2026" (ingestion day), an
+active Class-E temporal-corruption risk for dated-history ingestion. The field threads
+to the wire unchanged via `_preparePayload` (verified against mem0ai@3.0.2
+`dist/index.mjs`: `add()` merges options verbatim; `timestamp` is already snake_case).
+The ISO timestamp stays in `metadata.timestamp` as before; the two are different
+fields on different layers and both are kept. Regression test:
+`src/__tests__/Mem0Storage.store.timestamp.test.ts`; live smoke (skipped unless
+`KMS_MEM0_LIVE_SMOKE=1`): `Mem0Storage.store.timestamp.live.test.ts`.
+
+**Scope caveat — this fixes the storage layer, not the tool path (yet).** The only
+production caller of `store()` is `UnifiedStoreTool`, which hardcodes
+`timestamp: new Date()` when constructing the knowledge entry, and the
+`unified_store` input schema has **no** `timestamp` property. Through the tool
+path, every entry's narrative timestamp *is* ingestion time, so today's writes
+are behaviorally unchanged — DolphinBench/harvest currently put the narrative
+date only in `metadata.claude_timestamp`, and dated-history ingestion stays
+unsafe through the tool path until callers can plumb a real narrative timestamp
+into `knowledge.timestamp` (follow-up: `timestamp` arg on the `unified_store`
+schema + harvest wiring). `Mem0Storage.update()` is a second, same-class
+follow-up: it passes only `{ text }` to mem0, so an update re-runs extraction
+without the event timestamp (SDK `update()` accepts `timestamp` per
+`dist/index.d.ts`).
+
 **When in doubt, prefer `kms_supersede` over `kms_delete`**. The mistake is data — future you or a future agent might want to trace why a conclusion changed. Supersede preserves the chain; delete is for actual garbage.
 
 **Example correction flow**:
