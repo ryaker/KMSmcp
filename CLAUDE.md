@@ -180,6 +180,8 @@ When in doubt, omit subject — pure pass-through, no validation. But for any fa
 
 ## Dedup Gate (Tier 1 — DG-T1-B + Tier 2 — DG-T2-A)
 
+**Episodic write mode (DG-EPISODIC).** For bulk/episodic ingestion (benchmark history, transcript imports, Granola loads) pass `writeMode: "episodic"` to `unified_store`: the gate then runs **Tier 0 exact-fingerprint only** — Tier 1 cosine and the Tier 2 LLM judge are skipped, so legitimate restatements are stored instead of refused (the interactive gate measured 25% refusals on chronological life history in the DolphinBench ingestion probe, 2026-09-22). Exact duplicates still refuse (retry with `action=force-new`), and the entry is tagged `metadata.write_mode: "episodic"`. Default (`standard`) keeps the full interactive gate. Explicit `options.skip_dedup` (admin) still wins and skips Tier 0 too. Two deliberate exclusions: episodic writes never reach the Jev write-dedup shadow (Experiment 2) because the shadow lives inside the Tier 1 block the mode skips — the shadow dataset does not see bulk-ingestion signal; and `action=supersede` retries do not forward `writeMode`, so a correction of an episodic entry is stored standard (corrections are interactive; the supersede chain is not mode-stable).
+
 When you call `unified_store`, the gate may refuse the write if a near-duplicate already exists for the same `userId` + `contentType` + (optional) `metadata.subject`. The response shape:
 
 ```json

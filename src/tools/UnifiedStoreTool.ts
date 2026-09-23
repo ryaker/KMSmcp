@@ -401,6 +401,17 @@ export class UnifiedStoreTool {
     reason?: string
     related_to?: string
     /**
+     * DG-EPISODIC — write mode. 'episodic' is for bulk/episodic ingestion
+     * (benchmark history, transcript imports, Granola loads) where a
+     * restatement is temporal signal, not redundancy: the dedup gate runs
+     * Tier 0 (exact fingerprint) ONLY, so legitimate near-duplicates are
+     * stored instead of refused. The entry is stamped
+     * metadata.write_mode='episodic' as the audit trail. Absent or
+     * 'standard' keeps the interactive gate exactly as before. Explicit
+     * options.skip_dedup still wins (skips Tier 0 too).
+     */
+    writeMode?: 'standard' | 'episodic'
+    /**
      * Admin-only escape hatch for batch imports, the reaper, and the
      * calibration script. NOT advertised in the MCP tool schema; only honored
      * when the call comes from a non-Claude-facing code path. Defaults to
@@ -542,6 +553,17 @@ export class UnifiedStoreTool {
       fingerprint
     }
 
+    // DG-EPISODIC: stamp the write mode onto the entry before the fan-out so
+    // every backend copy carries the audit trail. A caller-supplied
+    // metadata.write_mode IS overwritten here — writeMode:'episodic' is the
+    // caller's declared intent for this write, so 'episodic' wins.
+    if (args.writeMode === 'episodic') {
+      knowledge.metadata = {
+        ...knowledge.metadata,
+        write_mode: 'episodic'
+      }
+    }
+
     if (
       args.options?.skip_dedup !== true &&
       typeof this.storage.graph.findByFingerprint === 'function'
@@ -603,11 +625,13 @@ export class UnifiedStoreTool {
         }
       } catch (e) {
         // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
-        // Tier 1 still runs. Use the project logger for consistency with the
-        // rest of the dedup-gate code path (Tier 1 / Tier 2 also log via
-        // logger.warn — see the findSimilar guard below).
+        // Tier 1 still runs in standard mode (under writeMode:'episodic' Tier 1
+        // is skipped by design, so this is the only gate degradation). Use the
+        // project logger for consistency with the rest of the dedup-gate code
+        // path (Tier 1 / Tier 2 also log via logger.warn — see the findSimilar
+        // guard below).
         logger.warn(
-          `⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+          `⚠️ unified_store: findByFingerprint failed (continuing past Tier 0): ` +
           `${e instanceof Error ? e.message : String(e)}`
         )
       }
@@ -683,9 +707,15 @@ export class UnifiedStoreTool {
     // Latency: typical p50 ~5-15 ms (HNSW search 1-3 ms + JS post-filter).
     // ---------------------------------------------------------------------
     const skipDedup = args.options?.skip_dedup === true
+    // DG-EPISODIC: episodic writes keep Tier 0 (exact fingerprint above) but
+    // skip Tier 1 cosine + Tier 2 LLM judge entirely — a restatement is the
+    // signal, not redundancy. Measured on the DolphinBench ingestion probe
+    // (2026-09-22): the interactive gate refused 25% of legitimate
+    // chronological history.
+    const gateTier1AndAbove = !skipDedup && args.writeMode !== 'episodic'
     if (
       pendingEmbedding &&
-      !skipDedup &&
+      gateTier1AndAbove &&
       typeof (this.storage.graph as any).findSimilar === 'function'
     ) {
       const subjectFacet = typeof knowledge.metadata?.subject === 'string'
