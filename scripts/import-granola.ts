@@ -74,7 +74,7 @@
  *   #   --kms-url http://localhost:8180/mcp                             (default)
  *   #   --sync-log ~/.kms-granola-sync.json                             (default)
  *   #   --user-id richard_yaker                                         (default — must match KMS_DEFAULT_USER_ID)
- *   #   --ollama-model qwen3:8b                                         (default)
+ *   #   --ollama-model <id>        (default: DEFAULT_OLLAMA_MODEL in src/inference/OllamaInference.ts)
  *   #   --dry-run                                                       (skip the actual KMS writes; log what would happen)
  *   #   --max-meetings <N>                                              (cap, useful for smoke-testing)
  *
@@ -103,7 +103,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { OllamaInference } from '../src/inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../src/inference/OllamaInference.js'
 import {
   buildDistillPrompt,
   DistilledMeeting,
@@ -174,7 +174,7 @@ export function parseArgs(argv: string[]): CliOptions {
     kmsUrl: process.env.KMS_URL || 'http://localhost:8180/mcp',
     syncLogPath: process.env.KMS_GRANOLA_SYNC_LOG || join(homedir(), '.kms-granola-sync.json'),
     userId: process.env.KMS_DEFAULT_USER_ID || 'richard_yaker',
-    ollamaModel: process.env.OLLAMA_MODEL || 'qwen3:8b',
+    ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     dryRun: false,
     bearerToken: process.env.KMS_BEARER_TOKEN
   }
@@ -268,7 +268,7 @@ Options:
   --kms-url <url>           default: http://localhost:8180/mcp
   --sync-log <path>         default: ~/.kms-granola-sync.json
   --user-id <id>            default: richard_yaker (or KMS_DEFAULT_USER_ID env)
-  --ollama-model <id>       default: qwen3:8b (or OLLAMA_MODEL env)
+  --ollama-model <id>       default: ${DEFAULT_OLLAMA_MODEL} (or OLLAMA_MODEL env)
   --bearer-token <token>    Bypass OAuth client-credentials, pass token directly.
                             Or set KMS_BEARER_TOKEN env var.
   --dry-run                 Don't actually write to KMS. Log what would happen.
@@ -280,7 +280,7 @@ Environment:
   KMS_URL                   Override --kms-url.
   KMS_DEFAULT_USER_ID       Default --user-id.
   OLLAMA_BASE_URL           Local model host (default: http://localhost:11434).
-  OLLAMA_MODEL              Local model for distillation (default: qwen3:8b).
+  OLLAMA_MODEL              Local model for distillation (default: ${DEFAULT_OLLAMA_MODEL}).
 
   When KMS_BEARER_TOKEN is unset, the script falls back to Auth0 client_credentials
   using OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_TOKEN_ENDPOINT, OAUTH_AUDIENCE

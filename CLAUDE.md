@@ -264,7 +264,7 @@ If a required field is missing, you get `{ status: 'invalid_action', success: fa
 
 ### Tier 2 — `llm_relation` (DG-T2-A, issue #49)
 
-Each candidate in a `dedup_required` response now carries an `llm_relation` field populated by a **local Ollama model** (`qwen3:8b` by default) for confirm-band candidates. Refuse-band candidates get the relation `"duplicate"` inline (free win — the embedder already agrees so strongly we skip the LLM call). The judge runs on the M1 mini alongside the embedder; no external API key is involved.
+Each candidate in a `dedup_required` response now carries an `llm_relation` field populated by a **local Ollama model** (`DEFAULT_OLLAMA_MODEL` in `src/inference/OllamaInference.ts`, currently `gemma4:12b-mlx`; `OLLAMA_MODEL` overrides it) for confirm-band candidates. Model choice was measured, not picked from spec sheets: on 18 labeled cases the real judge scored gemma4:12b-mlx 15/18, qwen3.5:9b-mlx 13/18, qwen3:8b 9/18 — and qwen3:8b caught 0/3 `contradicts`, the one relation the gate treats as a hard stop (2026-09-23). The router and the judge share one model on purpose: rym1 (M1, 16 GB, also a CI host) cannot hold two ~8 GB models at once. Refuse-band candidates get the relation `"duplicate"` inline (free win — the embedder already agrees so strongly we skip the LLM call). The judge runs on the M1 mini alongside the embedder; no external API key is involved.
 
 **Relation enum:**
 
@@ -283,7 +283,7 @@ Each candidate in a `dedup_required` response now carries an `llm_relation` fiel
 
 **Graceful degradation:** when Ollama is unreachable, `llm_relation` is `null` for all confirm-band candidates and `"duplicate"` for refuse-band. The gate still works on Tier 1 cosine alone — Tier 2 is purely advisory enrichment. Note the shared dependency: the embedder and the judge are both local Ollama services, so one unreachable Ollama disables Tier 1 and Tier 2 together.
 
-**Cost & latency budget:** local inference, no per-call cost. 8 s per-candidate timeout (first call after model eviction pays a multi-second load), single-word forced response (~12 tokens) with `think: false` so a reasoning model does not spend its budget thinking. LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
+**Cost & latency budget:** local inference, no per-call cost. 8 s per-candidate timeout. A cold load of gemma4:12b-mlx measured 45 s (first load after pull), so the first call after eviction degrades to `llm_relation: null`; rym1 sets `OLLAMA_KEEP_ALIVE=30m` so the model stays resident while KMS is active. Single-word forced response (~12 tokens) with `think: false` so a reasoning model does not spend its budget thinking. LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
 
 **Embedding writes work — the gate is live.** (Re-verified 2026-07-31.) An earlier
 revision of this file claimed the opposite: that the Node binding had no

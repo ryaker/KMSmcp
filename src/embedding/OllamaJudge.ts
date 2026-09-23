@@ -20,8 +20,8 @@
  *     config check. The previous implementation could only ask "is a key set",
  *     which is meaningless here — Ollama may be configured and still down, and
  *     it is on another host on the LAN.
- *   - `think: false` — the default model (qwen3:8b) is a reasoning model, and
- *     its thinking block would otherwise be the only thing a 12-token budget
+ *   - `think: false` — the Qwen-family defaults are reasoning models, and
+ *     a thinking block would otherwise be the only thing a 12-token budget
  *     has room for.
  */
 
@@ -33,9 +33,10 @@ import {
   parseLLMRelation,
 } from './LLMJudgeService.js'
 import { logger } from '../logger.js'
+import { DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
 
 const DEFAULT_BASE_URL = 'http://localhost:11434'
-const DEFAULT_MODEL = 'qwen3:8b'
+const DEFAULT_MODEL = DEFAULT_OLLAMA_MODEL
 const DEFAULT_CACHE_SIZE = 1000
 
 /**
@@ -84,7 +85,7 @@ Respond with ONLY the single enum word. No punctuation, no explanation, no forma
 export interface OllamaJudgeConfig {
   /** Ollama base URL. Defaults to env OLLAMA_BASE_URL, then localhost:11434. */
   baseUrl?: string
-  /** Model id (defaults to env OLLAMA_MODEL, then qwen3:8b). */
+  /** Model id (defaults to env OLLAMA_MODEL, then DEFAULT_OLLAMA_MODEL). */
   model?: string
   /** Per-call timeout in ms (default: env OLLAMA_JUDGE_TIMEOUT_MS, then 8000). */
   timeoutMs?: number

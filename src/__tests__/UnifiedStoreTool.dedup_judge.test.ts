@@ -723,14 +723,15 @@ describe('OllamaJudge', () => {
     expect(j.modelId).toBe('qwen3-test-model')
   })
 
-  it('default model id is the local Ollama model (qwen3:8b)', async () => {
+  it('default model id is the repo-wide DEFAULT_OLLAMA_MODEL', async () => {
     const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
+    const { DEFAULT_OLLAMA_MODEL } = await import('../inference/OllamaInference.js')
 
     const prevModel = process.env.OLLAMA_MODEL
     delete process.env.OLLAMA_MODEL
     try {
       const j = new OllamaJudge({ fetchImpl: jest.fn() as any })
-      expect(j.modelId).toBe('qwen3:8b')
+      expect(j.modelId).toBe(DEFAULT_OLLAMA_MODEL)
     } finally {
       if (prevModel !== undefined) process.env.OLLAMA_MODEL = prevModel
     }

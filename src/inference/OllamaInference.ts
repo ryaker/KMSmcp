@@ -1,3 +1,12 @@
+/**
+ * The one default local model for every Ollama consumer in this repo: storage
+ * router, dedup judge, CLI and the three importers. Change it here, not at call
+ * sites — nine hard-coded copies are how the judge stayed on qwen3:8b after it
+ * was outclassed. Must fit rym1 (M1, 16 GB shared with CI: ~9 GB ceiling).
+ * Every consumer still honours OLLAMA_MODEL as an override.
+ */
+export const DEFAULT_OLLAMA_MODEL = 'gemma4:12b-mlx'
+
 export interface ClassifyResult {
   targets: Array<'mem0' | 'mongodb' | 'graph'>
   contentType: 'episodic' | 'procedural' | 'relational' | 'factual' | 'insight'
@@ -57,7 +66,7 @@ export class OllamaInference {
 
   constructor(
     private baseUrl = 'http://localhost:11434',
-    private model = 'qwen3:8b'
+    private model = DEFAULT_OLLAMA_MODEL
   ) {}
 
   async isAvailable(): Promise<boolean> {

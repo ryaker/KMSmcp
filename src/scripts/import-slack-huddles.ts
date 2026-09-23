@@ -86,7 +86,7 @@
  *   }
  */
 
-import { OllamaInference } from '../inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -164,7 +164,7 @@ export function parseArgs(argv: string[]): CliOptions {
       process.env.KMS_SLACK_HUDDLE_SYNC_LOG ||
       join(homedir(), '.kms-slack-huddle-sync.json'),
     userId: process.env.KMS_DEFAULT_USER_ID || 'richard_yaker',
-    ollamaModel: process.env.OLLAMA_MODEL || 'qwen3:8b',
+    ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     workspace: process.env.SLACK_WORKSPACE || 'tengo',
     dryRun: false,
     bearerToken: process.env.KMS_BEARER_TOKEN
@@ -226,7 +226,7 @@ Options:
   --kms-url <url>            default: http://localhost:8180/mcp
   --sync-log <path>          default: ~/.kms-slack-huddle-sync.json
   --user-id <id>             default: richard_yaker (or KMS_DEFAULT_USER_ID env)
-  --ollama-model <id>        default: qwen3:8b (local Ollama)
+  --ollama-model <id>        default: ${DEFAULT_OLLAMA_MODEL} (local Ollama)
   --bearer-token <token>     Bypass OAuth client-credentials, pass token directly.
                              Or set KMS_BEARER_TOKEN env var.
   --dry-run                  Don't actually write to KMS. Log what would happen.
@@ -236,7 +236,7 @@ Options:
 Environment:
   KMS_BEARER_TOKEN           Preferred OAuth path for one-off runs.
   OLLAMA_BASE_URL            (optional) default http://localhost:11434 — distillation.
-  OLLAMA_MODEL               (optional) default qwen3:8b.
+  OLLAMA_MODEL               (optional) default ${DEFAULT_OLLAMA_MODEL}.
   KMS_URL                    Override --kms-url.
   KMS_DEFAULT_USER_ID        Default --user-id.
   SLACK_WORKSPACE            Default --workspace label.
@@ -1185,11 +1185,16 @@ export async function runImportLive(args: {
     { searchQuery: opts.searchQuery, searchLimit: opts.searchLimit }
   )
   // Distillation runs on the local Ollama host, so no credential is threaded in
-  // here any more — the only prerequisite is that the model answers, and a
-  // transport failure surfaces per huddle rather than up front.
+  // here any more — the only prerequisite is that the model answers. Probe it
+  // before touching KMS, as main() does: otherwise an unreachable host fails
+  // each huddle only after its full distill timeout.
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
   const distiller = opts.dryRun
     ? new NoopDistiller()
-    : new OllamaDistiller(process.env.OLLAMA_BASE_URL || 'http://localhost:11434', opts.ollamaModel)
+    : new OllamaDistiller(ollamaBaseUrl, opts.ollamaModel)
+  if (!opts.dryRun && !(await distiller.isAvailable())) {
+    throw new Error(`Ollama unreachable at ${ollamaBaseUrl} — distillation needs it.`)
+  }
   let kms: MinimalMcpClient | null = null
   if (!opts.dryRun) {
     const bearer = await fetchBearerTokenIfNeeded(opts)

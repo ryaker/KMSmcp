@@ -36,7 +36,7 @@ import { isSparrowdbPackageNotInstalled } from '../storage/nativeLoaderGuard.js'
 import { Mem0Storage } from '../storage/Mem0Storage.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
-import { OllamaInference } from '../inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
 import { EnrichmentQueue } from '../inference/EnrichmentQueue.js'
 import { EntityLinker } from '../inference/EntityLinker.js'
 import { UnifiedStoreTool } from '../tools/UnifiedStoreTool.js'
@@ -107,7 +107,7 @@ function buildConfig() {
     },
     ollama: {
       baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
-      model: process.env.OLLAMA_MODEL || 'qwen3:8b'
+      model: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL
     }
   }
 }

@@ -13,7 +13,7 @@
  *
  * Filesystem is READ-ONLY — never moves, edits, or deletes any source MD.
  *
- * Distillation: a local Ollama model (default qwen3:8b). No cloud credential —
+ * Distillation: a local Ollama model (DEFAULT_OLLAMA_MODEL). No cloud credential —
  * the same host that serves embeddings and the dedup judge does the extraction.
  *
  * Resumable via ~/.kms-md-corpus-sync.json keyed by absolute_path → content_sha256.
@@ -25,7 +25,7 @@ import * as os from 'os'
 import { createHash } from 'crypto'
 import { execFileSync } from 'child_process'
 
-import { OllamaInference } from '../inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -903,7 +903,7 @@ export function parseArgs(argv: string[]): CliOptions {
     kmsUrl: process.env.KMS_URL || DEFAULT_KMS_URL,
     syncLogPath: DEFAULT_SYNC_LOG,
     ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
-    ollamaModel: process.env.OLLAMA_MODEL || 'qwen3:8b',
+    ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     verbose: false
   }
   for (let i = 0; i < argv.length; i++) {
@@ -992,7 +992,7 @@ ${DEFAULT_ROOTS.map(r => '  ' + r).join('\n')}
 
 Required environment:
   OLLAMA_BASE_URL         (optional) default http://localhost:11434
-  OLLAMA_MODEL            (optional) default qwen3:8b — used for distillation
+  OLLAMA_MODEL            (optional) default ${DEFAULT_OLLAMA_MODEL} — used for distillation
   KMS_BEARER_TOKEN        (optional) sent to KMS as Authorization: Bearer <…>
 `)
 }
