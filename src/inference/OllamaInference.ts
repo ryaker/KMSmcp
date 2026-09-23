@@ -30,7 +30,30 @@ export interface GenerateOptions {
   numPredict?: number
   /** Sampling temperature. Lower is better for structured extraction. */
   temperature?: number
+  /**
+   * Ollama structured output: a JSON Schema the response is constrained to.
+   * Prompt wording alone is not enough — gemma4:12b-mlx intermittently wrapped
+   * router JSON in ```json fences despite "No markdown", and each fence sent a
+   * live write to the regex fallback. Pass a schema, not the bare string
+   * 'json': that one lets the model pick the shape, and it turned the entity
+   * ID array into objects ({"ids":[...]}), which the parser rejects.
+   */
+  format?: Record<string, unknown>
 }
+
+/** Router response shape — mirrors ClassifyResult; enforced by Ollama, re-validated below. */
+const CLASSIFY_SCHEMA = {
+  type: 'object',
+  properties: {
+    targets: { type: 'array', items: { type: 'string', enum: ['graph', 'mem0', 'mongodb'] } },
+    contentType: { type: 'string', enum: ['episodic', 'procedural', 'relational', 'factual', 'insight'] },
+    confidence: { type: 'number' },
+  },
+  required: ['targets', 'contentType', 'confidence'],
+}
+
+/** Entity extraction returns a bare array of candidate IDs. */
+const ENTITY_IDS_SCHEMA = { type: 'array', items: { type: 'string' } }
 
 /**
  * Timeout budgets. These were originally tuned for an Ollama running on loopback,
@@ -118,7 +141,7 @@ Rules:
 
 Text: "${content.slice(0, 500)}"`
 
-    const raw = await this.callOllama(prompt, { timeoutMs: CLASSIFY_TIMEOUT_MS })
+    const raw = await this.callOllama(prompt, { timeoutMs: CLASSIFY_TIMEOUT_MS, format: CLASSIFY_SCHEMA })
     if (raw === null) {
       return null
     }
@@ -182,7 +205,7 @@ Candidates: ${JSON.stringify(candidates.slice(0, 30))}
 
 Text: "${content.slice(0, 600)}"`
 
-    const raw = await this.callOllama(prompt, { timeoutMs: ENTITY_TIMEOUT_MS })
+    const raw = await this.callOllama(prompt, { timeoutMs: ENTITY_TIMEOUT_MS, format: ENTITY_IDS_SCHEMA })
     if (raw === null) {
       return []
     }
@@ -243,6 +266,7 @@ Text: "${content.slice(0, 600)}"`
           prompt,
           stream: false,
           think: false,
+          ...(options.format ? { format: options.format } : {}),
           ...(Object.keys(ollamaOptions).length > 0 ? { options: ollamaOptions } : {})
         }),
         signal: controller.signal,
