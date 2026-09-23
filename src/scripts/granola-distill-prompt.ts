@@ -1,7 +1,7 @@
 /**
  * Granola → KMS distillation prompt and types.
  *
- * The Haiku 4.5 (claude-haiku-4-5) call must return a JSON object matching
+ * The local Ollama model's call must return a JSON object matching
  * `DistilledMeeting`. The prompt enforces:
  *   - One ~200-word `summary` (the whole-meeting entry's content)
  *   - 2–5 `claims`, each a self-contained typed thought (OB1 6-type taxonomy)

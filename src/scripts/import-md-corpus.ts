@@ -13,7 +13,8 @@
  *
  * Filesystem is READ-ONLY — never moves, edits, or deletes any source MD.
  *
- * Distillation: Claude Haiku 4.5 (claude-haiku-4-5-20251001) via @anthropic-ai/sdk.
+ * Distillation: a local Ollama model (DEFAULT_OLLAMA_MODEL). No cloud credential —
+ * the same host that serves embeddings and the dedup judge does the extraction.
  *
  * Resumable via ~/.kms-md-corpus-sync.json keyed by absolute_path → content_sha256.
  */
@@ -23,6 +24,8 @@ import * as path from 'path'
 import * as os from 'os'
 import { createHash } from 'crypto'
 import { execFileSync } from 'child_process'
+
+import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -91,7 +94,10 @@ export interface CliOptions {
   bearerToken: string | null
   kmsUrl: string
   syncLogPath: string
-  anthropicApiKey: string | null
+  /** Ollama base URL used for distillation. */
+  ollamaBaseUrl: string
+  /** Ollama model used for distillation. */
+  ollamaModel: string
   /** Override of the default 7 verified roots (added by --root). */
   extraRoots: string[]
   /** Verbose — log every file decision. */
@@ -183,11 +189,45 @@ export const HUGE_DOC_BYTES = 500 * 1024  // fallback paragraph chunking
 export const PARAGRAPH_CHUNK_BYTES = 3 * 1024
 export const MAX_CLAIMS_PER_DOC = 8
 
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
 /**
- * Anthropic distillation model.
- * Override via ANTHROPIC_HAIKU_MODEL env var so ops can swap without a code change.
+ * Distillation budgets for the local model. Deliberately looser than the
+ * classifier's: a whole-document extraction emits up to ~2000 tokens, which a
+ * cold qwen3:8b can take tens of seconds to produce on the M1.
  */
-export const HAIKU_MODEL = process.env.ANTHROPIC_HAIKU_MODEL || 'claude-haiku-4-5-20251001'
+export const DISTILL_TIMEOUT_MS = envInt('OLLAMA_DISTILL_TIMEOUT_MS', 120_000)
+/** Token cap for one distillation response (mirrors the old max_tokens: 2000). */
+export const DISTILL_NUM_PREDICT = envInt('OLLAMA_DISTILL_NUM_PREDICT', 2_000)
+/** Token cap for the chunk-summary merge response (mirrors the old max_tokens: 800). */
+export const MERGE_NUM_PREDICT = envInt('OLLAMA_MERGE_NUM_PREDICT', 800)
+/** Low temperature — this is structured extraction, not writing. */
+export const DISTILL_TEMPERATURE = 0.2
+
+/**
+ * A local-model call: prompt in, raw text out, `numPredict` capping the
+ * response. Null means the model never answered (unreachable, timed out, or a
+ * malformed payload) — the caller decides the fallback.
+ *
+ * Injected rather than imported at the call site so distillation can be driven
+ * in tests without an Ollama host.
+ */
+export type GenerateFn = (prompt: string, numPredict: number) => Promise<string | null>
+
+/** Bind an OllamaInference instance to the distillation budget. */
+export function makeGenerate(inference: OllamaInference): GenerateFn {
+  return (prompt, numPredict) =>
+    inference.generate(prompt, {
+      timeoutMs: DISTILL_TIMEOUT_MS,
+      numPredict,
+      temperature: DISTILL_TEMPERATURE
+    })
+}
 
 // ─── Pure helpers (unit-testable) ──────────────────────────────────────────────
 
@@ -703,7 +743,7 @@ export class KmsHttpClient {
   }
 }
 
-// ─── Distillation (Anthropic Haiku) ────────────────────────────────────────────
+// ─── Distillation (local Ollama model) ────────────────────────────────────────
 
 /** Build the distillation prompt. */
 export function buildDistillPrompt(content: string): string {
@@ -758,7 +798,7 @@ ${chunkSummaries.map((s, i) => `--- Chunk ${i + 1} ---\n${s}`).join('\n\n')}`
 }
 
 /**
- * Strip code fences from model output. Haiku occasionally wraps JSON in
+ * Strip code fences from model output. Models occasionally wrap JSON in
  * ```json ... ``` even when told not to.
  */
 export function stripCodeFences(s: string): string {
@@ -769,11 +809,13 @@ export function stripCodeFences(s: string): string {
 }
 
 /**
- * Distill a single doc (or chunk) via Haiku. Retries once on JSON parse failure
- * with a stricter prompt. On second failure, throws (caller decides fallback).
+ * Distill a single doc (or chunk) via the local model. Retries once on JSON
+ * parse failure with a stricter prompt. On second failure, throws (caller
+ * decides fallback). A transport failure throws immediately — retrying a dead
+ * model just doubles the timeout.
  */
 export async function distillOnce(
-  anthropic: any,
+  generate: GenerateFn,
   content: string,
   retry = false
 ): Promise<Distillation> {
@@ -781,22 +823,17 @@ export async function distillOnce(
     ? `${buildDistillPrompt(content)}\n\n!!! Your previous response was not valid JSON. Output ONLY the JSON object, no fences, no prose. !!!`
     : buildDistillPrompt(content)
 
-  const resp = await anthropic.messages.create({
-    model: HAIKU_MODEL,
-    max_tokens: 2000,
-    messages: [{ role: 'user', content: prompt }]
-  })
-  const text = resp.content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
-    .join('')
+  const text = await generate(prompt, DISTILL_NUM_PREDICT)
+  if (text === null) {
+    throw new Error('local model returned no response (is Ollama reachable?)')
+  }
   const stripped = stripCodeFences(text)
   try {
     const parsed = JSON.parse(stripped)
     return validateDistillation(parsed)
   } catch (err) {
     if (!retry) {
-      return distillOnce(anthropic, content, true)
+      return distillOnce(generate, content, true)
     }
     throw err
   }
@@ -804,20 +841,20 @@ export async function distillOnce(
 
 /** Distill — chunked path. Always returns a Distillation, possibly empty claims. */
 export async function distillDocument(
-  anthropic: any,
+  generate: GenerateFn,
   content: string
 ): Promise<Distillation> {
   const wordCount = approxWordCount(content)
   const isLong = content.length > LONG_DOC_BYTES || wordCount > LONG_DOC_WORDS
   if (!isLong) {
-    return distillOnce(anthropic, content)
+    return distillOnce(generate, content)
   }
 
   const chunks = chunkLongDoc(content)
   const perChunk: Distillation[] = []
   for (const chunk of chunks) {
     try {
-      perChunk.push(await distillOnce(anthropic, chunk))
+      perChunk.push(await distillOnce(generate, chunk))
     } catch (err) {
       // skip bad chunk — keep going
       console.warn(`  ⚠️  chunk distill failed: ${(err as Error).message.slice(0, 200)}`)
@@ -834,25 +871,18 @@ export async function distillDocument(
   allClaims.sort((a, b) => confidenceRank[a.qualitative_confidence] - confidenceRank[b.qualitative_confidence])
   const claims = allClaims.slice(0, MAX_CLAIMS_PER_DOC)
 
-  // Merge summaries via a final Haiku call
+  // Merge summaries via a final model call
   const mergePrompt = buildMergePrompt(perChunk.map(p => p.summary))
-  const resp = await anthropic.messages.create({
-    model: HAIKU_MODEL,
-    max_tokens: 800,
-    messages: [{ role: 'user', content: mergePrompt }]
-  })
-  const text = resp.content
-    .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
-    .join('')
-  const stripped = stripCodeFences(text)
+  const mergeText = await generate(mergePrompt, MERGE_NUM_PREDICT)
   let summary = ''
   try {
-    summary = JSON.parse(stripped).summary || ''
+    if (mergeText === null) throw new Error('no response')
+    summary = JSON.parse(stripCodeFences(mergeText)).summary || ''
   } catch {
     // fallback: use the first chunk's summary
     summary = perChunk[0].summary
   }
+  if (!summary) summary = perChunk[0].summary
   return { summary, claims }
 }
 
@@ -872,7 +902,8 @@ export function parseArgs(argv: string[]): CliOptions {
     bearerToken: process.env.KMS_BEARER_TOKEN || null,
     kmsUrl: process.env.KMS_URL || DEFAULT_KMS_URL,
     syncLogPath: DEFAULT_SYNC_LOG,
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
+    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+    ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     verbose: false
   }
   for (let i = 0; i < argv.length; i++) {
@@ -960,7 +991,8 @@ Default roots:
 ${DEFAULT_ROOTS.map(r => '  ' + r).join('\n')}
 
 Required environment:
-  ANTHROPIC_API_KEY       Used for Haiku distillation
+  OLLAMA_BASE_URL         (optional) default http://localhost:11434
+  OLLAMA_MODEL            (optional) default ${DEFAULT_OLLAMA_MODEL} — used for distillation
   KMS_BEARER_TOKEN        (optional) sent to KMS as Authorization: Bearer <…>
 `)
 }
@@ -1002,9 +1034,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     (opts.includeLightWork ? ' + Light_Work[UNTRUSTED]' : '') +
     (opts.includeL16ReverseEng ? ' + L16_Lumen_ReverseEngineering[trusted]' : ''))
 
-  // 1. Validate prerequisites
-  if (!opts.dryRun && !opts.anthropicApiKey) {
-    console.error('❌ ANTHROPIC_API_KEY env var required (or use --dry-run for planning).')
+  // 1. Validate prerequisites — the model must actually answer, not merely be
+  //    configured. A key check could not tell the difference; Ollama can be
+  //    configured and down, and it runs on another host on the LAN.
+  const ollama = new OllamaInference(opts.ollamaBaseUrl, opts.ollamaModel)
+  console.log(`Distiller:     Ollama ${opts.ollamaModel} @ ${opts.ollamaBaseUrl}`)
+  if (!opts.dryRun && !(await ollama.isAvailable())) {
+    console.error(`❌ Ollama unreachable at ${opts.ollamaBaseUrl} — distillation needs it.`)
+    console.error('   Start Ollama and pull the model, or use --dry-run for planning.')
     process.exit(1)
   }
 
@@ -1074,9 +1111,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return
   }
 
-  // 8. Lazy-import the Anthropic SDK (only if not dry-run)
-  const { default: Anthropic } = await import('@anthropic-ai/sdk')
-  const anthropic = new Anthropic({ apiKey: opts.anthropicApiKey! })
+  // 8. Bind the distillation transport (local Ollama — no cloud SDK to load)
+  const generate = makeGenerate(ollama)
 
   // 9. Process files (max 2 concurrent distillations)
   const CONCURRENCY = 2
@@ -1091,7 +1127,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const { file, hash, action, priorEntry } = item
       try {
         const content = await fs.readFile(file.absolutePath, 'utf8')
-        await processFile(client!, anthropic, file, content, hash, action, priorEntry, syncLog, stats)
+        await processFile(client!, generate, file, content, hash, action, priorEntry, syncLog, stats)
         flushSyncLog()
         const total = idx + 1
         if (total % 5 === 0 || total === toProcess.length) {
@@ -1135,7 +1171,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 /** Process one file end-to-end (distill + store whole-doc + store claims). */
 async function processFile(
   client: KmsHttpClient,
-  anthropic: any,
+  generate: GenerateFn,
   file: FileRecord,
   content: string,
   hash: string,
@@ -1153,7 +1189,7 @@ async function processFile(
   let distillation: Distillation
   let partial = false
   try {
-    distillation = await distillDocument(anthropic, content)
+    distillation = await distillDocument(generate, content)
   } catch (err) {
     console.warn(`  ⚠️  distill failed for ${filename} — storing whole-doc only. (${(err as Error).message.slice(0, 120)})`)
     // Synthesize a degenerate summary: first 1k chars truncated + filename

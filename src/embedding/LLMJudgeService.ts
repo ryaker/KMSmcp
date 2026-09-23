@@ -53,7 +53,7 @@ const ALL_RELATIONS: readonly LLMRelation[] = [
  * level (same pair → same answer) but the cache makes that less load-bearing.
  */
 export interface LLMJudgeService {
-  /** Stable model identifier for audit logs. e.g. 'claude-haiku-4-5-20251001'. */
+  /** Stable model identifier for audit logs. e.g. 'qwen3.5:9b-mlx'. */
   readonly modelId: string
 
   /**

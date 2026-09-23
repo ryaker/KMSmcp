@@ -9,7 +9,7 @@
  *     stop the whole batch — we test the per-meeting boundary in processMeeting,
  *     and verify the batch loop in runImport rolls forward across mixed outcomes)
  *
- * No live KMS, no live Anthropic API. Everything is mocked at the seam.
+ * No live KMS, no live Ollama. Everything is mocked at the seam.
  */
 
 import {
@@ -350,9 +350,12 @@ class FakeGranolaSource implements GranolaSource {
 
 class FakeDistiller implements DistillerLike {
   constructor(private overrides: Partial<DistilledMeeting> = {}, private throwOn?: string) {}
+  async isAvailable(): Promise<boolean> {
+    return true
+  }
   async distill(meeting: any): Promise<DistilledMeeting> {
     if (this.throwOn && meeting.id === this.throwOn) {
-      throw new Error('haiku exploded')
+      throw new Error('local model exploded')
     }
     return {
       summary: this.overrides.summary ?? `summary for ${meeting.title}`,
@@ -485,7 +488,7 @@ describe('processMeeting', () => {
       log: { completed: [] }
     })
     expect(result.status).toBe('failed')
-    expect(result.reason).toContain('haiku exploded')
+    expect(result.reason).toContain('local model exploded')
     // No KMS calls — distillation gates the write path
     expect(kms.calls).toHaveLength(0)
   })
@@ -651,7 +654,7 @@ function defaultOpts(): any {
     kmsUrl: 'http://localhost:8180/mcp',
     syncLogPath: '/tmp/test-sync.json',
     userId: 'test-user',
-    anthropicModel: 'claude-haiku-4-5',
+    ollamaModel: 'qwen3:8b',
     dryRun: true
   }
 }

@@ -75,7 +75,7 @@ const build = (similarity: number | null, decision?: { engine?: DecisionEngine |
     embed: jest.fn().mockResolvedValue(unitVec()), isAvailable: jest.fn().mockResolvedValue(true),
   } as unknown as EmbeddingService
   const judge = {
-    modelId: 'claude-haiku-4-5-20251001',
+    modelId: 'qwen3:8b',
     classify: jest.fn().mockResolvedValue('contradicts'), isAvailable: jest.fn().mockResolvedValue(true),
   } as unknown as LLMJudgeService
   const tool = new UnifiedStoreTool(router, { mongodb: mongo, graph, mem0 }, cache, null, null, embedder, judge, decision)

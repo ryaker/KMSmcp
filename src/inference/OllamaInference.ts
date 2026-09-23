@@ -1,3 +1,12 @@
+/**
+ * The one default local model for every Ollama consumer in this repo: storage
+ * router, dedup judge, CLI and the three importers. Change it here, not at call
+ * sites — nine hard-coded copies are how the judge stayed on qwen3:8b after it
+ * was outclassed. Must fit rym1 (M1, 16 GB shared with CI: ~9 GB ceiling).
+ * Every consumer still honours OLLAMA_MODEL as an override.
+ */
+export const DEFAULT_OLLAMA_MODEL = 'gemma4:12b-mlx'
+
 export interface ClassifyResult {
   targets: Array<'mem0' | 'mongodb' | 'graph'>
   contentType: 'episodic' | 'procedural' | 'relational' | 'factual' | 'insight'
@@ -8,6 +17,19 @@ export interface EntityMention {
   id: string
   name: string
   aliases?: string[]
+}
+
+/** Options for a single-shot generation. */
+export interface GenerateOptions {
+  /** Per-call timeout in ms. */
+  timeoutMs?: number
+  /**
+   * Cap on generated tokens. Ollama's own default is small, so any caller that
+   * expects more than a one-line answer must set this explicitly.
+   */
+  numPredict?: number
+  /** Sampling temperature. Lower is better for structured extraction. */
+  temperature?: number
 }
 
 /**
@@ -44,7 +66,7 @@ export class OllamaInference {
 
   constructor(
     private baseUrl = 'http://localhost:11434',
-    private model = 'qwen3:8b'
+    private model = DEFAULT_OLLAMA_MODEL
   ) {}
 
   async isAvailable(): Promise<boolean> {
@@ -96,7 +118,7 @@ Rules:
 
 Text: "${content.slice(0, 500)}"`
 
-    const raw = await this.callOllama(prompt, CLASSIFY_TIMEOUT_MS)
+    const raw = await this.callOllama(prompt, { timeoutMs: CLASSIFY_TIMEOUT_MS })
     if (raw === null) {
       return null
     }
@@ -160,7 +182,7 @@ Candidates: ${JSON.stringify(candidates.slice(0, 30))}
 
 Text: "${content.slice(0, 600)}"`
 
-    const raw = await this.callOllama(prompt, ENTITY_TIMEOUT_MS)
+    const raw = await this.callOllama(prompt, { timeoutMs: ENTITY_TIMEOUT_MS })
     if (raw === null) {
       return []
     }
@@ -186,15 +208,43 @@ Text: "${content.slice(0, 600)}"`
     }
   }
 
-  private async callOllama(prompt: string, timeoutMs: number): Promise<string | null> {
+  /**
+   * Generic single-shot generation.
+   *
+   * Exposed so the distillation importers (markdown corpus, Slack huddles) can
+   * reach the local model through this class instead of opening their own
+   * connection — one module owns the Ollama wire format, one place applies
+   * `think: false` and the timeout budget.
+   *
+   * Returns null on any transport failure (non-200, timeout, malformed payload).
+   * Callers decide the fallback; distillation treats null as "no model".
+   */
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<string | null> {
+    return this.callOllama(prompt, options)
+  }
+
+  private async callOllama(prompt: string, options: GenerateOptions): Promise<string | null> {
+    // Defaults preserve the original classify/entity behaviour when no options
+    // are supplied; the distillation path overrides both.
+    const timeoutMs = options.timeoutMs ?? CLASSIFY_TIMEOUT_MS
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
 
     try {
+      const ollamaOptions: Record<string, number> = {}
+      if (typeof options.numPredict === 'number') ollamaOptions.num_predict = options.numPredict
+      if (typeof options.temperature === 'number') ollamaOptions.temperature = options.temperature
+
       const response = await fetch(`${this.baseUrl}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: this.model, prompt, stream: false, think: false }),
+        body: JSON.stringify({
+          model: this.model,
+          prompt,
+          stream: false,
+          think: false,
+          ...(Object.keys(ollamaOptions).length > 0 ? { options: ollamaOptions } : {})
+        }),
         signal: controller.signal,
       })
 

@@ -21,11 +21,11 @@ import { FACTCache } from './cache/FACTCache.js'
 import { RedisKeepAlive } from './cache/RedisKeepAlive.js'
 import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js'
-import { OllamaInference } from './inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL } from './inference/OllamaInference.js'
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js'
 import { EntityLinker } from './inference/EntityLinker.js'
 import { OllamaEmbeddingService } from './embedding/EmbeddingService.js'
-import { AnthropicHaikuJudge } from './embedding/AnthropicHaikuJudge.js'
+import { OllamaJudge } from './embedding/OllamaJudge.js'
 import type { LLMJudgeService } from './embedding/LLMJudgeService.js'
 import { MongoDBStorage, Mem0Storage, SparrowDBStorage, resolveSparrowDBPath } from './storage/index.js'
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js'
@@ -153,7 +153,7 @@ export class UnifiedKMSServer {
     console.log('🤖 Initializing Ollama Inference Layer...')
     const ollamaInference = new OllamaInference(
       process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
-      process.env.OLLAMA_MODEL || 'qwen3:8b'
+      process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL
     )
     const ollamaRouter = new OllamaStorageRouter(ollamaInference, this.router)
 
@@ -175,21 +175,19 @@ export class UnifiedKMSServer {
     })
 
     // LLM judge for the dedup gate's Tier 2 borderline classification
-    // (DG-T2-A, issue #49). Optional — when ANTHROPIC_API_KEY is missing we
-    // pass null and the gate degrades gracefully (every candidate gets
-    // `llm_relation: null`). API key is Doppler-injected in production.
-    let llmJudge: LLMJudgeService | null = null
-    if (process.env.ANTHROPIC_API_KEY) {
-      console.log('🤖 Initializing LLM Judge (Claude Haiku 4.5)...')
-      llmJudge = new AnthropicHaikuJudge({
-        apiKey: process.env.ANTHROPIC_API_KEY
-      })
-    } else {
-      console.warn(
-        '⚠️  ANTHROPIC_API_KEY not set — Tier 2 dedup classifier disabled. ' +
-        'Confirm-band candidates will return llm_relation=null.'
-      )
-    }
+    // (DG-T2-A, issue #49). Runs on the same local Ollama host as the
+    // inference and embedding layers — no cloud credential, no per-call cost.
+    // Constructed unconditionally: whether the model actually answers is
+    // settled by the judge's own reachability probe, not by an env var. If
+    // Ollama is down, classify() throws and candidates keep
+    // `llm_relation: null` — the gate still ships.
+    console.log(
+      `🤖 Initializing LLM Judge (Ollama ${process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL})...`
+    )
+    const llmJudge: LLMJudgeService = new OllamaJudge({
+      baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+      model: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL
+    })
 
     // Step 4: Initialize tools
     console.log('🛠️  Initializing Tools...')

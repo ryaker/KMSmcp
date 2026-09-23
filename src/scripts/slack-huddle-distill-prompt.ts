@@ -1,7 +1,7 @@
 /**
  * Slack Huddle → KMS distillation prompt and types.
  *
- * The Haiku 4.5 (claude-haiku-4-5-20251001) call must return a JSON object
+ * The local Ollama model's call must return a JSON object
  * matching `DistilledHuddle`. The prompt enforces:
  *   - One ~150–300 word `summary` (the whole-huddle entry's content)
  *   - 2–5 `claims`, each a self-contained typed thought (OB1 6-type taxonomy)
