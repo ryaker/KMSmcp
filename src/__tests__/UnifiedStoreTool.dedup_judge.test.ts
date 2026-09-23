@@ -96,7 +96,7 @@ describe('DG-T2-A — UnifiedStoreTool LLM judge wiring (issue #49)', () => {
     } as unknown as jest.Mocked<EmbeddingService>
 
     judge = {
-      modelId: 'claude-haiku-4-5-20251001',
+      modelId: 'qwen3:8b',
       classify: jest.fn().mockResolvedValue('complement' as LLMRelation),
       isAvailable: jest.fn().mockResolvedValue(true)
     } as unknown as jest.Mocked<LLMJudgeService>
@@ -598,145 +598,174 @@ describe('LRUCache', () => {
 })
 
 // ===========================================================================
-// AnthropicHaikuJudge — integration tests with a fake SDK client.
+// OllamaJudge — integration tests with a fake fetch transport.
 // ===========================================================================
 
-describe('AnthropicHaikuJudge', () => {
-  // Lazy-import so jest doesn't fail collecting this file when the SDK isn't
-  // present (it always is in this repo, but the pattern is safer).
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
+describe('OllamaJudge', () => {
+  const okResponse = (payload: unknown) =>
+    ({ ok: true, status: 200, json: async () => payload }) as unknown as Response
 
-  it('caches identical (newContent, candidateContent) pairs (no duplicate API calls)', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  const failResponse = (status: number) =>
+    ({ ok: false, status, json: async () => ({}) }) as unknown as Response
 
-    const fakeCreate = jest.fn().mockResolvedValue({
-      content: [{ type: 'text', text: 'complement' }]
-    })
-    const fakeClient = { messages: { create: fakeCreate } } as any
+  it('caches identical (newContent, candidateContent) pairs (one inference)', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ response: 'complement' }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
 
     const a = await j.classify({ newContent: 'X', candidateContent: 'Y' })
     const b = await j.classify({ newContent: 'X', candidateContent: 'Y' })
     const c = await j.classify({ newContent: 'X', candidateContent: 'Y' })
 
-    expect(a).toBe('complement')
-    expect(b).toBe('complement')
-    expect(c).toBe('complement')
-    // Cached after first call — only one underlying API hit.
-    expect(fakeCreate).toHaveBeenCalledTimes(1)
+    expect([a, b, c]).toEqual(['complement', 'complement', 'complement'])
+    // Cached after first call — only one underlying inference.
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
   })
 
-  it('different content pairs each hit the API once', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  it('different content pairs each hit the model once', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const fakeCreate = jest.fn().mockResolvedValue({
-      content: [{ type: 'text', text: 'unrelated' }]
-    })
-    const fakeClient = { messages: { create: fakeCreate } } as any
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ response: 'unrelated' }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
 
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
     await j.classify({ newContent: 'A', candidateContent: 'B' })
     await j.classify({ newContent: 'A', candidateContent: 'C' })
     await j.classify({ newContent: 'D', candidateContent: 'B' })
 
-    expect(fakeCreate).toHaveBeenCalledTimes(3)
+    expect(fakeFetch).toHaveBeenCalledTimes(3)
   })
 
-  it('isAvailable() = false when no API key is configured', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  it('isAvailable() = true when the Ollama probe succeeds', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const prevKey = process.env.ANTHROPIC_API_KEY
-    delete process.env.ANTHROPIC_API_KEY
-    try {
-      // Inject a fake client so the SDK doesn't reject on missing key during
-      // construction — we want to test the isAvailable() short-circuit.
-      const fakeClient = { messages: { create: jest.fn() } } as any
-      const j = new AnthropicHaikuJudge({ client: fakeClient })
-      expect(await j.isAvailable()).toBe(false)
-    } finally {
-      if (prevKey !== undefined) process.env.ANTHROPIC_API_KEY = prevKey
-    }
-  })
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ models: [] }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
 
-  it('isAvailable() = true when API key is configured', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
-
-    const fakeClient = { messages: { create: jest.fn() } } as any
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
     expect(await j.isAvailable()).toBe(true)
+    expect(String(fakeFetch.mock.calls[0][0])).toContain('/api/tags')
+  })
+
+  it('isAvailable() = false when Ollama is unreachable, and does not re-probe within the failure TTL', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
+
+    const fakeFetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
+
+    expect(await j.isAvailable()).toBe(false)
+    expect(await j.isAvailable()).toBe(false)
+    // Second call is served from the negative cache — a probe per candidate
+    // would otherwise burn the timeout on every confirm-band candidate.
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('isAvailable() = false on a non-200 probe', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
+
+    const fakeFetch = jest.fn().mockResolvedValue(failResponse(500))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
+
+    expect(await j.isAvailable()).toBe(false)
   })
 
   it('parses raw model response leniently (strips surrounding text)', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const fakeCreate = jest.fn().mockResolvedValue({
-      // Model returned a phrase instead of a single word — parser should
-      // still extract the relation token.
-      content: [{ type: 'text', text: 'The answer is contradicts.' }]
-    })
-    const fakeClient = { messages: { create: fakeCreate } } as any
+    // The model returned a phrase instead of a single word — the parser should
+    // still extract the relation token.
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ response: 'The answer is contradicts.' }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
 
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
-    const r = await j.classify({ newContent: 'X', candidateContent: 'Y' })
-    expect(r).toBe('contradicts')
+    expect(await j.classify({ newContent: 'X', candidateContent: 'Y' })).toBe('contradicts')
   })
 
-  it('returns "unrelated" when response is unparseable (safe fallback)', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  it('returns "unrelated" when the response is unparseable (safe fallback)', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const fakeCreate = jest.fn().mockResolvedValue({
-      content: [{ type: 'text', text: 'I have no idea what these are' }]
-    })
-    const fakeClient = { messages: { create: fakeCreate } } as any
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ response: 'I have no idea what these are' }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
 
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
-    const r = await j.classify({ newContent: 'X', candidateContent: 'Y' })
-    expect(r).toBe('unrelated')
+    expect(await j.classify({ newContent: 'X', candidateContent: 'Y' })).toBe('unrelated')
   })
 
-  it('returns "unrelated" without API call on empty content (defensive)', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  it('returns "unrelated" without an inference on empty content (defensive)', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const fakeCreate = jest.fn()
-    const fakeClient = { messages: { create: fakeCreate } } as any
+    const fakeFetch = jest.fn()
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
 
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
     expect(await j.classify({ newContent: '', candidateContent: 'Y' })).toBe('unrelated')
     expect(await j.classify({ newContent: 'X', candidateContent: '' })).toBe('unrelated')
-    expect(fakeCreate).not.toHaveBeenCalled()
+    expect(fakeFetch).not.toHaveBeenCalled()
   })
 
-  it('passes the configured model id and includes both contents in the prompt', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  it('sends the configured model, both contents, and disables thinking', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const fakeCreate = jest.fn().mockResolvedValue({
-      content: [{ type: 'text', text: 'duplicate' }]
-    })
-    const fakeClient = { messages: { create: fakeCreate } } as any
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ response: 'duplicate' }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any, model: 'qwen3-test-model' })
 
-    const j = new AnthropicHaikuJudge({
-      apiKey: 'test-key',
-      client: fakeClient,
-      model: 'claude-haiku-test-model'
-    })
     await j.classify({ newContent: 'NEW_TEXT_PAYLOAD', candidateContent: 'OLD_TEXT_PAYLOAD' })
 
-    expect(fakeCreate).toHaveBeenCalledTimes(1)
-    const callArgs = fakeCreate.mock.calls[0][0]
-    expect(callArgs.model).toBe('claude-haiku-test-model')
-    expect(callArgs.system).toContain('classifier')
-    expect(callArgs.messages[0].content).toContain('NEW_TEXT_PAYLOAD')
-    expect(callArgs.messages[0].content).toContain('OLD_TEXT_PAYLOAD')
-    // Default modelId reads from constructor argument
-    expect(j.modelId).toBe('claude-haiku-test-model')
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+    const [url, init] = fakeFetch.mock.calls[0]
+    const body = JSON.parse(init.body)
+
+    expect(String(url)).toContain('/api/generate')
+    expect(body.model).toBe('qwen3-test-model')
+    expect(body.stream).toBe(false)
+    // qwen3 is a reasoning model; without think:false its thinking block would
+    // consume the whole response.
+    expect(body.think).toBe(false)
+    expect(body.prompt).toContain('classifier')
+    expect(body.prompt).toContain('NEW_TEXT_PAYLOAD')
+    expect(body.prompt).toContain('OLD_TEXT_PAYLOAD')
+    expect(j.modelId).toBe('qwen3-test-model')
   })
 
-  it('default model id matches the spec (claude-haiku-4-5-20251001)', async () => {
-    const { AnthropicHaikuJudge } = await import('../embedding/AnthropicHaikuJudge.js')
+  it('default model id is the local Ollama model (qwen3:8b)', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
 
-    const fakeClient = { messages: { create: jest.fn() } } as any
-    const j = new AnthropicHaikuJudge({ apiKey: 'test-key', client: fakeClient })
-    expect(j.modelId).toBe('claude-haiku-4-5-20251001')
+    const prevModel = process.env.OLLAMA_MODEL
+    delete process.env.OLLAMA_MODEL
+    try {
+      const j = new OllamaJudge({ fetchImpl: jest.fn() as any })
+      expect(j.modelId).toBe('qwen3:8b')
+    } finally {
+      if (prevModel !== undefined) process.env.OLLAMA_MODEL = prevModel
+    }
+  })
+
+  it('throws on a non-200 classify response (caller leaves llm_relation null)', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
+
+    const fakeFetch = jest.fn().mockResolvedValue(failResponse(503))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
+
+    await expect(
+      j.classify({ newContent: 'X', candidateContent: 'Y' })
+    ).rejects.toThrow(/non-200/)
+  })
+
+  it('throws when the response payload has no text field', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
+
+    const fakeFetch = jest.fn().mockResolvedValue(okResponse({ done: true }))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
+
+    await expect(
+      j.classify({ newContent: 'X', candidateContent: 'Y' })
+    ).rejects.toThrow(/response field/)
+  })
+
+  it('throws on transport failure so the gate response still ships', async () => {
+    const { OllamaJudge } = await import('../embedding/OllamaJudge.js')
+
+    const fakeFetch = jest.fn().mockRejectedValue(new Error('network down'))
+    const j = new OllamaJudge({ fetchImpl: fakeFetch as any })
+
+    await expect(
+      j.classify({ newContent: 'X', candidateContent: 'Y' })
+    ).rejects.toThrow('network down')
   })
 })

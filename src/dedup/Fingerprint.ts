@@ -19,12 +19,14 @@
  *      Tier 0's normalize() collapses these to the same fingerprint.
  *   2. **Latency short-circuit.** A fingerprint check is an O(n) scan of
  *      the in-memory sidecar (~1200 entries → ~0.1 ms). The Tier 1 path
- *      is HNSW search (1-3 ms) + JS post-filter + (sometimes) Anthropic
- *      Haiku 4.5 round-trip (5 s timeout). Tier 0 catches the easy cases
+ *      is HNSW search (1-3 ms) + JS post-filter + (sometimes) a local
+ *      Ollama judge round-trip (8 s timeout, first call after model
+ *      eviction pays a multi-second load). Tier 0 catches the easy cases
  *      for free.
- *   3. **Exact-match certainty.** When the LLM judge or the embedder is
- *      down (Ollama unreachable, ANTHROPIC_API_KEY unset), Tier 0 still
- *      catches identical re-stores. Useful for batch importers and the
+ *   3. **Exact-match certainty.** The embedder and the Tier 2 judge are
+ *      both local Ollama services on the same host, so one unreachable
+ *      Ollama disables both at once. Tier 0 still catches identical
+ *      re-stores in that window. Useful for batch importers and the
  *      "user accidentally hit submit twice" case.
  *
  * The fingerprint is stored in `metadata.fingerprint` on the new entry so

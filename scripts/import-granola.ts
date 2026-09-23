@@ -74,7 +74,7 @@
  *   #   --kms-url http://localhost:8180/mcp                             (default)
  *   #   --sync-log ~/.kms-granola-sync.json                             (default)
  *   #   --user-id richard_yaker                                         (default — must match KMS_DEFAULT_USER_ID)
- *   #   --anthropic-model claude-haiku-4-5                              (default)
+ *   #   --ollama-model qwen3:8b                                         (default)
  *   #   --dry-run                                                       (skip the actual KMS writes; log what would happen)
  *   #   --max-meetings <N>                                              (cap, useful for smoke-testing)
  *
@@ -100,10 +100,10 @@
  *   }
  */
 
-import Anthropic from '@anthropic-ai/sdk'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { OllamaInference } from '../src/inference/OllamaInference.js'
 import {
   buildDistillPrompt,
   DistilledMeeting,
@@ -157,7 +157,7 @@ interface CliOptions {
   kmsUrl: string
   syncLogPath: string
   userId: string
-  anthropicModel: string
+  ollamaModel: string
   dryRun: boolean
   maxMeetings?: number
   bearerToken?: string
@@ -174,7 +174,7 @@ export function parseArgs(argv: string[]): CliOptions {
     kmsUrl: process.env.KMS_URL || 'http://localhost:8180/mcp',
     syncLogPath: process.env.KMS_GRANOLA_SYNC_LOG || join(homedir(), '.kms-granola-sync.json'),
     userId: process.env.KMS_DEFAULT_USER_ID || 'richard_yaker',
-    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5',
+    ollamaModel: process.env.OLLAMA_MODEL || 'qwen3:8b',
     dryRun: false,
     bearerToken: process.env.KMS_BEARER_TOKEN
   }
@@ -211,7 +211,7 @@ export function parseArgs(argv: string[]): CliOptions {
       case '--kms-url':            opts.kmsUrl = next('--kms-url'); break
       case '--sync-log':           opts.syncLogPath = next('--sync-log'); break
       case '--user-id':            opts.userId = next('--user-id'); break
-      case '--anthropic-model':    opts.anthropicModel = next('--anthropic-model'); break
+      case '--ollama-model':       opts.ollamaModel = next('--ollama-model'); break
       case '--bearer-token':       opts.bearerToken = next('--bearer-token'); break
       case '--dry-run':            opts.dryRun = true; break
       case '--max-meetings': {
@@ -268,7 +268,7 @@ Options:
   --kms-url <url>           default: http://localhost:8180/mcp
   --sync-log <path>         default: ~/.kms-granola-sync.json
   --user-id <id>            default: richard_yaker (or KMS_DEFAULT_USER_ID env)
-  --anthropic-model <id>    default: claude-haiku-4-5
+  --ollama-model <id>       default: qwen3:8b (or OLLAMA_MODEL env)
   --bearer-token <token>    Bypass OAuth client-credentials, pass token directly.
                             Or set KMS_BEARER_TOKEN env var.
   --dry-run                 Don't actually write to KMS. Log what would happen.
@@ -277,9 +277,10 @@ Options:
 
 Environment:
   KMS_BEARER_TOKEN          Preferred OAuth path for one-off runs.
-  ANTHROPIC_API_KEY         Required (Haiku 4.5 distillation).
   KMS_URL                   Override --kms-url.
   KMS_DEFAULT_USER_ID       Default --user-id.
+  OLLAMA_BASE_URL           Local model host (default: http://localhost:11434).
+  OLLAMA_MODEL              Local model for distillation (default: qwen3:8b).
 
   When KMS_BEARER_TOKEN is unset, the script falls back to Auth0 client_credentials
   using OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_TOKEN_ENDPOINT, OAUTH_AUDIENCE
@@ -566,20 +567,36 @@ export class FileGranolaSource implements GranolaSource {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Distillation — Haiku 4.5 via @anthropic-ai/sdk
+// Distillation — local Ollama model
 // ─────────────────────────────────────────────────────────────────────────
 
+/** Token cap for one meeting distillation (mirrors the old max_tokens: 2048). */
+const DISTILL_NUM_PREDICT = Number.parseInt(process.env.OLLAMA_DISTILL_NUM_PREDICT || '', 10) || 2048
+/** A transcript is long, and a cold model pays a multi-second load first. */
+const DISTILL_TIMEOUT_MS = Number.parseInt(process.env.OLLAMA_DISTILL_TIMEOUT_MS || '', 10) || 120_000
+/** Structured extraction, not writing. */
+const DISTILL_TEMPERATURE = 0.2
+
 export interface DistillerLike {
+  /**
+   * Can this distiller actually work? Replaces the old "is ANTHROPIC_API_KEY
+   * set?" credential check with a route to the backend itself — a set key
+   * proved nothing about reachability, and an unset one is no longer fatal.
+   */
+  isAvailable(): Promise<boolean>
   distill(meeting: RawMeeting): Promise<DistilledMeeting>
 }
 
-export class HaikuDistiller implements DistillerLike {
-  private client: Anthropic
-  private model: string
+export class OllamaDistiller implements DistillerLike {
+  private inference: OllamaInference
 
-  constructor(apiKey: string, model: string) {
-    this.client = new Anthropic({ apiKey })
-    this.model = model
+  constructor(baseUrl: string, model: string) {
+    this.inference = new OllamaInference(baseUrl, model)
+  }
+
+  /** Reachability probe — the CLI gate uses this instead of a credential check. */
+  async isAvailable(): Promise<boolean> {
+    return this.inference.isAvailable()
   }
 
   async distill(meeting: RawMeeting): Promise<DistilledMeeting> {
@@ -590,16 +607,16 @@ export class HaikuDistiller implements DistillerLike {
       transcript: meeting.transcript
     })
 
-    const resp = await this.client.messages.create({
-      model: this.model,
-      max_tokens: 2048,
-      system,
-      messages: [{ role: 'user', content: user }]
+    // /api/generate carries a single prompt, so the system instruction is
+    // concatenated ahead of the user turn.
+    const text = await this.inference.generate(`${system}\n\n${user}`, {
+      timeoutMs: DISTILL_TIMEOUT_MS,
+      numPredict: DISTILL_NUM_PREDICT,
+      temperature: DISTILL_TEMPERATURE
     })
-
-    // resp.content[0] is a text block when Haiku follows the prompt.
-    const block = resp.content?.[0] as any
-    const text = block?.type === 'text' ? block.text : ''
+    if (text === null) {
+      throw new Error('local model returned no response (is Ollama reachable?)')
+    }
     return parseDistilledResponse(text)
   }
 }
@@ -818,7 +835,7 @@ export async function runImport(deps: ImporterDeps): Promise<ImportReport> {
         report.claims += result.claimEntryIds?.length ?? 0
         deps.log.completed.push(meeting.id)
         // Save sync log immediately after each success — partial progress is
-        // valuable, especially for long Haiku-bound runs.
+        // valuable, especially for long distillation-bound runs.
         if (!deps.opts.dryRun) {
           saveSyncLog(deps.opts.syncLogPath, deps.log)
           // Advance the source's watermark (if any) so cron-mode skips on next run.
@@ -892,12 +909,7 @@ async function main(): Promise<void> {
     sinceDate = d
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey && !opts.dryRun) {
-    console.error('❌ ANTHROPIC_API_KEY env var is required (Haiku 4.5 distillation).')
-    console.error('   Set it directly or via doppler. Use --dry-run to skip distillation.')
-    process.exit(2)
-  }
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
 
   console.log(`🚀 Granola → KMS importer starting`)
   console.log(`   Source:       ${opts.source}`)
@@ -911,7 +923,7 @@ async function main(): Promise<void> {
   console.log(`   KMS URL:      ${opts.kmsUrl}`)
   console.log(`   Sync log:     ${opts.syncLogPath}`)
   console.log(`   User ID:      ${opts.userId}`)
-  console.log(`   Model:        ${opts.anthropicModel}`)
+  console.log(`   Distiller:    Ollama ${opts.ollamaModel} @ ${ollamaBaseUrl}`)
   console.log(`   Dry run:      ${opts.dryRun}`)
   if (opts.maxMeetings) console.log(`   Cap:          ${opts.maxMeetings} meetings`)
 
@@ -924,7 +936,13 @@ async function main(): Promise<void> {
     : new FileGranolaSource(opts.input!)
   const distiller = opts.dryRun
     ? new NoopDistiller()
-    : new HaikuDistiller(apiKey!, opts.anthropicModel)
+    : new OllamaDistiller(ollamaBaseUrl, opts.ollamaModel)
+
+  if (!opts.dryRun && !(await distiller.isAvailable())) {
+    console.error(`❌ Ollama unreachable at ${ollamaBaseUrl} — distillation needs it.`)
+    console.error('   Start Ollama and pull the model, or use --dry-run for planning.')
+    process.exit(2)
+  }
 
   let kms: MinimalMcpClient | null = null
   if (!opts.dryRun) {
@@ -975,6 +993,16 @@ async function main(): Promise<void> {
 
 /** Distiller that returns a stable stub — used in --dry-run when we still want to walk the pipeline. */
 class NoopDistiller implements DistillerLike {
+  /**
+   * A stub needs no backend, so it is always "available". The CLI gate
+   * short-circuits on `opts.dryRun` before probing, so today this is never
+   * called — returning true keeps that gate from wrongly exiting if the
+   * short-circuit ever goes away.
+   */
+  async isAvailable(): Promise<boolean> {
+    return true
+  }
+
   async distill(meeting: RawMeeting): Promise<DistilledMeeting> {
     return {
       summary: `[dry-run stub] meeting ${meeting.id} (${meeting.title}) — would distill ${meeting.transcript.length} chars`,

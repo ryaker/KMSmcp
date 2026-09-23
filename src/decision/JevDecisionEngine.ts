@@ -237,8 +237,8 @@ const ONECLI_MANAGED_API_KEY = 'ONECLI_MANAGED'
  *  2. `TYPESAFE_API_KEY` directly — for environments without a gateway.
  *
  * Null rather than a throw: the caller is a shadow path that must degrade to "no
- * evaluation" when Jev is unreachable, exactly as the dedup gate's Tier 2 does without
- * an ANTHROPIC_API_KEY.
+ * evaluation" when Jev is unreachable, exactly as the dedup gate's Tier 2 does
+ * when Ollama does not answer.
  */
 export function createJevDecisionEngineFromEnv(env: NodeJS.ProcessEnv = process.env): JevDecisionEngine | null {
   const viaGateway = createOneCliFetch(env)

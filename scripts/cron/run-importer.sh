@@ -25,7 +25,7 @@
 # Environment expectations:
 #   - KMS at http://localhost:8180/mcp must be reachable.
 #   - OAuth client_credentials env supplied via Doppler (preferred) or via .env.
-#   - ANTHROPIC_API_KEY must be set (required for Haiku 4.5 distillation).
+#   - Ollama must be reachable for distillation (OLLAMA_BASE_URL, default http://localhost:11434).
 
 set -uo pipefail
 

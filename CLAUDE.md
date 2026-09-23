@@ -264,7 +264,7 @@ If a required field is missing, you get `{ status: 'invalid_action', success: fa
 
 ### Tier 2 — `llm_relation` (DG-T2-A, issue #49)
 
-Each candidate in a `dedup_required` response now carries an `llm_relation` field populated by **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`) for confirm-band candidates. Refuse-band candidates get the relation `"duplicate"` inline (free win — the embedder already agrees so strongly we skip the LLM call).
+Each candidate in a `dedup_required` response now carries an `llm_relation` field populated by a **local Ollama model** (`qwen3:8b` by default) for confirm-band candidates. Refuse-band candidates get the relation `"duplicate"` inline (free win — the embedder already agrees so strongly we skip the LLM call). The judge runs on the M1 mini alongside the embedder; no external API key is involved.
 
 **Relation enum:**
 
@@ -281,9 +281,9 @@ Each candidate in a `dedup_required` response now carries an `llm_relation` fiel
 
 **The `dedup_required` response marks this for you (DG-T2-B, issue #50):** when any candidate's `llm_relation` is `contradicts`, the response carries `contradicts_detected: true` and `contradicting_ids: [...]`, `message` is rewritten to say CONTRADICTION explicitly (not "likely duplicate"), and `retry_with` is narrowed to only the two actions that make sense here — `action=supersede&old_id=<id>&reason=<why the existing entry is wrong>` and `action=force-new&reason=<why this does NOT actually contradict — required>`. `update` and `complement` are omitted: neither fits a factual conflict. Do not treat a `force-new` reason on a contradiction as a generic justification — it must specifically argue the two claims aren't actually opposed (e.g., they're scoped to different time periods or contexts); if you can't make that argument, the right move is `supersede`, not `force-new`.
 
-**Graceful degradation:** when `ANTHROPIC_API_KEY` is unset, `llm_relation` is `null` for all confirm-band candidates and `"duplicate"` for refuse-band. The gate still works on Tier 1 cosine alone — Tier 2 is purely advisory enrichment.
+**Graceful degradation:** when Ollama is unreachable, `llm_relation` is `null` for all confirm-band candidates and `"duplicate"` for refuse-band. The gate still works on Tier 1 cosine alone — Tier 2 is purely advisory enrichment. Note the shared dependency: the embedder and the judge are both local Ollama services, so one unreachable Ollama disables Tier 1 and Tier 2 together.
 
-**Cost & latency budget:** Haiku 4.5 with 5 s per-candidate timeout, single-word forced response (~12 tokens). LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
+**Cost & latency budget:** local inference, no per-call cost. 8 s per-candidate timeout (first call after model eviction pays a multi-second load), single-word forced response (~12 tokens) with `think: false` so a reasoning model does not spend its budget thinking. LRU-cached at 1000 entries per process so repeated borderline calls in a session are free. Refuse-band candidates skip the LLM entirely.
 
 **Embedding writes work — the gate is live.** (Re-verified 2026-07-31.) An earlier
 revision of this file claimed the opposite: that the Node binding had no

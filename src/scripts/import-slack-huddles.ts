@@ -86,7 +86,7 @@
  *   }
  */
 
-import Anthropic from '@anthropic-ai/sdk'
+import { OllamaInference } from '../inference/OllamaInference.js'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -140,7 +140,7 @@ export interface CliOptions {
   kmsUrl: string
   syncLogPath: string
   userId: string
-  anthropicModel: string
+  ollamaModel: string
   workspace: string
   dryRun: boolean
   maxHuddles?: number
@@ -164,7 +164,7 @@ export function parseArgs(argv: string[]): CliOptions {
       process.env.KMS_SLACK_HUDDLE_SYNC_LOG ||
       join(homedir(), '.kms-slack-huddle-sync.json'),
     userId: process.env.KMS_DEFAULT_USER_ID || 'richard_yaker',
-    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
+    ollamaModel: process.env.OLLAMA_MODEL || 'qwen3:8b',
     workspace: process.env.SLACK_WORKSPACE || 'tengo',
     dryRun: false,
     bearerToken: process.env.KMS_BEARER_TOKEN
@@ -181,7 +181,7 @@ export function parseArgs(argv: string[]): CliOptions {
       case '--kms-url':         opts.kmsUrl = next(); break
       case '--sync-log':        opts.syncLogPath = next(); break
       case '--user-id':         opts.userId = next(); break
-      case '--anthropic-model': opts.anthropicModel = next(); break
+      case '--ollama-model':    opts.ollamaModel = next(); break
       case '--workspace':       opts.workspace = next(); break
       case '--bearer-token':    opts.bearerToken = next(); break
       case '--dry-run':         opts.dryRun = true; break
@@ -226,7 +226,7 @@ Options:
   --kms-url <url>            default: http://localhost:8180/mcp
   --sync-log <path>          default: ~/.kms-slack-huddle-sync.json
   --user-id <id>             default: richard_yaker (or KMS_DEFAULT_USER_ID env)
-  --anthropic-model <id>     default: claude-haiku-4-5-20251001
+  --ollama-model <id>        default: qwen3:8b (local Ollama)
   --bearer-token <token>     Bypass OAuth client-credentials, pass token directly.
                              Or set KMS_BEARER_TOKEN env var.
   --dry-run                  Don't actually write to KMS. Log what would happen.
@@ -235,7 +235,8 @@ Options:
 
 Environment:
   KMS_BEARER_TOKEN           Preferred OAuth path for one-off runs.
-  ANTHROPIC_API_KEY          Required (Haiku 4.5 distillation).
+  OLLAMA_BASE_URL            (optional) default http://localhost:11434 — distillation.
+  OLLAMA_MODEL               (optional) default qwen3:8b.
   KMS_URL                    Override --kms-url.
   KMS_DEFAULT_USER_ID        Default --user-id.
   SLACK_WORKSPACE            Default --workspace label.
@@ -701,20 +702,36 @@ export class LiveSlackSource implements SlackHuddleSource {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Distillation — Haiku 4.5 via @anthropic-ai/sdk
+// Distillation — local Ollama model
 // ─────────────────────────────────────────────────────────────────────────
 
 export interface DistillerLike {
+  /**
+   * Can this distiller actually work? Replaces the old "is ANTHROPIC_API_KEY
+   * set?" credential check with a route to the backend itself — a set key
+   * proved nothing about reachability, and an unset one is no longer fatal.
+   */
+  isAvailable(): Promise<boolean>
   distill(huddle: RawHuddle, workspace: string): Promise<DistilledHuddle>
 }
 
-export class HaikuDistiller implements DistillerLike {
-  private client: Anthropic
-  private model: string
+/** Token cap for one huddle distillation (mirrors the old max_tokens: 2048). */
+const DISTILL_NUM_PREDICT = Number.parseInt(process.env.OLLAMA_DISTILL_NUM_PREDICT || '', 10) || 2048
+/** A huddle canvas is long, and a cold model pays a multi-second load first. */
+const DISTILL_TIMEOUT_MS = Number.parseInt(process.env.OLLAMA_DISTILL_TIMEOUT_MS || '', 10) || 120_000
+/** Structured extraction, not writing. */
+const DISTILL_TEMPERATURE = 0.2
 
-  constructor(apiKey: string, model: string) {
-    this.client = new Anthropic({ apiKey })
-    this.model = model
+export class OllamaDistiller implements DistillerLike {
+  private inference: OllamaInference
+
+  constructor(baseUrl: string, model: string) {
+    this.inference = new OllamaInference(baseUrl, model)
+  }
+
+  /** Reachability probe — the CLI gate uses this instead of a credential check. */
+  async isAvailable(): Promise<boolean> {
+    return this.inference.isAvailable()
   }
 
   async distill(huddle: RawHuddle, workspace: string): Promise<DistilledHuddle> {
@@ -725,15 +742,16 @@ export class HaikuDistiller implements DistillerLike {
       workspace
     })
 
-    const resp = await this.client.messages.create({
-      model: this.model,
-      max_tokens: 2048,
-      system,
-      messages: [{ role: 'user', content: user }]
+    // /api/generate carries a single prompt, so the system instruction is
+    // concatenated ahead of the user payload.
+    const text = await this.inference.generate(`${system}\n\n${user}`, {
+      timeoutMs: DISTILL_TIMEOUT_MS,
+      numPredict: DISTILL_NUM_PREDICT,
+      temperature: DISTILL_TEMPERATURE
     })
-
-    const block = resp.content?.[0] as any
-    const text = block?.type === 'text' ? block.text : ''
+    if (text === null) {
+      throw new Error('local model returned no response (is Ollama reachable?)')
+    }
     return parseDistilledResponse(text)
   }
 }
@@ -1021,6 +1039,16 @@ export async function runImport(deps: ImporterDeps): Promise<ImportReport> {
  * Distiller used in --dry-run when we still want to walk the whole pipeline.
  */
 class NoopDistiller implements DistillerLike {
+  /**
+   * A stub needs no backend, so it is always "available". The CLI gate
+   * short-circuits on `opts.dryRun` before probing, so today this is never
+   * called — returning true keeps that gate from wrongly exiting if the
+   * short-circuit ever goes away.
+   */
+  async isAvailable(): Promise<boolean> {
+    return true
+  }
+
   async distill(huddle: RawHuddle): Promise<DistilledHuddle> {
     return {
       summary: `[dry-run stub] huddle ${huddle.fileId} in #${huddle.channelName} — would distill ${huddle.canvasMarkdown.length} chars`,
@@ -1058,12 +1086,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     process.exit(2)
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey && !opts.dryRun) {
-    console.error('❌ ANTHROPIC_API_KEY env var is required (Haiku 4.5 distillation).')
-    console.error('   Set it directly or via doppler. Use --dry-run to skip distillation.')
-    process.exit(2)
-  }
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
 
   console.log(`🚀 Slack Huddle → KMS importer starting`)
   console.log(`   Source:       ${opts.source}`)
@@ -1072,14 +1095,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   console.log(`   Sync log:     ${opts.syncLogPath}`)
   console.log(`   User ID:      ${opts.userId}`)
   console.log(`   Workspace:    ${opts.workspace}`)
-  console.log(`   Model:        ${opts.anthropicModel}`)
+  console.log(`   Model:        ${opts.ollamaModel} (Ollama @ ${ollamaBaseUrl})`)
   console.log(`   Dry run:      ${opts.dryRun}`)
   if (opts.maxHuddles) console.log(`   Cap:          ${opts.maxHuddles} huddles`)
 
   const source: SlackHuddleSource = new FileSlackSource(opts.input!)
   const distiller = opts.dryRun
     ? new NoopDistiller()
-    : new HaikuDistiller(apiKey!, opts.anthropicModel)
+    : new OllamaDistiller(ollamaBaseUrl, opts.ollamaModel)
+  // The model must actually answer, not merely be configured. A credential
+  // check could not tell the difference; Ollama can be configured and down.
+  if (!opts.dryRun && !(await distiller.isAvailable())) {
+    console.error(`❌ Ollama unreachable at ${ollamaBaseUrl} — distillation needs it.`)
+    console.error('   Start Ollama and pull the model, or use --dry-run to skip distillation.')
+    process.exit(2)
+  }
 
   let kms: MinimalMcpClient | null = null
   if (!opts.dryRun) {
@@ -1148,20 +1178,18 @@ export async function runImportLive(args: {
     opts: { limit: number; sort?: string }
   ) => Promise<{ messages: SlackSearchMessage[] }>
   readCanvas: (canvasId: string) => Promise<{ canvas_markdown: string } | string>
-  apiKey?: string
 }): Promise<ImportReport> {
   const { opts, searchPublic, readCanvas } = args
-  const apiKey = args.apiKey ?? process.env.ANTHROPIC_API_KEY ?? ''
-  if (!apiKey && !opts.dryRun) {
-    throw new Error('ANTHROPIC_API_KEY required (or pass apiKey argument). Use opts.dryRun=true to skip.')
-  }
   const source = new LiveSlackSource(
     { searchPublic, readCanvas },
     { searchQuery: opts.searchQuery, searchLimit: opts.searchLimit }
   )
+  // Distillation runs on the local Ollama host, so no credential is threaded in
+  // here any more — the only prerequisite is that the model answers, and a
+  // transport failure surfaces per huddle rather than up front.
   const distiller = opts.dryRun
     ? new NoopDistiller()
-    : new HaikuDistiller(apiKey, opts.anthropicModel)
+    : new OllamaDistiller(process.env.OLLAMA_BASE_URL || 'http://localhost:11434', opts.ollamaModel)
   let kms: MinimalMcpClient | null = null
   if (!opts.dryRun) {
     const bearer = await fetchBearerTokenIfNeeded(opts)

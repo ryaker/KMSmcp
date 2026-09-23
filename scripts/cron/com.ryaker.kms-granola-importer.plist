@@ -35,7 +35,7 @@
         <string>/Users/ryaker</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <!-- Tell the runner to wrap with `doppler run` for OAuth / Anthropic
+        <!-- Tell the runner to wrap with `doppler run` for OAuth / importer
              secrets. The runner skips Doppler if KMS_BEARER_TOKEN is already set. -->
         <key>KMS_DOPPLER_PROJECT</key>
         <string>ry-local</string>

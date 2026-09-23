@@ -8,12 +8,12 @@
  *   - Sync-log resumability (skips canvases already in log)
  *   - Dedup-required response from KMS handled (skip + log, don't fail run)
  *   - Failed-canvas-fetch graceful degradation (LiveSlackSource skips, doesn't throw)
- *   - Distillation JSON validation (malformed Haiku output rejected per-huddle)
+ *   - Distillation JSON validation (malformed local-model output rejected per-huddle)
  *   - File-source: both pre-resolved-array and messages+canvases shapes
  *   - Subject + source-doc helpers
  *   - CLI parseArgs sanity
  *
- * No live KMS, no live Anthropic API, no live Slack. Everything is mocked at the seam.
+ * No live KMS, no live Ollama, no live Slack. Everything is mocked at the seam.
  */
 
 import {
@@ -770,9 +770,12 @@ class FakeDistiller implements DistillerLike {
     private overrides: Partial<DistilledHuddle> = {},
     private throwOn?: string
   ) {}
+  async isAvailable(): Promise<boolean> {
+    return true
+  }
   async distill(huddle: RawHuddle): Promise<DistilledHuddle> {
     if (this.throwOn && huddle.fileId === this.throwOn) {
-      throw new Error('haiku exploded')
+      throw new Error('local model exploded')
     }
     return {
       summary: this.overrides.summary ?? `summary for ${huddle.fileId}`,
@@ -846,7 +849,7 @@ function defaultOpts(): any {
     kmsUrl: 'http://localhost:8180/mcp',
     syncLogPath: '/tmp/test-sync.json',
     userId: 'test-user',
-    anthropicModel: 'claude-haiku-4-5',
+    ollamaModel: 'qwen3:8b',
     workspace: 'tengo',
     dryRun: true
   }
@@ -937,7 +940,7 @@ describe('processHuddle', () => {
       log: { completed: [] }
     })
     expect(result.status).toBe('failed')
-    expect(result.reason).toContain('haiku exploded')
+    expect(result.reason).toContain('local model exploded')
     expect(kms.calls).toHaveLength(0)
   })
 

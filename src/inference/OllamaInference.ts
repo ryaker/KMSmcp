@@ -10,6 +10,19 @@ export interface EntityMention {
   aliases?: string[]
 }
 
+/** Options for a single-shot generation. */
+export interface GenerateOptions {
+  /** Per-call timeout in ms. */
+  timeoutMs?: number
+  /**
+   * Cap on generated tokens. Ollama's own default is small, so any caller that
+   * expects more than a one-line answer must set this explicitly.
+   */
+  numPredict?: number
+  /** Sampling temperature. Lower is better for structured extraction. */
+  temperature?: number
+}
+
 /**
  * Timeout budgets. These were originally tuned for an Ollama running on loopback,
  * where a reachability probe completes in ~1 ms and a model is always resident.
@@ -96,7 +109,7 @@ Rules:
 
 Text: "${content.slice(0, 500)}"`
 
-    const raw = await this.callOllama(prompt, CLASSIFY_TIMEOUT_MS)
+    const raw = await this.callOllama(prompt, { timeoutMs: CLASSIFY_TIMEOUT_MS })
     if (raw === null) {
       return null
     }
@@ -160,7 +173,7 @@ Candidates: ${JSON.stringify(candidates.slice(0, 30))}
 
 Text: "${content.slice(0, 600)}"`
 
-    const raw = await this.callOllama(prompt, ENTITY_TIMEOUT_MS)
+    const raw = await this.callOllama(prompt, { timeoutMs: ENTITY_TIMEOUT_MS })
     if (raw === null) {
       return []
     }
@@ -186,15 +199,43 @@ Text: "${content.slice(0, 600)}"`
     }
   }
 
-  private async callOllama(prompt: string, timeoutMs: number): Promise<string | null> {
+  /**
+   * Generic single-shot generation.
+   *
+   * Exposed so the distillation importers (markdown corpus, Slack huddles) can
+   * reach the local model through this class instead of opening their own
+   * connection — one module owns the Ollama wire format, one place applies
+   * `think: false` and the timeout budget.
+   *
+   * Returns null on any transport failure (non-200, timeout, malformed payload).
+   * Callers decide the fallback; distillation treats null as "no model".
+   */
+  async generate(prompt: string, options: GenerateOptions = {}): Promise<string | null> {
+    return this.callOllama(prompt, options)
+  }
+
+  private async callOllama(prompt: string, options: GenerateOptions): Promise<string | null> {
+    // Defaults preserve the original classify/entity behaviour when no options
+    // are supplied; the distillation path overrides both.
+    const timeoutMs = options.timeoutMs ?? CLASSIFY_TIMEOUT_MS
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
 
     try {
+      const ollamaOptions: Record<string, number> = {}
+      if (typeof options.numPredict === 'number') ollamaOptions.num_predict = options.numPredict
+      if (typeof options.temperature === 'number') ollamaOptions.temperature = options.temperature
+
       const response = await fetch(`${this.baseUrl}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: this.model, prompt, stream: false, think: false }),
+        body: JSON.stringify({
+          model: this.model,
+          prompt,
+          stream: false,
+          think: false,
+          ...(Object.keys(ollamaOptions).length > 0 ? { options: ollamaOptions } : {})
+        }),
         signal: controller.signal,
       })
 
