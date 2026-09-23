@@ -412,6 +412,17 @@ export class UnifiedStoreTool {
      */
     writeMode?: 'standard' | 'episodic'
     /**
+     * Narrative timestamp for the knowledge entry — the date the stored
+     * content is ABOUT, not the ingestion date. ISO 8601 string or epoch
+     * seconds. Flows into knowledge.timestamp (mem0's extractor then uses it
+     * as the event time instead of stamping ingestion time into shard text —
+     * see CLAUDE.md "Mem0 narrative timestamps") and into search ranking's
+     * recency signal, which would otherwise treat 500K tokens of dated
+     * history as all-happened-today. Absent → now() (unchanged behavior).
+     * Unparseable → now() + a warning; never an Invalid Date.
+     */
+    timestamp?: string | number
+    /**
      * Admin-only escape hatch for batch imports, the reaper, and the
      * calibration script. NOT advertised in the MCP tool schema; only honored
      * when the call comes from a non-Claude-facing code path. Defaults to
@@ -501,6 +512,21 @@ export class UnifiedStoreTool {
     const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal'
     const resolvedUserId = enrichedArgs.userId || defaultUserId
 
+    // Narrative timestamp (see the args doc): ISO string or epoch seconds.
+    // Number is epoch SECONDS (not ms) — the caller's contract is mem0's
+    // epoch-seconds add option, so one unit convention spans the whole path.
+    let knowledgeTimestamp = new Date()
+    if (args.timestamp !== undefined) {
+      const parsed = typeof args.timestamp === 'number'
+        ? new Date(args.timestamp * 1000)
+        : new Date(args.timestamp)
+      if (Number.isFinite(parsed.getTime())) {
+        knowledgeTimestamp = parsed
+      } else {
+        console.warn(`unified_store: unparseable timestamp ${JSON.stringify(args.timestamp)} — falling back to now()`)
+      }
+    }
+
     // Create unified knowledge object
     const knowledge: UnifiedKnowledge = {
       id: crypto.randomUUID(),
@@ -509,7 +535,7 @@ export class UnifiedStoreTool {
       source: enrichedArgs.source!,
       userId: resolvedUserId,
       metadata: enrichedArgs.metadata || {},
-      timestamp: new Date(),
+      timestamp: knowledgeTimestamp,
       confidence: enrichedArgs.confidence || 0.8,
       relationships: enrichedArgs.relationships || []
     }
