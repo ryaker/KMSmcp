@@ -18,6 +18,13 @@ import { Mem0Storage } from '../storage/Mem0Storage.js'
 
 const live = process.env.KMS_MEM0_LIVE_SMOKE === '1' ? describe : describe.skip
 
+// The actual namespace written this run — captured by the test, used by
+// cleanup. Mem0's deleteAll takes TOP-LEVEL entity params (EntityOptions,
+// serialized via URLSearchParams — a nested `filters` object stringifies to
+// "filters=[object+Object]" and matches nothing), and the namespace is
+// suffixed per-run, so the prefix-only call used previously deleted nothing.
+let smokeNamespace: string | null = null
+
 live('Mem0 temporal-stamp live smoke', () => {
   it('extracts a 2023 narrative event under a 2023 event timestamp', async () => {
     if (!process.env.MEM0_API_KEY) {
@@ -41,6 +48,7 @@ live('Mem0 temporal-stamp live smoke', () => {
       timestamp: new Date('2023-03-06T12:00:00Z'),
       confidence: 0.8
     }
+    smokeNamespace = knowledge.userId
 
     await storage.store(knowledge as any)
 
@@ -75,7 +83,11 @@ live('Mem0 temporal-stamp live smoke', () => {
         defaultUserId: 'smoke_ts_probe'
       } as any)
       await storage.initialize()
-      await (storage as any).client.deleteAll({ filters: { user_id: 'smoke_ts_probe' } })
+      // deleteAll takes TOP-LEVEL entity params (no nested filters — see the
+      // comment above). Target the exact namespace written this run.
+      if (smokeNamespace) {
+        await (storage as any).client.deleteAll({ user_id: smokeNamespace })
+      }
     } catch {
       // smoke namespace is disposable; ignore cleanup failures
     }

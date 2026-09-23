@@ -122,4 +122,24 @@ describe('Mem0Storage.store — narrative timestamp propagation', () => {
     const [, options] = mockClient.add.mock.calls[0]
     expect(options.user_id).toBe('dolphin/alex/run1')
   })
+
+  it('falls back to no timestamp on an Invalid Date instead of writing null', async () => {
+    const knowledge = {
+      id: 'kms-bad',
+      content: 'Untyped caller sent an Invalid Date',
+      contentType: 'memory',
+      source: 'personal',
+      userId: 'dolphin/alex/run1',
+      metadata: {},
+      timestamp: new Date('not-a-date'),
+      confidence: 0.8
+    }
+
+    await storage.store(knowledge as any)
+
+    const [, options] = mockClient.add.mock.calls[0]
+    // JSON.stringify(NaN) → null on the wire; omitting the key is the safe
+    // fallback (mem0 then uses its own now() default).
+    expect(options.timestamp).toBeUndefined()
+  })
 })

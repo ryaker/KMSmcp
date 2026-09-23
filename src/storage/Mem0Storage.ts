@@ -83,6 +83,13 @@ export class Mem0Storage implements StorageSystem {
         role: 'user' as const,
         content: knowledge.content
       }]
+      // Guard against untyped JS callers at the MCP boundary: an undefined or
+      // Invalid Date must fall back to "no timestamp" (mem0's default now()
+      // behavior) rather than TypeError/RangeError (toISOString throws) or a
+      // JSON `null`/`NaN` on the wire.
+      const validTs = knowledge.timestamp instanceof Date &&
+        Number.isFinite(knowledge.timestamp.getTime())
+      const narrativeTs = validTs ? Math.floor(knowledge.timestamp.getTime() / 1000) : undefined
       const options: any = {
         user_id: userId,
         // Temporal-stamp fix (DolphinBench ingestion probe, 2026-09-22):
@@ -96,13 +103,13 @@ export class Mem0Storage implements StorageSystem {
         // verbatim, and 'timestamp' is snake already). Passing the
         // knowledge's narrative timestamp makes the extractor treat it as
         // the event time instead of now().
-        timestamp: Math.floor(knowledge.timestamp.getTime() / 1000),
+        ...(narrativeTs !== undefined && { timestamp: narrativeTs }),
         metadata: {
           kms_id: knowledge.id,
           content_type: knowledge.contentType,
           source: knowledge.source,
           confidence: knowledge.confidence,
-          timestamp: knowledge.timestamp.toISOString(),
+          ...(validTs && { timestamp: knowledge.timestamp.toISOString() }),
           ...knowledge.metadata
         }
       }
