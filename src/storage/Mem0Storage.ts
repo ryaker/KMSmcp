@@ -85,6 +85,18 @@ export class Mem0Storage implements StorageSystem {
       }]
       const options: any = {
         user_id: userId,
+        // Temporal-stamp fix (DolphinBench ingestion probe, 2026-09-22):
+        // mem0's server-side extractor stamps the *ingestion* date into the
+        // extracted memory text when no event time is given — observed
+        // rewriting a 2023-03-06 narrative event to "September 22, 2026"
+        // (ingestion day). AddMemoryOptions supports `timestamp` (epoch
+        // seconds); it reaches the wire unchanged via _preparePayload
+        // (verified against mem0ai@3.0.2 dist/index.mjs — add() at L348-353,
+        // _preparePayload at L307-310: options are camelToSnakeKeys'd
+        // verbatim, and 'timestamp' is snake already). Passing the
+        // knowledge's narrative timestamp makes the extractor treat it as
+        // the event time instead of now().
+        timestamp: Math.floor(knowledge.timestamp.getTime() / 1000),
         metadata: {
           kms_id: knowledge.id,
           content_type: knowledge.contentType,
