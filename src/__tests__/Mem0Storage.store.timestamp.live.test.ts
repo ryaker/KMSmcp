@@ -3,11 +3,16 @@
  * stamp reaches the wire and the extractor honours it.
  *
  * Skipped unless KMS_MEM0_LIVE_SMOKE=1, so CI and an ordinary `npm test`
- * never touch the network or spend tokens. To run on this machine (MEM0_API_KEY
- * in the environment or via doppler):
+ * never touch the network or spend tokens. To run on this machine:
  *
- *   KMS_MEM0_LIVE_SMOKE=1 doppler run -p ry-local -c dev_personal -- \
+ *   KMS_MEM0_LIVE_SMOKE=1 doppler run -p ry-local -c dev_eng -- \
+ *     KMS_MEM0_API_KEY=$(doppler secrets -p ry-local -c dev_eng get MEM0_API_KEY) \
  *     npx jest src/__tests__/Mem0Storage.store.timestamp.live.test.ts
+ *
+ * KMS_MEM0_API_KEY, not MEM0_API_KEY: src/__tests__/setup.ts (a
+ * setupFilesAfterEnv hook) hardcodes process.env.MEM0_API_KEY = 'test-mem0-key'
+ * before the test file loads, clobbering the real key and surfacing as an
+ * AuthenticationError against app.mem0.ai.
  *
  * Asserts the wire contract: a knowledge entry with a 2023-03-06 narrative
  * timestamp produces a shard whose text carries that date (not the ingestion
@@ -27,12 +32,14 @@ let smokeNamespace: string | null = null
 
 live('Mem0 temporal-stamp live smoke', () => {
   it('extracts a 2023 narrative event under a 2023 event timestamp', async () => {
-    if (!process.env.MEM0_API_KEY) {
-      throw new Error('KMS_MEM0_LIVE_SMOKE=1 but MEM0_API_KEY is not set')
+    if (!process.env.KMS_MEM0_API_KEY) {
+      throw new Error(
+        'KMS_MEM0_LIVE_SMOKE=1 but KMS_MEM0_API_KEY is not set (setup.ts clobbers MEM0_API_KEY — pass the dedicated var)'
+      )
     }
 
     const storage = new Mem0Storage({
-      apiKey: process.env.MEM0_API_KEY,
+      apiKey: process.env.KMS_MEM0_API_KEY,
       defaultUserId: 'smoke_ts_probe'
     } as any)
     await storage.initialize()
@@ -79,7 +86,7 @@ live('Mem0 temporal-stamp live smoke', () => {
     // still want the run to count the assertions above.
     try {
       const storage = new Mem0Storage({
-        apiKey: process.env.MEM0_API_KEY,
+        apiKey: process.env.KMS_MEM0_API_KEY,
         defaultUserId: 'smoke_ts_probe'
       } as any)
       await storage.initialize()
