@@ -108,6 +108,39 @@ describe('UnifiedStoreTool — narrative timestamp arg', () => {
     expect(ts.getTime()).toBeGreaterThanOrEqual(before)
   })
 
+  it('treats JSON null as absent (new Date(null) must not become 1970)', async () => {
+    const before = Date.now()
+    await tool.store({
+      content: 'Null timestamp sent by an untyped caller',
+      contentType: 'memory',
+      source: 'personal',
+      userId: 'dolphin/alex/p2',
+      timestamp: null
+    } as any)
+
+    const ts = storedKnowledge().timestamp as Date
+    expect(ts.getTime()).toBeGreaterThanOrEqual(before)
+  })
+
+  it('rejects epoch milliseconds as unparseable instead of building a 55k-year date', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await tool.store({
+        content: 'Caller sent a 13-digit epoch value',
+        contentType: 'memory',
+        source: 'personal',
+        userId: 'dolphin/alex/p2',
+        timestamp: 1705336200000
+      } as any)
+    } finally {
+      warn.mockRestore()
+    }
+
+    // Not 1970-in-milliseconds (which would be year ~55,000); falls back now().
+    const ts = storedKnowledge().timestamp as Date
+    expect(ts.getTime()).toBeLessThan(4e12) // any plausible "now", not 1.7e15
+  })
+
   it('defaults to now() when timestamp is absent', async () => {
     const before = Date.now()
     await tool.store({
