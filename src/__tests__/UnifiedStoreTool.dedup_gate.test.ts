@@ -655,6 +655,8 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     })
 
     expect(isDedupRequired(result)).toBe(false)
+    // Mechanism, not just outcome: Tier 1 must not have run at all.
+    expect((graph as any).findSimilar).not.toHaveBeenCalled()
     // Fan-out happened on all three backends.
     expect(graph.store).toHaveBeenCalledTimes(1)
     expect(mongo.store).toHaveBeenCalledTimes(1)
@@ -742,5 +744,49 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
 
     const stored = (graph.store as jest.Mock).mock.calls[0][0]
     expect(stored.metadata.write_mode).toBeUndefined()
+  })
+
+  it('episodic + options.skip_dedup still wins — Tier 0 skipped too', async () => {
+    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue({
+      id: 'exact-dup',
+      content: 'Identical content',
+      contentType: 'memory',
+      timestamp: '2026-03-06T00:00:00Z',
+      flag: null,
+      metadata: {},
+    })
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'Identical content',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1',
+      writeMode: 'episodic',
+      options: { skip_dedup: true }
+    })
+
+    expect(isDedupRequired(result)).toBe(false)
+    expect((graph as any).findByFingerprint).not.toHaveBeenCalled()
+    expect(graph.store).toHaveBeenCalledTimes(1)
+  })
+
+  it('episodic + action=force-new stores with force_new_reason and the stamp', async () => {
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
+
+    const tool = makeTool()
+    await tool.store({
+      content: 'Moved to the new apartment in March',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1',
+      action: 'force-new',
+      reason: 'deliberate re-ingest of dated history',
+      writeMode: 'episodic'
+    })
+
+    expect(graph.store).toHaveBeenCalledTimes(1)
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.force_new_reason).toBe('deliberate re-ingest of dated history')
+    // The stamp survives the dispatcher's fall-through mutation.
+    expect(stored.metadata.write_mode).toBe('episodic')
   })
 })

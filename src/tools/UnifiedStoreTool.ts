@@ -554,8 +554,9 @@ export class UnifiedStoreTool {
     }
 
     // DG-EPISODIC: stamp the write mode onto the entry before the fan-out so
-    // every backend copy carries the audit trail. A caller-provided value is
-    // not overwritten (write_mode is distinct from the caller's lane).
+    // every backend copy carries the audit trail. A caller-supplied
+    // metadata.write_mode IS overwritten here — writeMode:'episodic' is the
+    // caller's declared intent for this write, so 'episodic' wins.
     if (args.writeMode === 'episodic') {
       knowledge.metadata = {
         ...knowledge.metadata,
@@ -624,11 +625,13 @@ export class UnifiedStoreTool {
         }
       } catch (e) {
         // Non-fatal: degrade to "no Tier 0 check" rather than blocking the write.
-        // Tier 1 still runs. Use the project logger for consistency with the
-        // rest of the dedup-gate code path (Tier 1 / Tier 2 also log via
-        // logger.warn — see the findSimilar guard below).
+        // Tier 1 still runs in standard mode (under writeMode:'episodic' Tier 1
+        // is skipped by design, so this is the only gate degradation). Use the
+        // project logger for consistency with the rest of the dedup-gate code
+        // path (Tier 1 / Tier 2 also log via logger.warn — see the findSimilar
+        // guard below).
         logger.warn(
-          `⚠️ unified_store: findByFingerprint failed (continuing to Tier 1): ` +
+          `⚠️ unified_store: findByFingerprint failed (continuing past Tier 0): ` +
           `${e instanceof Error ? e.message : String(e)}`
         )
       }
