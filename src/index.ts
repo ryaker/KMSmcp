@@ -533,6 +533,10 @@ export class UnifiedKMSServer {
               type: 'string',
               enum: ['standard', 'episodic'],
               description: 'OPTIONAL - DG-EPISODIC write mode. Use "episodic" for bulk/episodic ingestion (benchmark history, transcript imports) where a restatement is temporal signal, not redundancy: the dedup gate then runs Tier 0 exact-fingerprint only, so legitimate near-duplicates are STORED instead of refused; the entry is tagged metadata.write_mode="episodic". An exact duplicate is still refused (retry with action=force-new). Default "standard" keeps the full interactive gate.'
+            },
+            timestamp: {
+              type: ['string', 'number'],
+              description: 'OPTIONAL - Narrative timestamp: the date the content is ABOUT, not the ingestion date. ISO 8601 string ("2023-03-06T12:00:00Z") or epoch SECONDS. Drives mem0 event-time extraction and search recency ranking. Omit for present-tense writes (defaults to now).'
             }
           },
           required: ['content']

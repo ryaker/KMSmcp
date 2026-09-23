@@ -412,6 +412,20 @@ export class UnifiedStoreTool {
      */
     writeMode?: 'standard' | 'episodic'
     /**
+     * Narrative timestamp for the knowledge entry — the date the stored
+     * content is ABOUT, not the ingestion date. ISO 8601 string or epoch
+     * seconds. Flows into knowledge.timestamp (mem0's extractor then uses it
+     * as the event time instead of stamping ingestion time into shard text —
+     * see CLAUDE.md "Mem0 narrative timestamps") and into search ranking's
+     * recency signal, which would otherwise treat 500K tokens of dated
+     * history as all-happened-today. Absent → now() (unchanged behavior).
+     * Unparseable → now() + a warning; never an Invalid Date. Applies to
+     * plain stores (and action=complement/force-new, which fall through the
+     * same path); a supersede/update retry does NOT consume it — those
+     * delegate to their own methods with the supersede time.
+     */
+    timestamp?: string | number
+    /**
      * Admin-only escape hatch for batch imports, the reaper, and the
      * calibration script. NOT advertised in the MCP tool schema; only honored
      * when the call comes from a non-Claude-facing code path. Defaults to
@@ -501,6 +515,30 @@ export class UnifiedStoreTool {
     const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal'
     const resolvedUserId = enrichedArgs.userId || defaultUserId
 
+    // Narrative timestamp (see the args doc): ISO string or epoch seconds.
+    // Number is epoch SECONDS (not ms) — the caller's contract is mem0's
+    // epoch-seconds add option, so one unit convention spans the whole path.
+    let knowledgeTimestamp = new Date()
+    // `== null` covers both undefined and JSON null (new Date(null) coerces
+    // to 1970 — that must count as "absent", not a valid date). Epoch values
+    // beyond 1e11 s (year ~5138) are almost certainly milliseconds passed by
+    // mistake; fall back to now() rather than silently building a 55,000-year
+    // timestamp that poisons recency ranking.
+    if (args.timestamp != null) {
+      // Only string ISO and in-range epoch-seconds numbers are accepted;
+      // anything else (boolean, object, out-of-range number) is treated as
+      // unparseable rather than coerced (new Date(true) → 1970-01-01T00:00:00.001Z).
+      const parsed = typeof args.timestamp === 'string' ? new Date(args.timestamp)
+        : typeof args.timestamp === 'number' && args.timestamp >= 0 && args.timestamp <= 1e11
+          ? new Date(args.timestamp * 1000)
+          : undefined
+      if (parsed && Number.isFinite(parsed.getTime())) {
+        knowledgeTimestamp = parsed
+      } else {
+        console.warn(`unified_store: unparseable timestamp ${JSON.stringify(args.timestamp)} — falling back to now()`)
+      }
+    }
+
     // Create unified knowledge object
     const knowledge: UnifiedKnowledge = {
       id: crypto.randomUUID(),
@@ -509,7 +547,7 @@ export class UnifiedStoreTool {
       source: enrichedArgs.source!,
       userId: resolvedUserId,
       metadata: enrichedArgs.metadata || {},
-      timestamp: new Date(),
+      timestamp: knowledgeTimestamp,
       confidence: enrichedArgs.confidence || 0.8,
       relationships: enrichedArgs.relationships || []
     }
