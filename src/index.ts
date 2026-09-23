@@ -528,6 +528,11 @@ export class UnifiedKMSServer {
                 required: ['targetId', 'type', 'strength']
               },
               description: 'OPTIONAL - Links to related knowledge. System suggests relationships like SOLVES, REQUIRES, CAUSES, SIMILAR_TO'
+            },
+            writeMode: {
+              type: 'string',
+              enum: ['standard', 'episodic'],
+              description: 'OPTIONAL - DG-EPISODIC write mode. Use "episodic" for bulk/episodic ingestion (benchmark history, transcript imports) where a restatement is temporal signal, not redundancy: the dedup gate then runs Tier 0 exact-fingerprint only, so legitimate near-duplicates are STORED instead of refused; the entry is tagged metadata.write_mode="episodic". An exact duplicate is still refused (retry with action=force-new). Default "standard" keeps the full interactive gate.'
             }
           },
           required: ['content']

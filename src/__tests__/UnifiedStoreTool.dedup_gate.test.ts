@@ -622,4 +622,125 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     // spec's original 0.90/0.75 guesses.
     expect(0.88).toBeGreaterThan(0.78)
   })
+
+  // -------------------------------------------------------------------------
+  // DG-EPISODIC — episodic write mode
+  //
+  // writeMode: 'episodic' degrades the gate to Tier 0 (exact fingerprint)
+  // only — Tier 1 cosine + Tier 2 LLM judge are skipped so legitimate
+  // restatements (chronological life history, transcript imports) are stored
+  // instead of refused. Measured 2026-09-22: the interactive gate refused
+  // 25% of legitimate history in the DolphinBench ingestion probe.
+  // -------------------------------------------------------------------------
+
+  it('episodic mode stores a near-duplicate the standard gate would refuse', async () => {
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+      {
+        id: 'existing-entry',
+        similarity: 0.95,
+        contentType: 'memory',
+        source: 'personal',
+        created: '2026-03-06T00:00:00Z',
+        flag: null,
+        content_preview: 'I started my new job as an ML engineer...',
+      },
+    ])
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'Started the ML engineer job — first week went well',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1',
+      writeMode: 'episodic'
+    })
+
+    expect(isDedupRequired(result)).toBe(false)
+    // Fan-out happened on all three backends.
+    expect(graph.store).toHaveBeenCalledTimes(1)
+    expect(mongo.store).toHaveBeenCalledTimes(1)
+    expect(mem0.store).toHaveBeenCalledTimes(1)
+  })
+
+  it('episodic mode still refuses an exact Tier 0 fingerprint duplicate', async () => {
+    ;(graph as any).findByFingerprint = jest.fn().mockReturnValue({
+      id: 'exact-dup',
+      content: 'Identical content',
+      contentType: 'memory',
+      timestamp: '2026-03-06T00:00:00Z',
+      flag: null,
+      metadata: {},
+    })
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'Identical content',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1',
+      writeMode: 'episodic'
+    })
+
+    expect(isDedupRequired(result)).toBe(true)
+    if (!isDedupRequired(result)) return
+    expect(result.band).toBe('exact')
+    expect(result.candidates[0].similarity).toBe(1.0)
+    expect(graph.store).not.toHaveBeenCalled()
+  })
+
+  it('standard mode still refuses the same near-duplicate (regression guard)', async () => {
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([
+      {
+        id: 'existing-entry',
+        similarity: 0.95,
+        contentType: 'memory',
+        source: 'personal',
+        created: '2026-03-06T00:00:00Z',
+        flag: null,
+        content_preview: 'I started my new job as an ML engineer...',
+      },
+    ])
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'Started the ML engineer job — first week went well',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1'
+    })
+
+    expect(isDedupRequired(result)).toBe(true)
+    if (!isDedupRequired(result)) return
+    expect(result.band).toBe('refuse')
+    expect(graph.store).not.toHaveBeenCalled()
+  })
+
+  it('episodic write stamps metadata.write_mode="episodic" on the stored entry', async () => {
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
+
+    const tool = makeTool()
+    await tool.store({
+      content: 'Moved to the new apartment in March',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1',
+      metadata: { lane: 'episodic' },
+      writeMode: 'episodic'
+    })
+
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.write_mode).toBe('episodic')
+    // Caller-provided metadata is preserved alongside the stamp.
+    expect(stored.metadata.lane).toBe('episodic')
+  })
+
+  it('standard mode does not stamp write_mode (default behavior unchanged)', async () => {
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
+
+    const tool = makeTool()
+    await tool.store({
+      content: 'Moved to the new apartment in March',
+      contentType: 'memory',
+      userId: 'dolphin/alex/run1'
+    })
+
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.write_mode).toBeUndefined()
+  })
 })

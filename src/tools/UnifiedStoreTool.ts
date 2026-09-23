@@ -401,6 +401,17 @@ export class UnifiedStoreTool {
     reason?: string
     related_to?: string
     /**
+     * DG-EPISODIC — write mode. 'episodic' is for bulk/episodic ingestion
+     * (benchmark history, transcript imports, Granola loads) where a
+     * restatement is temporal signal, not redundancy: the dedup gate runs
+     * Tier 0 (exact fingerprint) ONLY, so legitimate near-duplicates are
+     * stored instead of refused. The entry is stamped
+     * metadata.write_mode='episodic' as the audit trail. Absent or
+     * 'standard' keeps the interactive gate exactly as before. Explicit
+     * options.skip_dedup still wins (skips Tier 0 too).
+     */
+    writeMode?: 'standard' | 'episodic'
+    /**
      * Admin-only escape hatch for batch imports, the reaper, and the
      * calibration script. NOT advertised in the MCP tool schema; only honored
      * when the call comes from a non-Claude-facing code path. Defaults to
@@ -540,6 +551,16 @@ export class UnifiedStoreTool {
     knowledge.metadata = {
       ...knowledge.metadata,
       fingerprint
+    }
+
+    // DG-EPISODIC: stamp the write mode onto the entry before the fan-out so
+    // every backend copy carries the audit trail. A caller-provided value is
+    // not overwritten (write_mode is distinct from the caller's lane).
+    if (args.writeMode === 'episodic') {
+      knowledge.metadata = {
+        ...knowledge.metadata,
+        write_mode: 'episodic'
+      }
     }
 
     if (
@@ -683,9 +704,15 @@ export class UnifiedStoreTool {
     // Latency: typical p50 ~5-15 ms (HNSW search 1-3 ms + JS post-filter).
     // ---------------------------------------------------------------------
     const skipDedup = args.options?.skip_dedup === true
+    // DG-EPISODIC: episodic writes keep Tier 0 (exact fingerprint above) but
+    // skip Tier 1 cosine + Tier 2 LLM judge entirely — a restatement is the
+    // signal, not redundancy. Measured on the DolphinBench ingestion probe
+    // (2026-09-22): the interactive gate refused 25% of legitimate
+    // chronological history.
+    const gateTier1AndAbove = !skipDedup && args.writeMode !== 'episodic'
     if (
       pendingEmbedding &&
-      !skipDedup &&
+      gateTier1AndAbove &&
       typeof (this.storage.graph as any).findSimilar === 'function'
     ) {
       const subjectFacet = typeof knowledge.metadata?.subject === 'string'
