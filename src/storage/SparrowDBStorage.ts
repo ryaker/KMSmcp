@@ -993,6 +993,33 @@ export class SparrowDBStorage implements StorageSystem {
    * Find an entry by ID. Returns the full ContentEntry or null.
    * Used by reaper and unified_get_by_id.
    */
+  /**
+   * Entries carrying exactly `flag`, newest first — the review queue reads
+   * `CANDIDATE` through this. Reads the in-memory sidecar only, like findById.
+   */
+  listByFlag(flag: KnowledgeFlag, options: { userId?: string; limit?: number } = {}): Array<{
+    id: string
+    contentType: string
+    subject?: string
+    created: string
+    flag_by?: string
+    content_preview: string
+  }> {
+    const limit = Math.max(1, Math.min(options.limit ?? 25, 200))
+    const out = [...this.contentIndex.values()]
+      .filter(e => e.flag === flag && (!options.userId || e.userId === options.userId))
+      .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+      .slice(0, limit)
+    return out.map(e => ({
+      id: e.id,
+      contentType: e.contentType,
+      subject: typeof e.metadata?.subject === 'string' ? e.metadata.subject : undefined,
+      created: e.timestamp,
+      flag_by: e.flag_by,
+      content_preview: (e.content ?? '').slice(0, 300),
+    }))
+  }
+
   findById(id: string): ContentEntry | null {
     return this.contentIndex.get(id) ?? null
   }
@@ -1450,11 +1477,17 @@ export class SparrowDBStorage implements StorageSystem {
   async getEntitySummary(id: string): Promise<Record<string, any> | null> {
     const entity = this._ontology().get(id)
     const entry = this.contentIndex.get(id)
+    // entity_context is returned by every unified_search, so it must honour flags like
+    // every other read path: a flagged entry (CANDIDATE awaiting review, SUPERSEDED,
+    // DELETED) is neither summarised nor previewed as a neighbour.
+    if (entry?.flag) return null
+    const liveEdges = () => this._edges().relationshipsFor(id)
+      .filter(r => !this.contentIndex.get(r.relatedNode)?.flag)
 
     if (entity) {
       let top_relationships: any[] = []
       try {
-        top_relationships = this._edges().relationshipsFor(id).slice(0, 6).map(r => ({
+        top_relationships = liveEdges().slice(0, 6).map(r => ({
           rel: r.relationship,
           direction: r.direction,
           id: r.relatedNode,
@@ -1480,7 +1513,7 @@ export class SparrowDBStorage implements StorageSystem {
     if (entry) {
       let top_relationships: any[] = []
       try {
-        top_relationships = this._edges().relationshipsFor(id).slice(0, 4).map(r => ({
+        top_relationships = liveEdges().slice(0, 4).map(r => ({
           rel: r.relationship,
           direction: r.direction,
           id: r.relatedNode,

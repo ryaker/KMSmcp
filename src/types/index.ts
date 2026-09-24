@@ -40,7 +40,7 @@ export interface KMSConfig {
   oauth?: OAuthConfig
 }
 
-export type KnowledgeFlag = 'RETRACTED' | 'SUPERSEDED' | 'DELETED' | 'UNVERIFIED'
+export type KnowledgeFlag = 'RETRACTED' | 'SUPERSEDED' | 'DELETED' | 'UNVERIFIED' | 'CANDIDATE'
 
 export interface UnifiedKnowledge {
   id: string

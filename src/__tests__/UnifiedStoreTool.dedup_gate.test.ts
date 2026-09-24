@@ -582,7 +582,9 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
       userId: 'richard_yaker',
       contentType: 'insight',
       subject: 'Phoenix.camera_count',
-      topK: 5
+      topK: 5,
+      // Only review-queue writes dedup against flagged entries.
+      includeFlagged: false
     })
   })
 
