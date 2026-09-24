@@ -29,6 +29,7 @@ import {
   type WriteDedupRelation,
 } from '../decision/writeDedupRelation.js'
 import type { DecisionEngine, DecisionLogSink, DecisionRequest, DecisionResult } from '../decision/index.js'
+import { TokenBucket, setEngineRateLimiterForTests } from '../decision/engineSlot.js'
 
 const NEW_CONTENT = 'Correction: the Phoenix rig uses 16 cameras, not 6. The 6-camera figure used the wrong zoom config.'
 const SECRET_CANDIDATE_TEXT = 'The Phoenix rig uses 6 cameras per the March calibration session.'
@@ -182,6 +183,21 @@ describe('runWriteDedupShadow', () => {
     const run = await runWriteDedupShadow(input({ engine, hydrate: async () => { throw new Error('graph down') } }))
     expect((evaluate.mock.calls[0][0] as any).state.candidate).toMatchObject({ content: 'preview of old-1', content_truncated: true })
     expect(run.candidates[0]).toMatchObject({ content_truncated: true, error: null })
+  })
+
+  it('a full engine queue costs that candidate its row, not the whole run', async () => {
+    // One token, no queue: the first candidate gets the token, the second is refused at once.
+    setEngineRateLimiterForTests(new TokenBucket({ ratePerSecond: 0.001, burst: 1, maxQueue: 0 }))
+    try {
+      const { engine, evaluate } = mockEngine(() => answers('unrelated', 0.9))
+      const run = await runWriteDedupShadow(input({ engine, candidates: [candidate('a', 0.9), candidate('b', 0.85)] }))
+      expect(evaluate).toHaveBeenCalledTimes(1)
+      expect(run.candidates).toHaveLength(2)
+      expect(run.candidates.filter(c => c.error === null)).toHaveLength(1)
+      expect(run.candidates.find(c => c.error !== null)!.error).toMatch(/queue full/)
+    } finally {
+      setEngineRateLimiterForTests()
+    }
   })
 
   it('skips candidates under the similarity floor and caps the fan-out', async () => {

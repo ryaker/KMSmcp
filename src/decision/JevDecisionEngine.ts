@@ -20,9 +20,14 @@ import type {
 
 export const JEV_PROVIDER = 'typesafe'
 
-/** Env var naming the model to request. Pin a versioned id once thresholds are tuned. */
+/**
+ * Env var naming the model to request. The default is a pinned version, not `jev-latest`:
+ * aliases move to new models (https://docs.typesafe.ai/models.md, "Aliases"), and every
+ * threshold and weight in the shadow policies is tuned against the answers of one version.
+ * Move the pin deliberately, and re-score the labelled pool when you do.
+ */
 export const JEV_MODEL_ENV = 'KMS_JEV_MODEL'
-export const JEV_DEFAULT_MODEL = 'jev-latest'
+export const JEV_DEFAULT_MODEL = 'jev-1.13.0'
 
 /**
  * USD per million tokens, from https://docs.typesafe.ai/models (read 2026-09-19):
