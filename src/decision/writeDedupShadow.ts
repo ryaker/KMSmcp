@@ -238,7 +238,7 @@ export async function runWriteDedupShadow(input: WriteDedupShadowInput): Promise
     .filter(c => c.vectorSimilarity >= minSimilarity)
     .slice(0, JEV_WRITE_DEDUP_MAX_CANDIDATES)
 
-  const records = await Promise.all(evaluated.map(candidate => withEngineSlot(async (): Promise<WriteDedupCandidateRecord> => {
+  const records = await Promise.all(evaluated.map(async (candidate): Promise<WriteDedupCandidateRecord> => {
     const callStarted = Date.now()
     let base: Pick<WriteDedupCandidateRecord, 'id' | 'vector_similarity' | 'gate_band' | 'tier2_llm_relation' | 'state_fingerprint' | 'content_truncated'> = {
       id: String(candidate.id ?? ''),
@@ -280,7 +280,9 @@ export async function runWriteDedupShadow(input: WriteDedupShadowInput): Promise
           (state as { candidate: { content_truncated: boolean } }).candidate.content_truncated,
       }
 
-      const result = await input.engine.evaluate({ state, questions: WRITE_DEDUP_QUESTIONS })
+      // Only the engine call is rate-limited: the hydrate read above is local, and a full
+      // queue must cost this candidate's row, not the whole run (it lands in the catch below).
+      const result = await withEngineSlot(() => input.engine.evaluate({ state, questions: WRITE_DEDUP_QUESTIONS }))
       const jev = readJudgment(result)
       const proposed = proposeWriteDedupAction({
         relation: {
@@ -316,7 +318,7 @@ export async function runWriteDedupShadow(input: WriteDedupShadowInput): Promise
         error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
       }
     }
-  })))
+  }))
 
   const succeeded = records.filter(r => r.error === null)
   const costs = succeeded.map(r => r.cost_usd_estimate)
