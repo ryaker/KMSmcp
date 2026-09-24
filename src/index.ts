@@ -631,6 +631,10 @@ export class UnifiedKMSServer {
                   type: 'boolean',
                   default: false,
                   description: 'OPTIONAL — when true, also returns entries that have been flagged (retracted/superseded/deleted). Defaults to false so default search hides corrections.'
+                },
+                jevRerank: {
+                  type: 'boolean',
+                  description: 'EVAL-ONLY — internal option for the offline relevance-labelling harness. When false, skips the served Jev re-rank for this one request and returns production order, even if KMS_JEV_RERANK=1 server-wide. Not for normal callers; omit this field.'
                 }
               },
               description: 'Search options'
