@@ -28,6 +28,7 @@ import { OllamaEmbeddingService } from './embedding/EmbeddingService.js'
 import { OllamaJudge } from './embedding/OllamaJudge.js'
 import type { LLMJudgeService } from './embedding/LLMJudgeService.js'
 import { MongoDBStorage, Mem0Storage, SparrowDBStorage, resolveSparrowDBPath } from './storage/index.js'
+import { mem0ParentId } from './storage/Mem0Storage.js'
 import { UnifiedStoreTool, UnifiedSearchTool, KMSInstructionsTool, DocumentStoreTool } from './tools/index.js'
 
 export class UnifiedKMSServer {
@@ -1284,7 +1285,7 @@ export class UnifiedKMSServer {
 
       // Mem0 has no flag concept: honour the parent KMS entry's flag, as search does,
       // so a CANDIDATE/SUPERSEDED/DELETED entry is not readable by memory id.
-      const parentId = memory?.metadata?.kms_id
+      const parentId = mem0ParentId(memory?.metadata)
       const parentFlag = parentId ? (this.storage.graph as any).findById?.(parentId)?.flag : null
       if (parentFlag) {
         return {

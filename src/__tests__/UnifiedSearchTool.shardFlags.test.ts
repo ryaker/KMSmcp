@@ -119,3 +119,17 @@ describe('lookup efficiency', () => {
     expect(calls).toBe(2)
   })
 })
+
+describe('live mem0ai@3 response shape (metadata keys camel-cased on read)', () => {
+  // We write metadata.kms_id; the SDK returns it as metadata.kmsId. Mocks that
+  // echo kms_id back hid a filter that never matched a real response.
+  const liveShard = (id: string, kmsId: string) => ({ id, content: `shard ${id}`, metadata: { kmsId } })
+
+  it('drops shards of a flagged parent when the join key arrives as kmsId', async () => {
+    const tool = makeTool(
+      [{ id: 'p', flag: 'CANDIDATE' }, { id: 'q', flag: null }],
+      [liveShard('s1', 'p'), liveShard('s2', 'q')]
+    )
+    expect((await search(tool)).map((r: any) => r.id)).toEqual(['s2'])
+  })
+})

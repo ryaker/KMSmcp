@@ -26,6 +26,17 @@ import { MemoryClient } from 'mem0ai'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig } from '../types/index.js'
 import { logger } from '../logger.js'
 
+/**
+ * The KMS entry a Mem0 memory was derived from. We write `metadata.kms_id`, but
+ * mem0ai@3 camel-cases metadata keys on read, so results carry `kmsId`. Every
+ * reader of the join key must go through here; a bare `metadata.kms_id` read is
+ * always undefined against a live Mem0 response.
+ */
+export function mem0ParentId(metadata: Record<string, any> | null | undefined): string | undefined {
+  const id = metadata?.kms_id ?? metadata?.kmsId
+  return typeof id === 'string' && id.length > 0 ? id : undefined
+}
+
 export class Mem0Storage implements StorageSystem {
   public name = 'mem0'
   private client!: MemoryClient
@@ -159,13 +170,13 @@ export class Mem0Storage implements StorageSystem {
       const results: any[] = Array.isArray(response) ? response : (response?.results ?? [])
 
       const processedResults = results.map((r: any) => ({
-        id: r.id || r.metadata?.kms_id,
+        id: r.id || mem0ParentId(r.metadata),
         content: r.memory || '',
         confidence: r.score || r.metadata?.confidence || 0.5,
         metadata: r.metadata || {},
         sourceSystem: 'mem0',
         timestamp: r.metadata?.timestamp ? new Date(r.metadata.timestamp) : new Date(),
-        contentType: r.metadata?.content_type,
+        contentType: r.metadata?.content_type ?? r.metadata?.contentType,
         source: r.metadata?.source,
         userId: r.userId ?? r.user_id
       }))
@@ -388,7 +399,7 @@ export class Mem0Storage implements StorageSystem {
 
         // Step 2: exact-match filter on metadata.kms_id. Substring hits on
         // adjacent entries' metadata would be false positives.
-        const matches = results.filter((r: any) => r?.metadata?.kms_id === id)
+        const matches = results.filter((r: any) => mem0ParentId(r?.metadata) === id)
 
         if (matches.length === 0) {
           // Probe-and-skip — entry may never have been routed to Mem0
