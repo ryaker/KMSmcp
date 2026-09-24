@@ -24,6 +24,8 @@
     "build:sparrowdb": "bash scripts/build-sparrowdb-node.sh",
     "import:granola": "tsx scripts/import-granola.ts",
     "import:granola:dry-run": "tsx scripts/import-granola.ts --dry-run",
+    "backfill:mongo-ids": "tsx src/scripts/backfill-mongo-ids.ts",
+    "backfill:mongo-ids:apply": "tsx src/scripts/backfill-mongo-ids.ts --apply",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "keywords": [
