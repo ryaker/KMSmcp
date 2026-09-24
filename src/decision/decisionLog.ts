@@ -15,7 +15,6 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { logger } from '../logger.js'
-import type { RecallStatus } from './recallEvidence.js'
 
 export const DECISION_LOG_PATH_ENV = 'KMS_DECISION_LOG_PATH'
 export const DECISION_LOG_DEFAULT_PATH = path.join(os.homedir(), '.kms', 'decision-log', 'recall-shadow.jsonl')
@@ -27,6 +26,12 @@ export type ShadowAction = 'shadow_log' | 'shadow_reorder'
  * `jev_*`, everything retrieval said sits under `retrieval`, and what deterministic code
  * concluded is `policy_*`. There is no bare `confidence` or `score` anywhere in a row, so
  * a later reader cannot mistake one signal for another.
+ *
+ * `jev`'s shape is `recall-evidence/v2` (`question_schema_version` on the run record says
+ * which version actually produced a given row — v1 rows already on disk were written under
+ * an EARLIER shape of this same TS interface and are read as loosely-typed JSON, never
+ * against this type; see `src/eval/shadowRunMetrics.ts`, which does not touch `.jev` at
+ * all for exactly this reason).
  */
 export interface CandidateDecisionRecord {
   id: string
@@ -47,23 +52,33 @@ export interface CandidateDecisionRecord {
   /** Null when the evaluation failed; see `error`. */
   jev: {
     answers_query: { jev_probability: number }
-    status: {
-      choice: RecallStatus | string
-      jev_probabilities: Record<string, number>
-      jev_confidence: number
-    }
     evidence_value: {
       score: number
       /** Level name → probability, so a row is readable without the schema. */
       jev_probabilities: Record<string, number>
       jev_confidence: number
     }
+    contradicts_premise: { jev_probability: number }
+    contains_instruction: { jev_probability: number }
+    describes_past_state: { jev_probability: number }
   } | null
   policy_protected: 'ontology_match' | 'lexical_match' | null
   /** Null unless the action is `shadow_reorder` and the candidate was judged. */
   policy_shadow_score: number | null
   /** 1-based rank in the shadow ordering. Null unless the action is `shadow_reorder`. */
   policy_shadow_rank: number | null
+  /**
+   * `contains_instruction` crossed `SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD` (0.7). Logging
+   * only — does not affect `policy_shadow_score` or the ordering. Null when unjudged.
+   */
+  policy_contains_instruction_flag: boolean | null
+  /**
+   * `contradicts_premise` crossed `SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD` (0.7). For a
+   * future "conflicts" routing block (R10); never affects the score. Null when unjudged.
+   */
+  policy_contradicts_premise_flag: boolean | null
+  /** Raw P(describes_past_state = yes), clamped to [0, 1]. Logged, not thresholded, not scored. Null when unjudged. */
+  policy_past_state_probability: number | null
   model: string | null
   request_id: string | null
   latency_ms: number

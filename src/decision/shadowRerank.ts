@@ -1,11 +1,11 @@
 /**
  * Shadow recall rerank — Experiment 1 of the Jev/System One proposal.
  *
- * Takes the ordering `unified_search` already produced, asks a DecisionEngine three
- * questions about each of the top candidates, and writes what it learned to the decision
- * log. It returns a record; it does not return results. There is no code path from here
- * back into what a caller of `unified_search` receives, which is what makes this shadow
- * mode rather than a rerank with a flag in front of it.
+ * Takes the ordering `unified_search` already produced, asks a DecisionEngine the
+ * `recall-evidence/v2` questions about each of the top candidates, and writes what it
+ * learned to the decision log. It returns a record; it does not return results. There is
+ * no code path from here back into what a caller of `unified_search` receives, which is
+ * what makes this shadow mode rather than a rerank with a flag in front of it.
  */
 
 import crypto from 'crypto'
@@ -14,14 +14,14 @@ import type { CandidateDecisionRecord, DecisionLogSink, ShadowAction, ShadowRunR
 import { withEngineSlot } from './engineSlot.js'
 import {
   EVIDENCE_VALUE_LEVELS,
-  RECALL_EVIDENCE_QUESTIONS,
-  RECALL_EVIDENCE_SCHEMA_VERSION,
-  buildRecallState,
-  fingerprintRecallState,
+  RECALL_EVIDENCE_QUESTIONS_V2,
+  RECALL_EVIDENCE_V2_SCHEMA_VERSION,
+  buildRecallStateV2,
+  fingerprintRecallStateV2,
+  isCandidateCorrectedOrReplaced,
   type RecallCandidate,
-  type RecallStatus,
 } from './recallEvidence.js'
-import { SHADOW_POLICY_VERSION, protectionReason, shadowOrder, shadowScore } from './shadowPolicy.js'
+import { SHADOW_POLICY_V2_VERSION, protectionReason, shadowOrder, shadowScoreV2 } from './shadowPolicy.js'
 import type { DecisionEngine, DecisionResult } from './types.js'
 
 /** Turns shadow evaluation on. Default OFF. Strictly `'1'`, like KMS_HYBRID_RETRIEVAL. */
@@ -133,23 +133,29 @@ function nameEvidenceLevels(byIndex: Record<string, number>): Record<string, num
 
 function readJudgment(result: DecisionResult): NonNullable<CandidateDecisionRecord['jev']> {
   const answersQuery = result.answers.answers_query
-  const status = result.answers.status
   const evidenceValue = result.answers.evidence_value
-  if (answersQuery?.type !== 'noul' || status?.type !== 'choice' || evidenceValue?.type !== 'score') {
-    throw new Error('engine returned an answer of the wrong kind for a recall-evidence question')
+  const contradictsPremise = result.answers.contradicts_premise
+  const containsInstruction = result.answers.contains_instruction
+  const describesPastState = result.answers.describes_past_state
+  if (
+    answersQuery?.type !== 'noul' ||
+    evidenceValue?.type !== 'score' ||
+    contradictsPremise?.type !== 'noul' ||
+    containsInstruction?.type !== 'noul' ||
+    describesPastState?.type !== 'noul'
+  ) {
+    throw new Error('engine returned an answer of the wrong kind for a recall-evidence/v2 question')
   }
   return {
     answers_query: { jev_probability: answersQuery.probability },
-    status: {
-      choice: status.choice,
-      jev_probabilities: status.probabilities,
-      jev_confidence: status.confidence,
-    },
     evidence_value: {
       score: evidenceValue.score,
       jev_probabilities: nameEvidenceLevels(evidenceValue.probabilities),
       jev_confidence: evidenceValue.confidence,
     },
+    contradicts_premise: { jev_probability: contradictsPremise.probability },
+    contains_instruction: { jev_probability: containsInstruction.probability },
+    describes_past_state: { jev_probability: describesPastState.probability },
   }
 }
 
@@ -170,7 +176,16 @@ async function evaluateOneCandidate(
   // Everything that touches the candidate is inside the try. A retrieval result is an
   // untyped bag from three backends; one that throws while being read must cost one
   // row, not reject the run and discard the judgments already paid for.
-  let base: Pick<CandidateDecisionRecord, 'id' | 'production_rank' | 'state_fingerprint' | 'content_truncated' | 'retrieval' | 'policy_protected' | 'policy_shadow_rank'> = {
+  let base: Pick<
+    CandidateDecisionRecord,
+    | 'id'
+    | 'production_rank'
+    | 'state_fingerprint'
+    | 'content_truncated'
+    | 'retrieval'
+    | 'policy_protected'
+    | 'policy_shadow_rank'
+  > = {
     id: '',
     production_rank: index + 1,
     state_fingerprint: '',
@@ -180,11 +195,14 @@ async function evaluateOneCandidate(
     policy_shadow_rank: null,
   }
   try {
-    const state = buildRecallState(query, candidate, now)
+    const state = buildRecallStateV2(query, candidate)
+    // Code-known, not asked of Jev (R7): the same metadata v1's `status` Choice used to
+    // judge `superseded_context` from is read directly here.
+    const correctedOrReplaced = isCandidateCorrectedOrReplaced(candidate)
     base = {
       ...base,
       id: String(candidate.id ?? ''),
-      state_fingerprint: fingerprintRecallState(state),
+      state_fingerprint: fingerprintRecallStateV2(state),
       content_truncated: (state as { candidate: { content_truncated: boolean } }).candidate.content_truncated,
       retrieval: {
         source_systems: candidate._sourceSystems ?? (candidate.sourceSystem ? [candidate.sourceSystem] : []),
@@ -199,18 +217,25 @@ async function evaluateOneCandidate(
     // The rate-limit wait is inside the try and under the deadline: a candidate still
     // queued when the deadline fires, or refused by a full queue, is one unjudged row.
     const result = await untilAborted(
-      withEngineSlot(() => engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS, signal }), { signal }),
+      withEngineSlot(() => engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS_V2, signal }), { signal }),
       signal
     )
     const jev = readJudgment(result)
+    const scored = shadowScoreV2({
+      answersQuery: jev.answers_query.jev_probability,
+      evidenceValue: jev.evidence_value.score,
+      containsInstruction: jev.contains_instruction.jev_probability,
+      describesPastState: jev.describes_past_state.jev_probability,
+      contradictsPremise: jev.contradicts_premise.jev_probability,
+      correctedOrReplaced,
+    })
     return {
       ...base,
       jev,
-      policy_shadow_score: shadowScore({
-        answersQuery: jev.answers_query.jev_probability,
-        statusProbabilities: jev.status.jev_probabilities as Partial<Record<RecallStatus, number>>,
-        evidenceValue: jev.evidence_value.score,
-      }),
+      policy_shadow_score: scored.score,
+      policy_contains_instruction_flag: scored.containsInstructionFlag,
+      policy_contradicts_premise_flag: scored.contradictsPremiseFlag,
+      policy_past_state_probability: scored.describesPastStateProbability,
       model: result.model,
       request_id: result.requestId ?? null,
       latency_ms: result.latencyMs,
@@ -225,6 +250,9 @@ async function evaluateOneCandidate(
       ...base,
       jev: null,
       policy_shadow_score: null,
+      policy_contains_instruction_flag: null,
+      policy_contradicts_premise_flag: null,
+      policy_past_state_probability: null,
       model: null,
       request_id: null,
       latency_ms: Date.now() - callStarted,
@@ -312,8 +340,8 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
     provider: input.engine.provider,
     requested_model: input.engine.requestedModel,
     models: Array.from(new Set(succeeded.map(r => r.model).filter((m): m is string => m !== null))),
-    question_schema_version: RECALL_EVIDENCE_SCHEMA_VERSION,
-    policy_version: SHADOW_POLICY_VERSION,
+    question_schema_version: RECALL_EVIDENCE_V2_SCHEMA_VERSION,
+    policy_version: SHADOW_POLICY_V2_VERSION,
     policy_decision: input.action,
     query: input.query,
     candidates_in_pool: input.ranked.length,

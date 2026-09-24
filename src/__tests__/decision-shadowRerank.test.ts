@@ -17,20 +17,22 @@ import { TokenBucket, setEngineRateLimiterForTests } from '../decision/engineSlo
 import {
   EVIDENCE_VALUE_LEVELS,
   RECALL_CANDIDATE_MAX_CHARS,
-  RECALL_EVIDENCE_QUESTIONS,
-  RECALL_EVIDENCE_SCHEMA_VERSION,
-  RECALL_STATUS_OPTIONS,
+  RECALL_EVIDENCE_QUESTIONS_V2,
+  RECALL_EVIDENCE_V2_SCHEMA_VERSION,
   buildRecallState,
   fingerprintRecallState,
 } from '../decision/recallEvidence.js'
-import { SHADOW_POLICY_VERSION } from '../decision/shadowPolicy.js'
+import { SHADOW_POLICY_V2_VERSION } from '../decision/shadowPolicy.js'
 import type { DecisionLogSink, ShadowRunRecord } from '../decision/decisionLog.js'
 import type { DecisionEngine, DecisionRequest, DecisionResult } from '../decision/types.js'
 
 const NOW = new Date('2026-09-19T12:00:00.000Z')
 const QUERY = 'how many cameras does Phoenix use'
 
-interface Verdict { answers: number; status: string; evidence: number }
+/** v2 verdict: the five nouls/score `evaluateRecallCandidates` now asks. Unset flags
+ *  default to 0 (no instruction, no contradiction, not past-state) — RANKED's fixtures
+ *  only set what each test needs. */
+interface Verdict { answers: number; evidence: number; instruction?: number; pastState?: number; contradicts?: number }
 
 /** An engine whose verdict is looked up from the candidate content it is shown. */
 const mockEngine = (verdicts: Record<string, Verdict | Error>) => {
@@ -39,7 +41,6 @@ const mockEngine = (verdicts: Record<string, Verdict | Error>) => {
     const verdict = verdicts[content]
     if (verdict instanceof Error) throw verdict
     if (!verdict) throw new Error(`no verdict for "${content}"`)
-    const rest = (1 - 0.9) / (RECALL_STATUS_OPTIONS.length - 1)
     const level = Math.round(verdict.evidence)
     return {
       provider: 'mock',
@@ -47,18 +48,15 @@ const mockEngine = (verdicts: Record<string, Verdict | Error>) => {
       requestedModel: 'mock-latest',
       answers: {
         answers_query: { type: 'noul', probability: verdict.answers },
-        status: {
-          type: 'choice',
-          choice: verdict.status,
-          probabilities: Object.fromEntries(RECALL_STATUS_OPTIONS.map(o => [o, o === verdict.status ? 0.9 : rest])),
-          confidence: 0.85,
-        },
         evidence_value: {
           type: 'score',
           score: verdict.evidence,
           probabilities: Object.fromEntries(EVIDENCE_VALUE_LEVELS.map((_, i) => [String(i), i === level ? 1 : 0])),
           confidence: 0.7,
         },
+        contradicts_premise: { type: 'noul', probability: verdict.contradicts ?? 0 },
+        contains_instruction: { type: 'noul', probability: verdict.instruction ?? 0 },
+        describes_past_state: { type: 'noul', probability: verdict.pastState ?? 0 },
       },
       usage: { inputTokens: 400, outputTokens: 12 },
       latencyMs: 35,
@@ -78,14 +76,17 @@ const memorySink = () => {
 
 const RANKED = [
   { id: 'noise', content: 'phoenix session notes', _relevance: 0.6, confidence: 1, sourceSystem: 'graph', timestamp: '2026-09-01T00:00:00Z' },
-  { id: 'old', content: 'phoenix had 6 cameras', _relevance: 0.5, confidence: 1, _sourceSystems: ['graph', 'mongodb'] },
+  // `flag: 'SUPERSEDED'` exercises the code-known correction multiplier (0.5x) that
+  // replaced v1's `superseded_context` status — same intent (this entry is outdated),
+  // now read from metadata instead of asked of Jev.
+  { id: 'old', content: 'phoenix had 6 cameras', _relevance: 0.5, confidence: 1, _sourceSystems: ['graph', 'mongodb'], metadata: { flag: 'SUPERSEDED' } },
   { id: 'answer', content: 'phoenix uses 16 cameras', _relevance: 0.4, _vectorSimilarity: 0.91, confidence: 0.6, sourceSystem: 'vector' },
 ]
 
 const VERDICTS: Record<string, Verdict> = {
-  'phoenix session notes': { answers: 0.05, status: 'irrelevant', evidence: 1 },
-  'phoenix had 6 cameras': { answers: 0.7, status: 'superseded_context', evidence: 3 },
-  'phoenix uses 16 cameras': { answers: 0.97, status: 'current', evidence: 4 },
+  'phoenix session notes': { answers: 0.05, evidence: 1 },
+  'phoenix had 6 cameras': { answers: 0.7, evidence: 3 },
+  'phoenix uses 16 cameras': { answers: 0.97, evidence: 4 },
 }
 
 describe('flags', () => {
@@ -171,17 +172,23 @@ beforeEach(() => setEngineRateLimiterForTests(unthrottled()))
 afterEach(() => setEngineRateLimiterForTests())
 
 describe('runShadowRerank', () => {
-  it('asks the three recall-evidence questions once per candidate', async () => {
+  it('asks the five recall-evidence/v2 questions once per candidate', async () => {
     const { engine, evaluate } = mockEngine(VERDICTS)
     await runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_log', now: NOW })
 
     expect(evaluate).toHaveBeenCalledTimes(3)
     for (const [request] of evaluate.mock.calls) {
-      expect(request.questions).toBe(RECALL_EVIDENCE_QUESTIONS)
-      expect(Object.keys(request.questions)).toEqual(['answers_query', 'status', 'evidence_value'])
+      expect(request.questions).toBe(RECALL_EVIDENCE_QUESTIONS_V2)
+      expect(Object.keys(request.questions)).toEqual([
+        'answers_query', 'evidence_value', 'contradicts_premise', 'contains_instruction', 'describes_past_state',
+      ])
     }
-    expect(Object.keys(RECALL_EVIDENCE_QUESTIONS.status.criteria).sort()).toEqual([...RECALL_STATUS_OPTIONS].sort())
-    expect(RECALL_EVIDENCE_QUESTIONS.evidence_value.criteria).toHaveLength(EVIDENCE_VALUE_LEVELS.length)
+    // No Choice left in the v2 set — the ordered "decide in this order" logic v1's `status`
+    // asked Jev for is gone; every question is a noul or a score now.
+    expect(Object.values(RECALL_EVIDENCE_QUESTIONS_V2).map(q => q.type).sort()).toEqual(
+      ['noul', 'noul', 'noul', 'noul', 'score']
+    )
+    expect(RECALL_EVIDENCE_QUESTIONS_V2.evidence_value.criteria).toHaveLength(EVIDENCE_VALUE_LEVELS.length)
   })
 
   it('logs every field the brief requires', async () => {
@@ -197,8 +204,8 @@ describe('runShadowRerank', () => {
       provider: 'mock',
       requested_model: 'mock-latest',
       models: ['mock-1.0.0'],
-      question_schema_version: RECALL_EVIDENCE_SCHEMA_VERSION,
-      policy_version: SHADOW_POLICY_VERSION,
+      question_schema_version: RECALL_EVIDENCE_V2_SCHEMA_VERSION,
+      policy_version: SHADOW_POLICY_V2_VERSION,
       policy_decision: 'shadow_log',
       query: QUERY,
       candidates_in_pool: 3,
@@ -220,15 +227,21 @@ describe('runShadowRerank', () => {
       latency_ms: 35,
       usage: { input_tokens: 400, output_tokens: 12 },
       error: null,
+      // `policy_shadow_score` stays null under shadow_log (the logged-shadow contract,
+      // below) but the flags/probability are logged unconditionally — they don't depend
+      // on an ordering having been computed.
       policy_shadow_score: null,
       policy_shadow_rank: null,
+      policy_contains_instruction_flag: false,
+      policy_contradicts_premise_flag: false,
+      policy_past_state_probability: 0,
     })
     expect(answer.state_fingerprint).toMatch(/^[0-9a-f]{64}$/)
     expect(answer.jev!.answers_query).toEqual({ jev_probability: 0.97 })
-    expect(answer.jev!.status.choice).toBe('current')
-    expect(answer.jev!.status.jev_confidence).toBe(0.85)
-    // Full distributions, not just the winner.
-    expect(Object.keys(answer.jev!.status.jev_probabilities)).toEqual([...RECALL_STATUS_OPTIONS])
+    expect(answer.jev!.contradicts_premise).toEqual({ jev_probability: 0 })
+    expect(answer.jev!.contains_instruction).toEqual({ jev_probability: 0 })
+    expect(answer.jev!.describes_past_state).toEqual({ jev_probability: 0 })
+    // Full distribution, not just the winner, for the one question that still has one.
     expect(Object.keys(answer.jev!.evidence_value.jev_probabilities)).toEqual([...EVIDENCE_VALUE_LEVELS])
     expect(answer.jev!.evidence_value.jev_probabilities.direct).toBe(1)
   })
@@ -248,7 +261,7 @@ describe('runShadowRerank', () => {
       knowledge_confidence: 0.6,
     })
     // … and no engine value is ever stored under a name that means something else.
-    expect(answer.retrieval.knowledge_confidence).not.toBe(answer.jev!.status.jev_confidence)
+    expect(answer.retrieval.knowledge_confidence).not.toBe(answer.jev!.evidence_value.jev_confidence)
     const bareKeys: string[] = []
     const walk = (node: unknown) => {
       if (!node || typeof node !== 'object') return
@@ -290,7 +303,7 @@ describe('runShadowRerank', () => {
     ]
     const { engine } = mockEngine({
       ...VERDICTS,
-      'Charles Jack Yaker — Person / father': { answers: 0.02, status: 'irrelevant', evidence: 0 },
+      'Charles Jack Yaker — Person / father': { answers: 0.02, evidence: 0 },
     })
     const run = await runShadowRerank({ engine, query: 'my dad', ranked, action: 'shadow_reorder', now: NOW })
 
@@ -325,7 +338,7 @@ describe('runShadowRerank', () => {
     const real = evaluate.getMockImplementation()!
     evaluate.mockImplementation(async request => {
       const result = await real(request)
-      return { ...result, answers: { ...result.answers, status: { type: 'noul', probability: 0.5 } } }
+      return { ...result, answers: { ...result.answers, evidence_value: { type: 'noul', probability: 0.5 } } }
     })
     const run = await runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_log', now: NOW })
     expect(run.candidates_failed).toBe(3)
@@ -335,7 +348,9 @@ describe('runShadowRerank', () => {
   it('a candidate that throws while being READ costs one row, not the run', async () => {
     const { engine } = mockEngine(VERDICTS)
     const { sink, rows } = memorySink()
-    const poisoned = { id: 'poisoned', content: 'unreadable', get timestamp(): string { throw new Error('boom: poisoned getter') } }
+    // v2's state no longer reads `timestamp` (R5 — no date sent to Jev at all), so the
+    // poisoned getter has to be on `content`, which `buildRecallStateV2` reads first.
+    const poisoned = { id: 'poisoned', get content(): string { throw new Error('boom: poisoned getter') } }
     const run = await runShadowRerank({ engine, query: QUERY, ranked: [poisoned, ...RANKED], action: 'shadow_reorder', sink, now: NOW })
 
     expect(run.candidates_failed).toBe(1)

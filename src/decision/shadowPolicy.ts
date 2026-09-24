@@ -85,6 +85,96 @@ export function shadowScore(j: ShadowJudgment): number {
   return Number((base * expectedMultiplier).toFixed(6))
 }
 
+// ── v2 ───────────────────────────────────────────────────────────────────────
+//
+// `shadowScoreV2` scores the v2 question set (`recall-evidence/v2`): `answers_query` and
+// `evidence_value` unchanged, plus three nouls in place of v1's `status` Choice. The status
+// Choice's ordered "decide in this order" logic is gone; each rule below applies to its own
+// probability independently, in code, which is what jaggedness #7/#8 ask for.
+//
+// The score itself is deliberately narrow: base × the code-known correction multiplier,
+// nothing else. `contains_instruction` and `describes_past_state` were both tried as score
+// multipliers (demote-to-zero and a mild discount, respectively) and re-scored offline
+// against the 1,200-pair labelled pool (`src/scripts/eval-recall-evidence.ts`,
+// `src/scripts/rescore-recall-evidence-variants.ts`, PR #137). The instruction demotion
+// made things WORSE: of the 65 candidates it zeroed, 61.5% had Gemma grade >= 1 (44.6%
+// grade 2) — it was catching legitimately-stored operational directives ("never run
+// Ollama inference on this Mac mini", "always use the OneCLI gateway") as if they were
+// prompt injection, not just actual adversarial content. Dropping that rule alone closed
+// most of the gap to v1 on the same pool. `contradicts_premise` was never a score
+// multiplier (v1 gave `contradictory` ×1 for the same reason: a disputed premise is what a
+// reader most needs to see). All three nouls are still asked and still logged, as signals
+// a future "conflicts"/injection-review block can route on (R10) — they just do not move a
+// candidate's rank on their own until there is evidence they should.
+export const SHADOW_POLICY_V2_VERSION = 'recall-shadow-policy/v2'
+
+/** Same multiplier v1 gave `superseded_context` — corrected/replaced status is code-known now. */
+export const SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER = 0.5
+/**
+ * NOT applied by `shadowScoreV2` (see the module comment above) — kept only because
+ * `src/scripts/rescore-recall-evidence-variants.ts` reconstructs the discounted variants
+ * (B/C) from the same cached answers for comparison, and a second copy of this number
+ * there would drift from this one.
+ */
+export const SHADOW_V2_PAST_STATE_DISCOUNT_WEIGHT = 0.2
+/** Above this, `contains_instruction` is logged as a flag. It does not change the score. */
+export const SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD = 0.7
+/** Above this, `contradicts_premise` is logged as a flag. It does not change the score. */
+export const SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD = 0.7
+
+export interface ShadowJudgmentV2 {
+  /** P(answers_query = yes). */
+  answersQuery: number
+  /** Probability-weighted evidence level, 0 … EVIDENCE_VALUE_MAX. */
+  evidenceValue: number
+  /** P(contains_instruction = yes). Logged as a flag; does not affect `score`. */
+  containsInstruction: number
+  /** P(describes_past_state = yes). Logged as a probability; does not affect `score`. */
+  describesPastState: number
+  /** P(contradicts_premise = yes). Logged as a flag; does not affect `score`. */
+  contradictsPremise: number
+  /** Code-known from metadata (`isCandidateCorrectedOrReplaced`) — never asked of Jev. */
+  correctedOrReplaced: boolean
+}
+
+export interface ShadowScoreV2Result {
+  /** base(answersQuery, evidenceValue) × the correction multiplier. Nothing else. */
+  score: number
+  /**
+   * `containsInstruction` crossed `SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD`. Logging only — see
+   * the module comment for why this does not demote. Carried for a future review/injection
+   * block to route on, and for auditing the flag's own false-positive rate over time.
+   */
+  containsInstructionFlag: boolean
+  /**
+   * `contradictsPremise` crossed `SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD`. For routing to a
+   * future "conflicts" block (R10's `route()`), not for reordering — a disputed premise is
+   * exactly what a reader needs to see, the same reasoning v1 gave `contradictory` ×1.
+   */
+  contradictsPremiseFlag: boolean
+  /** Raw P(describes_past_state = yes), clamped to [0, 1]. Logged, not thresholded. */
+  describesPastStateProbability: number
+}
+
+/**
+ * Shadow score in [0, 1] for the v2 question set: `base × correction multiplier`, plus the
+ * three logged signals (two flags, one raw probability) read off the same judgment. Kept as
+ * one function (not score-then-flags) because a caller that logs the score always logs the
+ * flags alongside it.
+ */
+export function shadowScoreV2(j: ShadowJudgmentV2): ShadowScoreV2Result {
+  const evidence = Math.min(1, Math.max(0, j.evidenceValue / EVIDENCE_VALUE_MAX))
+  const base = SHADOW_WEIGHT_ANSWERS_QUERY * j.answersQuery + SHADOW_WEIGHT_EVIDENCE_VALUE * evidence
+  const correctedMultiplier = j.correctedOrReplaced ? SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER : 1
+
+  return {
+    score: Number((base * correctedMultiplier).toFixed(6)),
+    containsInstructionFlag: j.containsInstruction > SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD,
+    contradictsPremiseFlag: j.contradictsPremise > SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD,
+    describesPastStateProbability: Math.min(1, Math.max(0, j.describesPastState)),
+  }
+}
+
 export interface ProtectionSignals {
   _ontologyScore?: unknown
   _relevance?: unknown

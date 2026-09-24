@@ -13,14 +13,16 @@ import {
   runServedRerank,
 } from '../decision/servedRerank.js'
 import { TokenBucket, setEngineRateLimiterForTests } from '../decision/engineSlot.js'
-import { EVIDENCE_VALUE_LEVELS, RECALL_STATUS_OPTIONS } from '../decision/recallEvidence.js'
+import { EVIDENCE_VALUE_LEVELS } from '../decision/recallEvidence.js'
 import type { DecisionLogSink, ShadowRunRecord } from '../decision/decisionLog.js'
 import type { DecisionEngine, DecisionRequest, DecisionResult } from '../decision/types.js'
 
 const NOW = new Date('2026-09-24T12:00:00.000Z')
 const QUERY = 'how many cameras does Phoenix use'
 
-interface Verdict { answers: number; status: string; evidence: number }
+/** v2 verdict: the five nouls/score `evaluateRecallCandidates` now asks. Unset flags
+ *  default to 0 — RANKED's fixtures only set what each test needs. */
+interface Verdict { answers: number; evidence: number; instruction?: number; pastState?: number; contradicts?: number }
 
 /** An engine whose verdict is looked up from the candidate content it is shown. */
 const mockEngine = (verdicts: Record<string, Verdict | Error>) => {
@@ -29,7 +31,6 @@ const mockEngine = (verdicts: Record<string, Verdict | Error>) => {
     const verdict = verdicts[content]
     if (verdict instanceof Error) throw verdict
     if (!verdict) throw new Error(`no verdict for "${content}"`)
-    const rest = (1 - 0.9) / (RECALL_STATUS_OPTIONS.length - 1)
     const level = Math.round(verdict.evidence)
     return {
       provider: 'mock',
@@ -37,18 +38,15 @@ const mockEngine = (verdicts: Record<string, Verdict | Error>) => {
       requestedModel: 'mock-latest',
       answers: {
         answers_query: { type: 'noul', probability: verdict.answers },
-        status: {
-          type: 'choice',
-          choice: verdict.status,
-          probabilities: Object.fromEntries(RECALL_STATUS_OPTIONS.map(o => [o, o === verdict.status ? 0.9 : rest])),
-          confidence: 0.85,
-        },
         evidence_value: {
           type: 'score',
           score: verdict.evidence,
           probabilities: Object.fromEntries(EVIDENCE_VALUE_LEVELS.map((_, i) => [String(i), i === level ? 1 : 0])),
           confidence: 0.7,
         },
+        contradicts_premise: { type: 'noul', probability: verdict.contradicts ?? 0 },
+        contains_instruction: { type: 'noul', probability: verdict.instruction ?? 0 },
+        describes_past_state: { type: 'noul', probability: verdict.pastState ?? 0 },
       },
       usage: { inputTokens: 400, outputTokens: 12 },
       latencyMs: 35,
@@ -68,14 +66,16 @@ const memorySink = () => {
 
 const RANKED = [
   { id: 'noise', content: 'phoenix session notes', _relevance: 0.6, confidence: 1, sourceSystem: 'graph' },
-  { id: 'old', content: 'phoenix had 6 cameras', _relevance: 0.5, confidence: 1, sourceSystem: 'graph' },
+  // `flag: 'SUPERSEDED'` exercises the code-known correction multiplier (0.5x) that
+  // replaced v1's `superseded_context` status.
+  { id: 'old', content: 'phoenix had 6 cameras', _relevance: 0.5, confidence: 1, sourceSystem: 'graph', metadata: { flag: 'SUPERSEDED' } },
   { id: 'answer', content: 'phoenix uses 16 cameras', _relevance: 0.4, confidence: 0.6, sourceSystem: 'vector' },
 ]
 
 const VERDICTS: Record<string, Verdict> = {
-  'phoenix session notes': { answers: 0.05, status: 'irrelevant', evidence: 1 },
-  'phoenix had 6 cameras': { answers: 0.7, status: 'superseded_context', evidence: 3 },
-  'phoenix uses 16 cameras': { answers: 0.97, status: 'current', evidence: 4 },
+  'phoenix session notes': { answers: 0.05, evidence: 1 },
+  'phoenix had 6 cameras': { answers: 0.7, evidence: 3 },
+  'phoenix uses 16 cameras': { answers: 0.97, evidence: 4 },
 }
 
 const unthrottled = () => new TokenBucket({ ratePerSecond: 1e6, burst: 1e6, maxQueue: 1e6 })
@@ -165,8 +165,8 @@ describe('runServedRerank', () => {
       { id: 'semantic', content: 'Q3 sales are projected at 4.2M', _relevance: 0.2 },
     ]
     const { engine } = mockEngine({
-      'quarterly revenue forecast meeting was rescheduled': { answers: 0.03, status: 'irrelevant', evidence: 0 },
-      'Q3 sales are projected at 4.2M': { answers: 0.98, status: 'current', evidence: 4 },
+      'quarterly revenue forecast meeting was rescheduled': { answers: 0.03, evidence: 0 },
+      'Q3 sales are projected at 4.2M': { answers: 0.98, evidence: 4 },
     })
     const run = await runServedRerank({ engine, query: 'quarterly revenue forecast', ranked, now: NOW })
 

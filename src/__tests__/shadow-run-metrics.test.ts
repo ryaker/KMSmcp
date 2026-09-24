@@ -41,6 +41,9 @@ function cand(id: string, over: Partial<CandidateDecisionRecord> = {}): Candidat
     policy_protected: null,
     policy_shadow_score: 0.5,
     policy_shadow_rank: 1,
+    policy_contains_instruction_flag: null,
+    policy_contradicts_premise_flag: null,
+    policy_past_state_probability: null,
     model: 'jev-1.13.0',
     request_id: null,
     latency_ms: 100,
@@ -77,6 +80,81 @@ function run(over: Partial<ShadowRunRecord> = {}): ShadowRunRecord {
 }
 
 const line = (r: unknown): string => JSON.stringify(r) + '\n'
+
+/**
+ * A v2-shaped row, as `evaluateRecallCandidates` now writes it: `question_schema_version`
+ * / `policy_version` at `recall-evidence/v2` / `recall-shadow-policy/v2`, and each
+ * candidate's `jev` block carries the five v2 answers (no `status` Choice) plus the three
+ * `policy_*` flags/probability `shadowScoreV2` adds. Declared `as ShadowRunRecord` (not
+ * through the `run()`/`cand()` v1 fixtures) because `CandidateDecisionRecord['jev']` is
+ * typed to the v2 shape now — this is what a REAL v2 row looks like, not a v1 fixture with
+ * fields renamed.
+ */
+function v2Run(over: Record<string, unknown> = {}): ShadowRunRecord {
+  return {
+    ...run({
+      run_id: 'run-v2',
+      question_schema_version: 'recall-evidence/v2',
+      policy_version: 'recall-shadow-policy/v2',
+      candidates: [
+        {
+          ...cand('a'),
+          jev: {
+            answers_query: { jev_probability: 0.9 },
+            evidence_value: { score: 3.2, jev_probabilities: { direct: 0.7, partial: 0.3 }, jev_confidence: 0.8 },
+            contradicts_premise: { jev_probability: 0.05 },
+            contains_instruction: { jev_probability: 0.82 },
+            describes_past_state: { jev_probability: 0.1 },
+          },
+          policy_contains_instruction_flag: true,
+          policy_contradicts_premise_flag: false,
+          policy_past_state_probability: 0.1,
+        },
+      ],
+    }),
+    ...over,
+  } as ShadowRunRecord
+}
+
+// ── version tolerance ────────────────────────────────────────────────────────
+
+describe('v1/v2 log tolerance', () => {
+  it('parses a v1 row and a v2 row from the same log, distinguished by question_schema_version/policy_version', () => {
+    const p = parseShadowLog(line(run()) + line(v2Run()))
+    expect(p.rows.map(r => r.run_id)).toEqual(['run-1', 'run-v2'])
+    expect(p.malformedLines).toBe(0)
+    expect(p.rows[0].question_schema_version).toBe('v1')
+    expect(p.rows[1].question_schema_version).toBe('recall-evidence/v2')
+  })
+
+  it('summarize/orderingMetrics/protectionAudit/runTotals never touch `.jev` — v1 and v2 rows score identically for everything but the version tags', () => {
+    const v1Only = summarize([run()])
+    const v2Only = summarize([v2Run()])
+    // Same shapes, same field names throughout — nothing here branches on schema version.
+    expect(Object.keys(v1Only)).toEqual(Object.keys(v2Only))
+    expect(Object.keys(v1Only.ordering)).toEqual(Object.keys(v2Only.ordering))
+    expect(Object.keys(v1Only.protection)).toEqual(Object.keys(v2Only.protection))
+  })
+
+  it('tallies both schema/policy versions separately when a run set has both', () => {
+    const combined = summarize([run(), run({ run_id: 'run-1b' }), v2Run()])
+    expect(combined.policyVersions).toEqual({
+      'recall-shadow-policy/v1': 2,
+      'recall-shadow-policy/v2': 1,
+    })
+  })
+
+  it('renderReport prints a mixed v1/v2 run set without throwing', () => {
+    const summary = summarize([run(), v2Run()])
+    const rendered = renderReport(
+      [{ label: 'combined', file: 'combined.jsonl', parsed: { rows: [run(), v2Run()], malformedLines: 0, partialTailLines: 0, unorderedRuns: 0 } }],
+      summary,
+      { labelSetProvided: false }
+    )
+    expect(rendered).toContain('recall-shadow-policy/v1')
+    expect(rendered).toContain('recall-shadow-policy/v2')
+  })
+})
 
 // ── parsing ──────────────────────────────────────────────────────────────────
 

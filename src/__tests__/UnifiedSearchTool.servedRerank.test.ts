@@ -29,7 +29,7 @@ const GRAPH = [
   entry('semantic', 'Q3 sales are projected at 4.2M'),
 ]
 
-/** Scores by content: the inverse of production order. */
+/** Scores by content: the inverse of production order. v2 questions — no `status` Choice. */
 const opinionatedEngine = () => {
   const evaluate = jest.fn(async (request: any): Promise<DecisionResult> => {
     const isAnswer = String(request.state.candidate.content).includes('4.2M')
@@ -37,11 +37,10 @@ const opinionatedEngine = () => {
       provider: 'mock', model: 'mock-1', requestedModel: 'mock-latest',
       answers: {
         answers_query: { type: 'noul', probability: isAnswer ? 0.98 : 0.03 },
-        status: {
-          type: 'choice', choice: isAnswer ? 'current' : 'irrelevant', confidence: 0.9,
-          probabilities: { current: isAnswer ? 0.96 : 0.01, historical: 0.01, superseded_context: 0.01, contradictory: 0.01, irrelevant: isAnswer ? 0.01 : 0.96 },
-        },
         evidence_value: { type: 'score', score: isAnswer ? 3.9 : 0.2, confidence: 0.8, probabilities: { 0: 0.1, 1: 0.1, 2: 0.1, 3: 0.1, 4: 0.6 } },
+        contradicts_premise: { type: 'noul', probability: 0 },
+        contains_instruction: { type: 'noul', probability: 0 },
+        describes_past_state: { type: 'noul', probability: 0 },
       },
       usage: { inputTokens: 300, outputTokens: 10 }, latencyMs: 20, costUsdEstimate: 0.0000126,
     }
