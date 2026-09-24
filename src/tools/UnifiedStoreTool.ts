@@ -5,7 +5,7 @@
 import crypto from 'crypto'
 import { UnifiedKnowledge, StorageDecision, SystemName, KnowledgeFlag } from '../types/index.js'
 import { IntelligentStorageRouter } from '../routing/IntelligentStorageRouter.js'
-import { OllamaStorageRouter } from '../routing/OllamaStorageRouter.js'
+import type { StorageTargetRouter } from '../routing/OllamaStorageRouter.js'
 import { EnrichmentQueue } from '../inference/EnrichmentQueue.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
@@ -224,7 +224,7 @@ export class UnifiedStoreTool {
     mem0: Mem0Storage
   }
   private cache: FACTCache
-  private ollamaRouter: OllamaStorageRouter | null
+  private ollamaRouter: StorageTargetRouter | null
   private enrichmentQueue: EnrichmentQueue | null
   private embeddingService: EmbeddingService | null
   private llmJudge: LLMJudgeService | null
@@ -244,7 +244,7 @@ export class UnifiedStoreTool {
     router: IntelligentStorageRouter,
     storage: { mongodb: MongoDBStorage, graph: GraphStorage, mem0: Mem0Storage },
     cache: FACTCache | null,
-    ollamaRouter?: OllamaStorageRouter | null,
+    ollamaRouter?: StorageTargetRouter | null,
     enrichmentQueue?: EnrichmentQueue | null,
     embeddingService?: EmbeddingService | null,
     llmJudge?: LLMJudgeService | null,
@@ -1009,7 +1009,7 @@ export class UnifiedStoreTool {
         primary: primarySystem,
         secondary: secondarySystems,
         cacheStrategy: fallbackDecision.cacheStrategy,
-        reasoning: `OllamaStorageRouter(${ollamaDecision.source}, confidence=${ollamaDecision.confidence.toFixed(2)})`
+        reasoning: `${ollamaDecision.source === 'jev' ? 'JevStorageRouter' : 'OllamaStorageRouter'}(${ollamaDecision.source}, confidence=${ollamaDecision.confidence.toFixed(2)})`
       }
     } else {
       decision = this.router.determineStorage(knowledge)

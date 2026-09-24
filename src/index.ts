@@ -20,7 +20,10 @@ import { KMSConfig, GraphStorage } from './types/index.js'
 import { FACTCache } from './cache/FACTCache.js'
 import { RedisKeepAlive } from './cache/RedisKeepAlive.js'
 import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js'
-import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js'
+import { OllamaStorageRouter, type StorageTargetRouter } from './routing/OllamaStorageRouter.js'
+import { createJevDecisionEngineFromEnv } from './decision/JevDecisionEngine.js'
+import { JevStorageRouter, isJevRouterEnabled } from './decision/jevStorageRouter.js'
+import { JevJudge, isJevJudgeEnabled } from './decision/jevJudge.js'
 import { OllamaInference, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_BASE_URL } from './inference/OllamaInference.js'
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js'
 import { EntityLinker } from './inference/EntityLinker.js'
@@ -185,15 +188,26 @@ export class UnifiedKMSServer {
     console.log(
       `🤖 Initializing LLM Judge (Ollama ${process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL})...`
     )
-    const llmJudge: LLMJudgeService = new OllamaJudge({
+    const ollamaJudge: LLMJudgeService = new OllamaJudge({
       baseUrl: process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
       model: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL
     })
 
+    // Jev (TypeSafe System One) for the write path's two judgments: the storage router and
+    // the Tier 2 dedup judge. ~0.2 s calibrated judgments instead of 5-19 s of generation on
+    // rym1; the Gemma router/judge above stay as the fallback on any Jev fault. Needs a Jev
+    // credential route; KMS_JEV_ROUTER=0 / KMS_JEV_JUDGE=0 turn either off.
+    const jevEngine = createJevDecisionEngineFromEnv()
+    const storageRouter: StorageTargetRouter =
+      jevEngine && isJevRouterEnabled() ? new JevStorageRouter(jevEngine, ollamaRouter) : ollamaRouter
+    const llmJudge: LLMJudgeService =
+      jevEngine && isJevJudgeEnabled() ? new JevJudge(jevEngine, ollamaJudge) : ollamaJudge
+    console.log(`🧭 Write-path judgments: router=${storageRouter === ollamaRouter ? 'ollama' : 'jev→ollama'}, dedup judge=${llmJudge.modelId}`)
+
     // Step 4: Initialize tools
     console.log('🛠️  Initializing Tools...')
     this.tools = {
-      store: new UnifiedStoreTool(this.router, this.storage, this.factCache, ollamaRouter, enrichmentQueue, embeddingService, llmJudge),
+      store: new UnifiedStoreTool(this.router, this.storage, this.factCache, storageRouter, enrichmentQueue, embeddingService, llmJudge),
       // The search tool shares the store tool's embedder so the hybrid retrieval arm
       // (KMS_HYBRID_RETRIEVAL=1, default off) reuses one `isAvailable()` probe cache
       // instead of re-probing Ollama on every search.

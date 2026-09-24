@@ -5,11 +5,23 @@ import { UnifiedKnowledge } from '../types/index.js'
 export interface RoutingDecision {
   targets: Array<'mem0' | 'mongodb' | 'graph'>
   contentType: string
-  source: 'llm' | 'regex'
+  source: 'jev' | 'llm' | 'regex'
   confidence: number
+  /**
+   * SHADOW ONLY — P(a future assistant should recall this by meaning), from the Jev
+   * router's `needs_semantic_recall` question. Measurement, not a routing input: mem0
+   * stays always-on regardless of this value, because nobody has decided to route by it
+   * yet. Present only when the Jev router answered (docs: 3C).
+   */
+  pMem0Needed?: number
 }
 
-export class OllamaStorageRouter {
+/** Anything that picks a write's storage targets. graph + mem0 are always included. */
+export interface StorageTargetRouter {
+  getStorageTargets(content: string, metadata?: Record<string, any>): Promise<RoutingDecision>
+}
+
+export class OllamaStorageRouter implements StorageTargetRouter {
   constructor(
     private ollama: OllamaInference,
     private fallback: IntelligentStorageRouter

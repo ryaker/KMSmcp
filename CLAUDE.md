@@ -88,6 +88,6 @@ embedder is also Ollama, so one outage disables both tiers. For bulk/episodic in
 - Doppler (`ry-local` `dev_eng` / `dev_personal`) injects env only at process start. A Doppler
   change needs `launchctl kickstart -k gui/$(id -u)/<agent>`.
 - After a deploy, confirm with a real `unified_store`: the router should report
-  `llm(...)`, not `regex(confidence=0.50)`.
+  `JevStorageRouter(jev, …)`. `OllamaStorageRouter(llm, …)` means the Jev fallback ran.
 - Never run Ollama inference on this Mac mini (16 GB, CI host). Local models run on rym1
   (`OLLAMA_BASE_URL`, Tailscale `100.127.128.76:11434`).
