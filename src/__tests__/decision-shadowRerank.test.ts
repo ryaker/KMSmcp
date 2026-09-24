@@ -4,13 +4,16 @@
  */
 
 import {
+  JEV_RERANK_DEADLINE_DEFAULT_MS,
   JEV_SHADOW_TOPK_DEFAULT,
   JEV_SHADOW_TOPK_MAX,
   isJevShadowRerankEnabled,
+  jevRerankDeadlineMs,
   jevShadowAction,
   jevShadowTopK,
   runShadowRerank,
 } from '../decision/shadowRerank.js'
+import { TokenBucket, setEngineRateLimiterForTests } from '../decision/engineSlot.js'
 import {
   EVIDENCE_VALUE_LEVELS,
   RECALL_CANDIDATE_MAX_CHARS,
@@ -160,6 +163,12 @@ describe('fingerprintRecallState', () => {
     expect(fingerprintRecallState(buildRecallState(QUERY, { ...candidate, content: 'edited' }, NOW))).not.toBe(fingerprintRecallState(state))
   })
 })
+
+// A bucket that never throttles, so these tests measure the rerank and not the rate
+// limit. The tests that are about the limit install their own.
+const unthrottled = () => new TokenBucket({ ratePerSecond: 1e6, burst: 1e6, maxQueue: 1e6 })
+beforeEach(() => setEngineRateLimiterForTests(unthrottled()))
+afterEach(() => setEngineRateLimiterForTests())
 
 describe('runShadowRerank', () => {
   it('asks the three recall-evidence questions once per candidate', async () => {
@@ -339,33 +348,31 @@ describe('runShadowRerank', () => {
     expect(run.candidates[0].policy_shadow_rank).toBe(1)
   })
 
-  it('caps in-flight engine calls across concurrent searches, not per search', async () => {
-    let inFlight = 0
-    let peak = 0
-    const evaluate = jest.fn(async (): Promise<DecisionResult> => {
-      peak = Math.max(peak, ++inFlight)
-      await new Promise(r => setTimeout(r, 5))
-      inFlight--
-      throw new Error('irrelevant to this test')
-    })
-    const engine: DecisionEngine = { provider: 'mock', requestedModel: 'm', evaluate }
-    const pool = (tag: string) => Array.from({ length: 10 }, (_, i) => ({ id: `${tag}${i}`, content: `content ${tag}${i}` }))
+  it('rate-limits engine calls across concurrent searches through one shared bucket', async () => {
+    jest.useFakeTimers()
+    try {
+      setEngineRateLimiterForTests(new TokenBucket({ ratePerSecond: 10, burst: 5, maxQueue: 100 }))
+      const evaluate = jest.fn(async (): Promise<DecisionResult> => { throw new Error('irrelevant to this test') })
+      const engine: DecisionEngine = { provider: 'mock', requestedModel: 'm', evaluate }
+      const pool = (tag: string) => Array.from({ length: 10 }, (_, i) => ({ id: `${tag}${i}`, content: `content ${tag}${i}` }))
 
-    await Promise.all(['a', 'b', 'c'].map(tag => runShadowRerank({ engine, query: QUERY, ranked: pool(tag), action: 'shadow_log', now: NOW })))
-
-    expect(evaluate).toHaveBeenCalledTimes(30)
-    expect(peak).toBe(4)
+      const runs = Promise.all(['a', 'b', 'c'].map(tag =>
+        runShadowRerank({ engine, query: QUERY, ranked: pool(tag), action: 'shadow_log', now: NOW, deadlineMs: 0 })))
+      await jest.advanceTimersByTimeAsync(0)
+      // The burst of 5 is shared by all three searches, not 5 each.
+      expect(evaluate).toHaveBeenCalledTimes(5)
+      await jest.advanceTimersByTimeAsync(1000)
+      expect(evaluate).toHaveBeenCalledTimes(15)
+      await jest.advanceTimersByTimeAsync(1500)
+      expect(evaluate).toHaveBeenCalledTimes(30)
+      await runs
+    } finally {
+      jest.useRealTimers()
+    }
   })
 
-  it('evaluates only the top K, and caps in-flight calls', async () => {
-    let inFlight = 0
-    let peak = 0
-    const evaluate = jest.fn(async (): Promise<DecisionResult> => {
-      peak = Math.max(peak, ++inFlight)
-      await new Promise(r => setTimeout(r, 5))
-      inFlight--
-      throw new Error('irrelevant to this test')
-    })
+  it('evaluates only the top K', async () => {
+    const evaluate = jest.fn(async (): Promise<DecisionResult> => { throw new Error('irrelevant to this test') })
     const ranked = Array.from({ length: 30 }, (_, i) => ({ id: `c${i}`, content: `content ${i}` }))
     const run = await runShadowRerank({
       engine: { provider: 'mock', requestedModel: 'm', evaluate }, query: QUERY, ranked, action: 'shadow_log', topK: 12, now: NOW,
@@ -374,13 +381,92 @@ describe('runShadowRerank', () => {
     expect(evaluate).toHaveBeenCalledTimes(12)
     expect(run.candidates_in_pool).toBe(30)
     expect(run.candidates_evaluated).toBe(12)
-    expect(peak).toBeLessThanOrEqual(4)
+  })
+
+  it('records a candidate refused by a full engine queue as a failed row, not a failed run', async () => {
+    setEngineRateLimiterForTests(new TokenBucket({ ratePerSecond: 1, burst: 2, maxQueue: 0 }))
+    const { engine, evaluate } = mockEngine(VERDICTS)
+    const run = await runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_reorder', now: NOW, deadlineMs: 0 })
+
+    expect(evaluate).toHaveBeenCalledTimes(2)
+    expect(run.candidates_failed).toBe(1)
+    expect(run.candidates[2].error).toMatch(/^EngineQueueFullError: /)
+    // Unjudged, so it keeps its production position.
+    expect(run.candidates[2].policy_shadow_rank).toBe(3)
   })
 
   it('survives a log sink that throws', async () => {
     const { engine } = mockEngine(VERDICTS)
     const sink: DecisionLogSink = { write: jest.fn().mockRejectedValue(new Error('disk full')) }
     await expect(runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_log', sink, now: NOW })).resolves.toMatchObject({ candidates_evaluated: 3 })
+  })
+
+  it('aborts the whole search at the deadline: late candidates are unjudged and keep their place', async () => {
+    jest.useFakeTimers()
+    try {
+      const signals: AbortSignal[] = []
+      const { engine: fast } = mockEngine(VERDICTS)
+      // 'answer' hangs until its signal fires, as the SDK request would; the rest answer at once.
+      const evaluate = jest.fn((request: DecisionRequest): Promise<DecisionResult> => {
+        signals.push(request.signal!)
+        if ((request.state as any).candidate.content !== 'phoenix uses 16 cameras') return fast.evaluate(request)
+        return new Promise((_, reject) => request.signal!.addEventListener('abort', () => reject(new Error('Request was aborted.'))))
+      })
+      const engine: DecisionEngine = { provider: 'mock', requestedModel: 'm', evaluate }
+      const { sink, rows } = memorySink()
+
+      const pending = runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_reorder', sink, now: NOW, deadlineMs: 300 })
+      await jest.advanceTimersByTimeAsync(299)
+      expect(signals).toHaveLength(3)
+      expect(signals.every(s => s === signals[0])).toBe(true) // one controller for the search
+      expect(signals[0].aborted).toBe(false)
+      await jest.advanceTimersByTimeAsync(1)
+      const run = await pending
+
+      expect(signals[0].aborted).toBe(true)
+      expect(run.candidates_failed).toBe(1)
+      expect(run.candidates[2]).toMatchObject({ id: 'answer', jev: null, policy_shadow_score: null, policy_shadow_rank: 3 })
+      expect(run.candidates[2].error).toBe('DeadlineExceeded: not judged within the 300ms search deadline')
+      expect(run.candidates[0].error).toBeNull()
+      expect(run.candidates[1].error).toBeNull()
+      expect(rows).toHaveLength(1)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('ends at the deadline even when the engine ignores the signal, and drops queued waiters', async () => {
+    jest.useFakeTimers()
+    try {
+      // Burst 1 at 1/s: the second and third candidates are still queued when the deadline fires.
+      const bucket = new TokenBucket({ ratePerSecond: 1, burst: 1, maxQueue: 10 })
+      setEngineRateLimiterForTests(bucket)
+      const evaluate = jest.fn((): Promise<DecisionResult> => new Promise(() => { /* never settles */ }))
+      const engine: DecisionEngine = { provider: 'mock', requestedModel: 'm', evaluate }
+
+      const pending = runShadowRerank({ engine, query: QUERY, ranked: RANKED, action: 'shadow_log', now: NOW, deadlineMs: 200 })
+      await jest.advanceTimersByTimeAsync(0)
+      expect(bucket.queued).toBe(2)
+      await jest.advanceTimersByTimeAsync(200)
+      const run = await pending
+
+      expect(evaluate).toHaveBeenCalledTimes(1)
+      expect(bucket.queued).toBe(0)
+      expect(run.candidates_failed).toBe(3)
+      expect(run.candidates.every(c => c.error?.startsWith('DeadlineExceeded:'))).toBe(true)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('reads the deadline from KMS_JEV_RERANK_DEADLINE_MS, 0 disabling it', () => {
+    expect(jevRerankDeadlineMs({})).toBe(JEV_RERANK_DEADLINE_DEFAULT_MS)
+    expect(JEV_RERANK_DEADLINE_DEFAULT_MS).toBe(800)
+    expect(jevRerankDeadlineMs({ KMS_JEV_RERANK_DEADLINE_MS: '1500' })).toBe(1500)
+    expect(jevRerankDeadlineMs({ KMS_JEV_RERANK_DEADLINE_MS: '0' })).toBe(0)
+    for (const bad of ['-1', '2.5', 'soon', '  ']) {
+      expect(jevRerankDeadlineMs({ KMS_JEV_RERANK_DEADLINE_MS: bad })).toBe(JEV_RERANK_DEADLINE_DEFAULT_MS)
+    }
   })
 
   it('handles an empty pool without calling the engine', async () => {

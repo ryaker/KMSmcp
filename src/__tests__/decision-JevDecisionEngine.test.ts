@@ -145,14 +145,21 @@ describe('credential routing', () => {
   it('builds an engine for the gateway route and for a direct key', () => {
     const viaGateway = createJevDecisionEngineFromEnv({
       ONECLI_TOKEN: 'agent-token', ONECLI_GATEWAY: 'http://localhost:10255',
-      ONECLI_CA_CERT: '/nonexistent/ca.pem', KMS_JEV_MODEL: 'jev-1.13.0',
+      ONECLI_CA_CERT: '/nonexistent/ca.pem', KMS_JEV_MODEL: 'jev-1.14.0',
     })
     expect(viaGateway).toBeInstanceOf(JevDecisionEngine)
-    expect(viaGateway!.requestedModel).toBe('jev-1.13.0')
+    expect(viaGateway!.requestedModel).toBe('jev-1.14.0')
 
     const direct = createJevDecisionEngineFromEnv({ TYPESAFE_API_KEY: 'k' })
     expect(direct).toBeInstanceOf(JevDecisionEngine)
     expect(direct!.requestedModel).toBe(JEV_DEFAULT_MODEL)
+  })
+
+  it('defaults to the pinned jev-1.13.0, never a moving alias', () => {
+    expect(JEV_DEFAULT_MODEL).toBe('jev-1.13.0')
+    expect(createJevDecisionEngineFromEnv({ TYPESAFE_API_KEY: 'k' })!.requestedModel).toBe('jev-1.13.0')
+    expect(createJevDecisionEngineFromEnv({ TYPESAFE_API_KEY: 'k', KMS_JEV_MODEL: '  ' })!.requestedModel).toBe('jev-1.13.0')
+    expect(new JevDecisionEngine({ client: stubClient().client }).requestedModel).toBe('jev-1.13.0')
   })
 })
 

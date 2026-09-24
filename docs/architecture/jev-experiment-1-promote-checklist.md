@@ -1,5 +1,30 @@
 # Jev Experiment 1 — promote checklist (at 200 shadow samples)
 
+## 2026-09-24 correction
+
+Read this before anything below. The older text is kept as it was written, except where it
+is marked **superseded**.
+
+- **The latency figures in this checklist (p50 2343 ms / p95 7219 ms per run) were produced
+  by the concurrency-4 cap in `src/decision/engineSlot.ts`, not by Jev.** That cap queued a
+  20-candidate search four requests at a time. Its premise was wrong: `max_workers=4` is a
+  thread count in TypeSafe's RAG cookbook notebook, not a rate limit. The documented limit
+  for `jev-1.13.0` is 1,200 requests/min and 250k tokens/s
+  ([Models](https://docs.typesafe.ai/models.md)). The cap is now a 15 requests/s token
+  bucket with a burst of 20 (`KMS_JEV_RPS`).
+- **Measured uncapped**, 20 concurrent calls per search over 12 searches: **p50 205 ms,
+  p95 356 ms per search**; per call p50 147 ms, p95 273 ms; **0 faults in 240 calls**.
+- **Quality labels now exist.** On 60 queries labelled by Gemma on rym1, top-1 accuracy:
+  production **0.71**, lexical baseline **0.64**, Jev per-candidate **0.89** (wins 12,
+  losses 2, delta **+0.18**, 95% CI **+0.06 to +0.31**). The "labels: NONE" line in the
+  status table below is out of date.
+- The design behind this experiment is replaced by the v2 architecture note,
+  `~/Documents/Notes/kms-jev-architecture-v2.md` ("KMS × Jev architecture, v2: rebuilt
+  from the TypeSafe docs"). Its §5 is the build order; this correction is part of step 1.
+- Shadow runs now have a whole-search deadline (`KMS_JEV_RERANK_DEADLINE_MS`, default
+  800 ms, `0` disables). Candidates not judged by then are logged as unjudged with a
+  `DeadlineExceeded` error, so the deadline-miss rate is in the log.
+
 **Nothing in this document promotes anything.** There is no auto-promote, no scheduled
 flip, and no flag that serves a shadow ordering. This is the list a human works through,
 by hand, when the sample gate is met — and it exists because a sample count on its own is
@@ -43,12 +68,17 @@ label set is a _not yet evaluated_ experiment, not a passing one.
 | signal-consistency disagreements | 0 |
 | candidate errors / failed | 0 / 0 |
 | cost | $0.001143/run, $0.1497 total |
-| run latency | p50 2343 ms, p95 7219 ms |
+| run latency | ~~p50 2343 ms, p95 7219 ms~~ **superseded 2026-09-24** — an artefact of the concurrency-4 cap; see the correction at the top |
 | model / policy | `jev-1.13.0` / `recall-shadow-policy/v1` |
 | labels | **NONE** — quality delta not computed |
 
 The ETA is extrapolation from a window spanning under a day, so it moves. Re-run the
 report rather than trusting this table.
+
+> **Superseded (2026-09-24): the run-latency row above.** Those numbers measured the
+> concurrency-4 queue, not Jev. Uncapped: p50 205 ms, p95 356 ms per 20-candidate search.
+> Runs logged before the rate-limiter change carry the old queueing in `latency_ms`;
+> do not compare them with later runs.
 
 ## Before promotion — invariants
 

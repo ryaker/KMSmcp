@@ -34,6 +34,22 @@ export const JEV_SHADOW_TOPK_DEFAULT = 20
 /** Hard ceiling — one request per candidate, so this bounds the cost of any one search. */
 export const JEV_SHADOW_TOPK_MAX = 50
 
+/**
+ * One deadline for the whole search, in ms; `0` disables it. When it fires, the search's
+ * single AbortController aborts every request still queued or in flight, and those
+ * candidates are logged as unjudged — which the shadow policy already keeps at their
+ * production position.
+ *
+ * Why 800 ms, although shadow mode answers nobody: the shadow log is the evidence for
+ * serving, so it should measure what a served re-rank would actually get. Measured
+ * uncapped, a 20-candidate search took p50 205 ms / p95 356 ms (per call p95 273 ms), so
+ * 800 ms cuts off only the tail, and the unjudged count per run becomes the deadline-miss
+ * rate a served path would see. Set it to 0 to record every judgment however late (the
+ * pre-2026-09-24 behaviour, bounded only by the engine's per-attempt timeout).
+ */
+export const JEV_RERANK_DEADLINE_ENV = 'KMS_JEV_RERANK_DEADLINE_MS'
+export const JEV_RERANK_DEADLINE_DEFAULT_MS = 800
+
 export function isJevShadowRerankEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env[JEV_SHADOW_RERANK_FLAG] === '1'
 }
@@ -46,6 +62,13 @@ export function jevShadowTopK(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env[JEV_SHADOW_TOPK_ENV])
   if (!Number.isInteger(parsed) || parsed < 1) return JEV_SHADOW_TOPK_DEFAULT
   return Math.min(parsed, JEV_SHADOW_TOPK_MAX)
+}
+
+export function jevRerankDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[JEV_RERANK_DEADLINE_ENV]
+  if (raw === undefined || raw.trim() === '') return JEV_RERANK_DEADLINE_DEFAULT_MS
+  const parsed = Number(raw)
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : JEV_RERANK_DEADLINE_DEFAULT_MS
 }
 
 /** A ranked retrieval result, as `unified_search` holds it just before slicing. */
@@ -67,6 +90,32 @@ export interface ShadowRerankInput {
   topK?: number
   sink?: DecisionLogSink | null
   now?: Date
+  /** Whole-search deadline in ms; `0` disables. Defaults to `KMS_JEV_RERANK_DEADLINE_MS`, else 800. */
+  deadlineMs?: number
+}
+
+class DeadlineExceededError extends Error {
+  constructor(deadlineMs: number) {
+    super(`not judged within the ${deadlineMs}ms search deadline`)
+    this.name = 'DeadlineExceeded'
+  }
+}
+
+/**
+ * Settle with `promise`, or reject as soon as `signal` fires — whichever is first. The
+ * SDK aborts its request on the signal too; this is what guarantees the run ends at the
+ * deadline even if an engine ignores it.
+ */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      value => { signal.removeEventListener('abort', onAbort); resolve(value) },
+      error => { signal.removeEventListener('abort', onAbort); reject(error) }
+    )
+  })
 }
 
 function finiteOrNull(value: unknown): number | null {
@@ -115,7 +164,14 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
   const now = input.now ?? new Date()
   const evaluated = input.ranked.slice(0, input.topK ?? JEV_SHADOW_TOPK_DEFAULT)
 
-  const records = await Promise.all(evaluated.map((candidate, index) => withEngineSlot(async (): Promise<CandidateDecisionRecord> => {
+  const deadlineMs = input.deadlineMs ?? jevRerankDeadlineMs()
+  const controller = new AbortController()
+  const { signal } = controller
+  const deadlineTimer = deadlineMs > 0
+    ? setTimeout(() => controller.abort(new DeadlineExceededError(deadlineMs)), deadlineMs)
+    : null
+
+  const records = await Promise.all(evaluated.map(async (candidate, index): Promise<CandidateDecisionRecord> => {
     const callStarted = Date.now()
     // Everything that touches the candidate is inside the try. A retrieval result is an
     // untyped bag from three backends; one that throws while being read must cost one
@@ -146,7 +202,12 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
         policy_protected: protectionReason(candidate),
       }
 
-      const result = await input.engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS })
+      // The rate-limit wait is inside the try and under the deadline: a candidate still
+      // queued when the deadline fires, or refused by a full queue, is one unjudged row.
+      const result = await untilAborted(
+        withEngineSlot(() => input.engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS, signal }), { signal }),
+        signal
+      )
       const jev = readJudgment(result)
       return {
         ...base,
@@ -166,6 +227,8 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
         error: null,
       }
     } catch (e) {
+      // Whatever the SDK or the bucket threw on abort, a deadline miss is logged as one.
+      const cause = signal.aborted && signal.reason instanceof DeadlineExceededError ? signal.reason : e
       return {
         ...base,
         jev: null,
@@ -175,10 +238,13 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
         latency_ms: Date.now() - callStarted,
         usage: null,
         cost_usd_estimate: null,
-        error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+        error: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause),
       }
     }
-  })))
+  }))
+  if (deadlineTimer) clearTimeout(deadlineTimer)
+  const deadlineHit = signal.aborted
+  const unjudgedByDeadline = records.filter(r => r.error?.startsWith('DeadlineExceeded:')).length
 
   let order: string[] | null = null
   if (input.action === 'shadow_reorder') {
@@ -232,7 +298,12 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
   }
   logger.info(
     `decision: ${run.policy_decision} ${run.candidates_evaluated - run.candidates_failed}/${run.candidates_evaluated} judged in ${run.latency_ms}ms` +
-    ` (${run.usage.input_tokens} in-tok${run.cost_usd_estimate !== null ? `, ~$${run.cost_usd_estimate}` : ''})`
+    ` (${run.usage.input_tokens} in-tok${run.cost_usd_estimate !== null ? `, ~$${run.cost_usd_estimate}` : ''})` +
+    (deadlineMs > 0
+      ? deadlineHit
+        ? `; deadline ${deadlineMs}ms HIT, ${unjudgedByDeadline} unjudged`
+        : `; within ${deadlineMs}ms deadline`
+      : '; no deadline')
   )
   return run
 }
