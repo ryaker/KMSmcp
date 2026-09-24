@@ -206,6 +206,15 @@ export class UnifiedSearchTool {
       maxResults?: number
       cacheStrategy?: 'aggressive' | 'conservative' | 'realtime'
       includeFlagged?: boolean
+      /**
+       * EVAL-ONLY. `false` skips the served Jev re-rank for THIS request and returns
+       * production order, even when KMS_JEV_RERANK=1 server-wide. Not a normal caller
+       * option — set only by the offline labelling harness
+       * (`src/scripts/label-recall-pool.ts`) so it can measure production order without
+       * turning the server flag off for every other caller. Omitted, or any value other
+       * than `false` (including `true`), has no effect on behaviour.
+       */
+      jevRerank?: boolean
     }
   }): Promise<{
     query: string
@@ -289,7 +298,17 @@ export class UnifiedSearchTool {
     const hybridEnabled = isHybridRetrievalEnabled()
     // Read once per search, alongside the other mode flags: it decides both whether a
     // cache hit is servable (below) and whether a miss runs the served re-rank (Step 4a).
-    const jevRerankOn = isJevServedRerankEnabled()
+    //
+    // `options.jevRerank === false` is the eval-only per-request bypass: it is folded
+    // into `jevRerankOn` ITSELF, rather than checked as a separate branch further down,
+    // so every place that already gates on "was this response (possibly) reranked?" —
+    // the cache-hit check just below, the served-rerank call in Step 3b, and the
+    // `_rerankFlag` written alongside the cached entry — treats a bypassed request
+    // exactly like the server flag being off for it. A bypassed response is therefore
+    // never read back as a `_rerankFlag`-true cache hit, and a real reranked entry is
+    // never handed to a bypassed caller as if it were production order.
+    const jevRerankBypassed = args.options?.jevRerank === false
+    const jevRerankOn = isJevServedRerankEnabled() && !jevRerankBypassed
 
     // A cache entry written before KMS_EVAL_CAPTURE was set (or by a run with it off)
     // has no _evalCapture. Serving it as a hit would silently hand the harness a
@@ -520,7 +539,15 @@ export class UnifiedSearchTool {
     // Skipped when the served re-rank already ran for this search: that run already asked
     // the engine about this exact pool and wrote its own (`served: true`) row, so a second
     // shadow row would be a duplicate measurement that cost money for nothing new.
-    if (!jevRerankOn) this.startShadowRerank(args.query, rankedResults)
+    //
+    // Also skipped outright when this request bypassed serving (`options.jevRerank ===
+    // false`): the bypass exists so an eval caller gets production order WITHOUT spending
+    // any Jev budget on this request, and shadow rerank has its own independent flag
+    // (KMS_JEV_SHADOW_RERANK) — `jevRerankOn` being false here could otherwise mean either
+    // "serving is off" (shadow should still run) or "serving was bypassed for eval"
+    // (shadow must NOT run), and only the second case is reachable when `jevRerankBypassed`
+    // is true.
+    if (!jevRerankBypassed && !jevRerankOn) this.startShadowRerank(args.query, rankedResults)
 
     debug(`\n✅ UNIFIED SEARCH COMPLETE`)
     debug(`   Found: ${sortedResults.length} unique results`)
