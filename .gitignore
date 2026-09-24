@@ -19,6 +19,7 @@ dist/
 !tsconfig.test.json
 !test-fixtures/*.json
 !src/__tests__/fixtures/*.json
+!src/eval/fixtures/*.json
 !skills/**/*.json
 *.sh
 !examples/**/*.sh
