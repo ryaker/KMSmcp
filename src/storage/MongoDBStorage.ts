@@ -59,10 +59,20 @@ export class MongoDBStorage implements StorageSystem {
       const contentHash = this.contentFingerprint(knowledge.content)
       const docWithHash = { ...knowledge, contentHash }
 
-      // Upsert on contentHash — prevents duplicate documents when the same
-      // content is stored at different timestamps.
+      // Upsert on id, not contentHash. The dedup gate in UnifiedStoreTool
+      // (Tier 0 fingerprint / Tier 1 cosine) is the system's dedup layer —
+      // by the time knowledge reaches here, `id` is the identity every other
+      // backend (SparrowDB, Mem0) and every later id-keyed op (flag/update/
+      // delete/supersede) already agrees on. Upserting on contentHash used
+      // to let a second store() with identical-but-not-deduped content
+      // silently keep the OLD document under the OLD id while the other
+      // backends stored the NEW id — every later operation on the new id
+      // then missed Mongo entirely (matchedCount/deletedCount 0). Keying on
+      // id makes every id the router sends resolve to a Mongo document with
+      // that same id; contentHash is kept as a plain, non-unique field for
+      // diagnostics only (see the contentHash migration in createIndexes()).
       const result = await this.collection.updateOne(
-        { contentHash },
+        { id: knowledge.id },
         { $setOnInsert: docWithHash },
         { upsert: true }
       )
@@ -70,7 +80,7 @@ export class MongoDBStorage implements StorageSystem {
       if (result.upsertedCount > 0) {
         console.log(`✅ Successfully stored in MongoDB (new document)`)
       } else {
-        console.log(`⚠️  MongoDB: duplicate content detected, skipped insert (contentHash: ${contentHash.slice(0, 8)}…)`)
+        console.log(`⚠️  MongoDB: id ${knowledge.id} already stored, skipped insert (contentHash: ${contentHash.slice(0, 8)}…)`)
       }
     } catch (error) {
       console.error('❌ MongoDB storage error:', error)
@@ -371,8 +381,32 @@ export class MongoDBStorage implements StorageSystem {
       await this.collection.createIndex({ confidence: -1 })
       await this.collection.createIndex({ timestamp: -1 })
 
-      // Unique index for deduplication via content fingerprint
-      await this.collection.createIndex({ contentHash: 1 }, { unique: true, sparse: true })
+      // Unique index on id — id is now the upsert key in store() (see the
+      // comment there) and the key every id-scoped op (findById/update/
+      // delete/flag) resolves through, so it needs its own index rather
+      // than relying on the (now non-unique) contentHash index below.
+      await this.collection.createIndex({ id: 1 }, { unique: true, sparse: true })
+
+      // contentHash migration (mongo-id-divergence fix, 2026-09): contentHash
+      // used to be the unique upsert key. That let a second store() with
+      // identical content silently keep the OLD document/OLD id while
+      // SparrowDB/Mem0 stored the NEW id — see store() above. contentHash is
+      // now a plain, non-unique diagnostic field; id is the identity. Create
+      // the non-unique replacement index BEFORE dropping the old unique one
+      // so the field is never briefly unindexed, then drop the legacy unique
+      // index (name 'contentHash_1', from the original
+      // `createIndex({ contentHash: 1 }, { unique: true, sparse: true })`
+      // call). No documents are touched — only index metadata changes.
+      await this.collection.createIndex({ contentHash: 1 }, { name: 'contentHash_1_nonunique' })
+      try {
+        await this.collection.dropIndex('contentHash_1')
+      } catch (error: any) {
+        // Already migrated, or a fresh DB that never had the legacy unique
+        // index — not fatal either way.
+        if (error?.codeName !== 'IndexNotFound' && error?.code !== 27) {
+          console.warn('⚠️ MongoDB: could not drop legacy unique contentHash index:', error)
+        }
+      }
 
       // Compound indexes for common queries
       await this.collection.createIndex({ userId: 1, contentType: 1 })
