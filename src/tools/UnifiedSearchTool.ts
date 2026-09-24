@@ -20,12 +20,17 @@ import {
   createJevDecisionEngineFromEnv,
   decisionLogFromEnv,
   isJevShadowRerankEnabled,
+  isJevServedRerankEnabled,
+  jevRerankDeadlineMs,
   jevShadowAction,
   jevShadowTopK,
+  runServedRerank,
   runShadowRerank,
+  JEV_SERVED_RERANK_FLAG,
   JEV_SHADOW_RERANK_FLAG,
   type DecisionEngine,
   type DecisionLogSink,
+  type RerankMeta,
 } from '../decision/index.js'
 
 /** Shape of the KMS_EVAL_CAPTURE payload — the deduplicated, ranked pool captured
@@ -95,20 +100,52 @@ export class UnifiedSearchTool {
    * Cache hits do not trigger a run: the pool and the query are the ones a previous run
    * already judged, so a second row would be a duplicate measurement that cost money.
    */
-  private startShadowRerank(query: string, rankedResults: any[]): void {
-    if (!isJevShadowRerankEnabled()) return
-
+  /**
+   * The shared Jev engine, resolved from the environment on first use by whichever of
+   * shadow or served re-rank asks first. Both flags spend from the same credential and
+   * the same rate limiter, so there is exactly one engine per process regardless of how
+   * many of the two flags are on. Warns once, not once per flag and not once per search.
+   */
+  private resolveDecisionEngine(flagForWarning: string): DecisionEngine | null {
     if (this.decisionEngine === undefined) {
       this.decisionEngine = createJevDecisionEngineFromEnv()
       if (!this.decisionEngine) {
-        console.error(`⚠️ ${JEV_SHADOW_RERANK_FLAG}=1 but no Jev credential route (ONECLI_TOKEN+ONECLI_GATEWAY, or TYPESAFE_API_KEY) — shadow rerank disabled for this process`)
+        console.error(`⚠️ ${flagForWarning}=1 but no Jev credential route (ONECLI_TOKEN+ONECLI_GATEWAY, or TYPESAFE_API_KEY) — rerank disabled for this process`)
       }
     }
-    if (!this.decisionEngine) return
+    return this.decisionEngine
+  }
+
+  /**
+   * Served recall re-rank (`KMS_JEV_RERANK=1`). Unlike shadow, this is AWAITED — its
+   * ordering is what the caller receives — so it is called from `search()` itself, not
+   * fired off after the response is built. Never called on a cache hit (the cached
+   * response already carries whatever `_rerank` its own write produced).
+   */
+  private async runServedRerankForSearch(query: string, rankedResults: any[]): Promise<{ ordered: any[], meta: RerankMeta }> {
+    const engine = this.resolveDecisionEngine(JEV_SERVED_RERANK_FLAG)
+    if (this.decisionLog === undefined) this.decisionLog = decisionLogFromEnv()
+
+    const outcome = await runServedRerank({
+      engine,
+      query,
+      ranked: rankedResults,
+      topK: jevShadowTopK(),
+      deadlineMs: jevRerankDeadlineMs(),
+      sink: this.decisionLog,
+    })
+    return { ordered: outcome.ordered, meta: outcome.meta }
+  }
+
+  private startShadowRerank(query: string, rankedResults: any[]): void {
+    if (!isJevShadowRerankEnabled()) return
+
+    const engine = this.resolveDecisionEngine(JEV_SHADOW_RERANK_FLAG)
+    if (!engine) return
     if (this.decisionLog === undefined) this.decisionLog = decisionLogFromEnv()
 
     const run: Promise<void> = runShadowRerank({
-      engine: this.decisionEngine,
+      engine,
       query,
       ranked: rankedResults,
       action: jevShadowAction(),
@@ -205,6 +242,10 @@ export class UnifiedSearchTool {
     // Present (and true) only when KMS_HYBRID_RETRIEVAL=1. Also persisted into the cache
     // entry so a response produced under one retrieval mode is never served to the other.
     _hybridRetrieval?: true
+    // Present only when KMS_JEV_RERANK=1 (default OFF) — what the served re-rank did.
+    // One object per response, never per result. Absent entirely when the flag is off,
+    // so a flag-off response is unchanged from before this field existed.
+    _rerank?: RerankMeta
   }> {
     const startTime = Date.now()
     
@@ -240,10 +281,15 @@ export class UnifiedSearchTool {
       sources: { mem0: number, graph: number, mongodb: number, vector?: number }
       _evalCapture?: EvalCapture
       _hybridRetrieval?: true
+      _rerank?: RerankMeta
+      _rerankFlag?: true
     }>(cacheKey) : null
     const cacheCheckTime = Date.now() - cacheCheckStart
     const wantsEvalCapture = process.env.KMS_EVAL_CAPTURE === '1'
     const hybridEnabled = isHybridRetrievalEnabled()
+    // Read once per search, alongside the other mode flags: it decides both whether a
+    // cache hit is servable (below) and whether a miss runs the served re-rank (Step 4a).
+    const jevRerankOn = isJevServedRerankEnabled()
 
     // A cache entry written before KMS_EVAL_CAPTURE was set (or by a run with it off)
     // has no _evalCapture. Serving it as a hit would silently hand the harness a
@@ -256,12 +302,20 @@ export class UnifiedSearchTool {
     // rankers silently compare a ranker against a cached copy of its rival. Treat a
     // mode mismatch as a miss. (Entries written before this field existed have it
     // undefined, which correctly reads as "lexical".)
+    //
+    // KMS_JEV_RERANK follows the exact same technique rather than folding the flag into
+    // `FACTCache.generateSearchKey` itself: the key stays a pure function of what the
+    // caller asked for, one entry is reused across whichever mode wrote it last, and a
+    // mode mismatch still costs nothing worse than one cache miss — never a re-ranked
+    // response served under the flag that produced production order, or vice versa.
     const cachedIsHybrid = cached?._hybridRetrieval === true
+    const cachedRerankFlag = cached?._rerankFlag === true
     if (
       cached &&
       query.options?.cacheStrategy !== 'realtime' &&
       (!wantsEvalCapture || cached._evalCapture) &&
-      cachedIsHybrid === hybridEnabled
+      cachedIsHybrid === hybridEnabled &&
+      cachedRerankFlag === jevRerankOn
     ) {
       debug(`⚡ CACHE HIT - Returning cached results`)
 
@@ -279,7 +333,8 @@ export class UnifiedSearchTool {
           totalTime: Date.now() - startTime
         },
         ...(cached._evalCapture ? { _evalCapture: cached._evalCapture } : {}),
-        ...(cached._hybridRetrieval ? { _hybridRetrieval: true as const } : {})
+        ...(cached._hybridRetrieval ? { _hybridRetrieval: true as const } : {}),
+        ...(cached._rerank ? { _rerank: cached._rerank } : {})
       }
     }
 
@@ -337,7 +392,6 @@ export class UnifiedSearchTool {
     const rankedResults = hybridEnabled
       ? this.rankResultsHybrid(uniqueResults, args.query)
       : this.rankResults(uniqueResults, args.query)
-    const sortedResults = rankedResults.slice(0, maxResults)
 
     // Eval capture (KMS_EVAL_CAPTURE=1). Off by default and zero-cost when off.
     //
@@ -385,6 +439,24 @@ export class UnifiedSearchTool {
 
     const mergingTime = Date.now() - mergingStart
 
+    // Step 3b: served Jev re-rank (KMS_JEV_RERANK=1 only, default OFF — the owner flips
+    // it). AWAITED, unlike the shadow run below: its ordering is what `maxResults`
+    // slicing (and the caller) actually sees. `rankedResults` itself is never touched —
+    // `evalCapture` above already captured it, and the fallback path on any fault is to
+    // hand `sortedResults` right back that same array.
+    //
+    // Deliberately absent when the flag is off: `_rerank` is only ever added to `result`
+    // below when `jevRerankOn`, so a flag-off response is exactly what it was before this
+    // change (see `UnifiedSearchTool.servedRerank.test.ts`, "flag off is byte-identical").
+    let finalRankedResults = rankedResults
+    let rerankMeta: RerankMeta | undefined
+    if (jevRerankOn) {
+      const outcome = await this.runServedRerankForSearch(args.query, rankedResults)
+      finalRankedResults = outcome.ordered
+      rerankMeta = outcome.meta
+    }
+    const sortedResults = finalRankedResults.slice(0, maxResults)
+
     // Step 4: Context expansion — entity cards + triggered actions
     // Runs AFTER merging so we know which entities surfaced before deciding what to expand.
     const { entity_context, triggered_actions } = await this.expandWithEntityContext(
@@ -426,7 +498,15 @@ export class UnifiedSearchTool {
       entity_context,
       triggered_actions,
       ...(evalCapture ? { _evalCapture: evalCapture } : {}),
-      ...(hybridEnabled ? { _hybridRetrieval: true as const } : {})
+      ...(hybridEnabled ? { _hybridRetrieval: true as const } : {}),
+      ...(rerankMeta ? { _rerank: rerankMeta } : {}),
+      // Cached alongside the response (never in the cache KEY — see the cache-hit gate
+      // above) so a later request under a different flag state treats this entry as a
+      // miss instead of serving production order as reranked or vice versa. Only ever
+      // set when the flag was on, matching `_hybridRetrieval`'s convention: an entry
+      // written before this field existed (or under the flag off) has it undefined,
+      // which correctly reads as "not reranked".
+      ...(jevRerankOn ? { _rerankFlag: true as const } : {})
     }
 
     // Step 5: Cache the results
@@ -437,7 +517,10 @@ export class UnifiedSearchTool {
     }
 
     // Shadow recall rerank — observes the ordering above, never feeds back into `result`.
-    this.startShadowRerank(args.query, rankedResults)
+    // Skipped when the served re-rank already ran for this search: that run already asked
+    // the engine about this exact pool and wrote its own (`served: true`) row, so a second
+    // shadow row would be a duplicate measurement that cost money for nothing new.
+    if (!jevRerankOn) this.startShadowRerank(args.query, rankedResults)
 
     debug(`\n✅ UNIFIED SEARCH COMPLETE`)
     debug(`   Found: ${sortedResults.length} unique results`)

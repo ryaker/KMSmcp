@@ -153,6 +153,119 @@ function readJudgment(result: DecisionResult): NonNullable<CandidateDecisionReco
   }
 }
 
+/** One candidate's evaluation — everything `runShadowRerank` and the served re-rank
+ *  (`servedRerank.ts`) both need, independent of what either does with the result.
+ *  `policy_shadow_score` is always computed when a judgment succeeds; a caller that only
+ *  wants it under `shadow_reorder` (the logged-shadow contract, pinned by
+ *  `UnifiedSearchTool.shadowRerank.test.ts`) nulls it back out itself. */
+async function evaluateOneCandidate(
+  engine: DecisionEngine,
+  query: string,
+  candidate: RankedRecallCandidate,
+  index: number,
+  now: Date,
+  signal: AbortSignal
+): Promise<CandidateDecisionRecord> {
+  const callStarted = Date.now()
+  // Everything that touches the candidate is inside the try. A retrieval result is an
+  // untyped bag from three backends; one that throws while being read must cost one
+  // row, not reject the run and discard the judgments already paid for.
+  let base: Pick<CandidateDecisionRecord, 'id' | 'production_rank' | 'state_fingerprint' | 'content_truncated' | 'retrieval' | 'policy_protected' | 'policy_shadow_rank'> = {
+    id: '',
+    production_rank: index + 1,
+    state_fingerprint: '',
+    content_truncated: false,
+    retrieval: { source_systems: [], retrieval_relevance: null, vector_similarity: null, ontology_score: null, knowledge_confidence: null },
+    policy_protected: null,
+    policy_shadow_rank: null,
+  }
+  try {
+    const state = buildRecallState(query, candidate, now)
+    base = {
+      ...base,
+      id: String(candidate.id ?? ''),
+      state_fingerprint: fingerprintRecallState(state),
+      content_truncated: (state as { candidate: { content_truncated: boolean } }).candidate.content_truncated,
+      retrieval: {
+        source_systems: candidate._sourceSystems ?? (candidate.sourceSystem ? [candidate.sourceSystem] : []),
+        retrieval_relevance: finiteOrNull(candidate._relevance),
+        vector_similarity: finiteOrNull(candidate._vectorSimilarity),
+        ontology_score: finiteOrNull(candidate._ontologyScore),
+        knowledge_confidence: finiteOrNull(candidate.confidence),
+      },
+      policy_protected: protectionReason(candidate),
+    }
+
+    // The rate-limit wait is inside the try and under the deadline: a candidate still
+    // queued when the deadline fires, or refused by a full queue, is one unjudged row.
+    const result = await untilAborted(
+      withEngineSlot(() => engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS, signal }), { signal }),
+      signal
+    )
+    const jev = readJudgment(result)
+    return {
+      ...base,
+      jev,
+      policy_shadow_score: shadowScore({
+        answersQuery: jev.answers_query.jev_probability,
+        statusProbabilities: jev.status.jev_probabilities as Partial<Record<RecallStatus, number>>,
+        evidenceValue: jev.evidence_value.score,
+      }),
+      model: result.model,
+      request_id: result.requestId ?? null,
+      latency_ms: result.latencyMs,
+      usage: { input_tokens: result.usage.inputTokens, output_tokens: result.usage.outputTokens },
+      cost_usd_estimate: result.costUsdEstimate,
+      error: null,
+    }
+  } catch (e) {
+    // Whatever the SDK or the bucket threw on abort, a deadline miss is logged as one.
+    const cause = signal.aborted && signal.reason instanceof DeadlineExceededError ? signal.reason : e
+    return {
+      ...base,
+      jev: null,
+      policy_shadow_score: null,
+      model: null,
+      request_id: null,
+      latency_ms: Date.now() - callStarted,
+      usage: null,
+      cost_usd_estimate: null,
+      error: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause),
+    }
+  }
+}
+
+export interface EvaluateCandidatesResult {
+  records: CandidateDecisionRecord[]
+  /** Whether the whole-batch deadline fired before every candidate settled. */
+  deadlineHit: boolean
+}
+
+/**
+ * Judge `evaluated` against `query`, one request per candidate, under one whole-batch
+ * deadline. Shared by `runShadowRerank` (fire-and-forget, logged) and `servedRerank.ts`
+ * (awaited, served) — everything about talking to the engine lives here exactly once.
+ */
+export async function evaluateRecallCandidates(
+  engine: DecisionEngine,
+  query: string,
+  evaluated: RankedRecallCandidate[],
+  now: Date,
+  deadlineMs: number
+): Promise<EvaluateCandidatesResult> {
+  const controller = new AbortController()
+  const { signal } = controller
+  const deadlineTimer = deadlineMs > 0
+    ? setTimeout(() => controller.abort(new DeadlineExceededError(deadlineMs)), deadlineMs)
+    : null
+
+  const records = await Promise.all(
+    evaluated.map((candidate, index) => evaluateOneCandidate(engine, query, candidate, index, now, signal))
+  )
+  if (deadlineTimer) clearTimeout(deadlineTimer)
+  return { records, deadlineHit: signal.aborted }
+}
+
 /**
  * Evaluate the top candidates and log the run. A failed candidate — whether the engine
  * failed or the candidate itself could not be read — is a row with `error` set; a failed
@@ -165,85 +278,16 @@ export async function runShadowRerank(input: ShadowRerankInput): Promise<ShadowR
   const evaluated = input.ranked.slice(0, input.topK ?? JEV_SHADOW_TOPK_DEFAULT)
 
   const deadlineMs = input.deadlineMs ?? jevRerankDeadlineMs()
-  const controller = new AbortController()
-  const { signal } = controller
-  const deadlineTimer = deadlineMs > 0
-    ? setTimeout(() => controller.abort(new DeadlineExceededError(deadlineMs)), deadlineMs)
-    : null
+  const { records, deadlineHit } = await evaluateRecallCandidates(input.engine, input.query, evaluated, now, deadlineMs)
 
-  const records = await Promise.all(evaluated.map(async (candidate, index): Promise<CandidateDecisionRecord> => {
-    const callStarted = Date.now()
-    // Everything that touches the candidate is inside the try. A retrieval result is an
-    // untyped bag from three backends; one that throws while being read must cost one
-    // row, not reject the run and discard the judgments already paid for.
-    let base: Pick<CandidateDecisionRecord, 'id' | 'production_rank' | 'state_fingerprint' | 'content_truncated' | 'retrieval' | 'policy_protected' | 'policy_shadow_rank'> = {
-      id: '',
-      production_rank: index + 1,
-      state_fingerprint: '',
-      content_truncated: false,
-      retrieval: { source_systems: [], retrieval_relevance: null, vector_similarity: null, ontology_score: null, knowledge_confidence: null },
-      policy_protected: null,
-      policy_shadow_rank: null,
-    }
-    try {
-      const state = buildRecallState(input.query, candidate, now)
-      base = {
-        ...base,
-        id: String(candidate.id ?? ''),
-        state_fingerprint: fingerprintRecallState(state),
-        content_truncated: (state as { candidate: { content_truncated: boolean } }).candidate.content_truncated,
-        retrieval: {
-          source_systems: candidate._sourceSystems ?? (candidate.sourceSystem ? [candidate.sourceSystem] : []),
-          retrieval_relevance: finiteOrNull(candidate._relevance),
-          vector_similarity: finiteOrNull(candidate._vectorSimilarity),
-          ontology_score: finiteOrNull(candidate._ontologyScore),
-          knowledge_confidence: finiteOrNull(candidate.confidence),
-        },
-        policy_protected: protectionReason(candidate),
-      }
-
-      // The rate-limit wait is inside the try and under the deadline: a candidate still
-      // queued when the deadline fires, or refused by a full queue, is one unjudged row.
-      const result = await untilAborted(
-        withEngineSlot(() => input.engine.evaluate({ state, questions: RECALL_EVIDENCE_QUESTIONS, signal }), { signal }),
-        signal
-      )
-      const jev = readJudgment(result)
-      return {
-        ...base,
-        jev,
-        policy_shadow_score: input.action === 'shadow_reorder'
-          ? shadowScore({
-              answersQuery: jev.answers_query.jev_probability,
-              statusProbabilities: jev.status.jev_probabilities as Partial<Record<RecallStatus, number>>,
-              evidenceValue: jev.evidence_value.score,
-            })
-          : null,
-        model: result.model,
-        request_id: result.requestId ?? null,
-        latency_ms: result.latencyMs,
-        usage: { input_tokens: result.usage.inputTokens, output_tokens: result.usage.outputTokens },
-        cost_usd_estimate: result.costUsdEstimate,
-        error: null,
-      }
-    } catch (e) {
-      // Whatever the SDK or the bucket threw on abort, a deadline miss is logged as one.
-      const cause = signal.aborted && signal.reason instanceof DeadlineExceededError ? signal.reason : e
-      return {
-        ...base,
-        jev: null,
-        policy_shadow_score: null,
-        model: null,
-        request_id: null,
-        latency_ms: Date.now() - callStarted,
-        usage: null,
-        cost_usd_estimate: null,
-        error: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause),
-      }
-    }
-  }))
-  if (deadlineTimer) clearTimeout(deadlineTimer)
-  const deadlineHit = signal.aborted
+  // `policy_shadow_score` is always computed by evaluateOneCandidate; the logged-shadow
+  // contract only ever reported it under `shadow_reorder` (see
+  // `UnifiedSearchTool.shadowRerank.test.ts`: "logs every field the brief requires"
+  // asserts `policy_shadow_score: null` under `shadow_log`), so a plain log run nulls it
+  // back out rather than exposing a number nobody asked to log a policy decision on.
+  if (input.action !== 'shadow_reorder') {
+    for (const r of records) r.policy_shadow_score = null
+  }
   const unjudgedByDeadline = records.filter(r => r.error?.startsWith('DeadlineExceeded:')).length
 
   let order: string[] | null = null

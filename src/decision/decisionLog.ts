@@ -85,6 +85,19 @@ export interface ShadowRunRecord {
   /** What deterministic code did with the judgments. Never anything but a shadow action. */
   policy_decision: ShadowAction
   /**
+   * True when this ordering was actually returned to the `unified_search` caller
+   * (`KMS_JEV_RERANK=1`, `src/decision/servedRerank.ts`). Absent/false for a shadow run
+   * that only observed the ordering already served — the two share this log file and this
+   * row shape, and this is the one field that tells them apart.
+   */
+  served?: boolean
+  /**
+   * Count of Mem0 shard candidates dropped before judging because their parent KMS id
+   * (`mem0ParentId`) was also in the candidate pool — the same entry judged once, not
+   * twice. Only a served run collapses; a shadow run leaves `undefined`.
+   */
+  collapsed_duplicates?: number
+  /**
    * The query text. Unlike candidate content this IS logged: it is the join key to the
    * eval harness's relevance labels, it is not a stored entry any corrective tool could
    * later retract, and the file is 0600 on the machine that already holds the store.
