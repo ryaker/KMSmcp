@@ -6,6 +6,7 @@ import crypto from 'crypto'
 import { KnowledgeQuery } from '../types/index.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
+import { mem0ParentId } from '../storage/Mem0Storage.js'
 import type { GraphStorage } from '../types/index.js'
 import type { EvalCandidate } from '../eval/rankers.js'
 import { OllamaEmbeddingService, type EmbeddingService } from '../embedding/EmbeddingService.js'
@@ -638,7 +639,7 @@ export class UnifiedSearchTool {
 
     const parentFlagged = new Map<string, boolean>()
     return results.filter(r => {
-      const parentId = r?.metadata?.kms_id
+      const parentId = mem0ParentId(r?.metadata)
       // No join key, or the shard IS the parent: nothing to inherit.
       if (!parentId || parentId === r.id) return true
       if (!parentFlagged.has(parentId)) {

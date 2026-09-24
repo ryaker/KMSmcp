@@ -52,6 +52,14 @@ describe('Mem0Storage.update — kms_update propagation', () => {
   // -------------------------------------------------------------------------
 
   describe('search-and-update happy path', () => {
+    it('matches the live SDK shape, where kms_id comes back camel-cased as kmsId', async () => {
+      mockClient.search.mockResolvedValue({
+        results: [{ id: 'mem0-id-live', memory: 'old', metadata: { kmsId: 'kms-abc' } }]
+      })
+      expect(await storage.update('kms-abc', 'corrected content')).toBe(true)
+      expect(mockClient.update).toHaveBeenCalledWith('mem0-id-live', { text: 'corrected content' })
+    })
+
     it('looks up mem0 id by metadata.kms_id and calls client.update with new content', async () => {
       mockClient.search.mockResolvedValue({
         results: [
