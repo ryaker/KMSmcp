@@ -36,6 +36,9 @@ import {
   type PoolRow,
 } from '../scripts/label-recall-pool.js'
 import type { DecisionEngine, DecisionResult } from '../decision/types.js'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
 
 // ── classifyQueryKind ────────────────────────────────────────────────────────
 
@@ -355,6 +358,8 @@ const poolRow = (over: Partial<PoolRow> = {}): PoolRow => ({
   kind: 'human',
   at: '2026-09-24T00:00:00.000Z',
   production_path: 'bypass',
+  label_source: 'gemma',
+  topk: 20,
   candidates: [],
   ...over,
 })
@@ -362,6 +367,18 @@ const poolRow = (over: Partial<PoolRow> = {}): PoolRow => ({
 describe('poolRowKey / alreadyDoneKeys', () => {
   it('keys on (source, query) — the same query text against two sources is NOT the same key', () => {
     expect(poolRowKey('eng', 'q')).not.toBe(poolRowKey('personal', 'q'))
+  })
+
+  it('defaults label_source=gemma, topk=20 — matches the pre-labeller/topk pool format', () => {
+    expect(poolRowKey('eng', 'q')).toBe(poolRowKey('eng', 'q', 'gemma', 20))
+  })
+
+  it('differs by label_source — a jev-labelled row is a different work item from a gemma one', () => {
+    expect(poolRowKey('eng', 'q', 'gemma', 20)).not.toBe(poolRowKey('eng', 'q', 'jev', 20))
+  })
+
+  it('differs by topk — a top-50 row is a different work item from a top-20 one', () => {
+    expect(poolRowKey('eng', 'q', 'jev', 20)).not.toBe(poolRowKey('eng', 'q', 'jev', 50))
   })
 
   it('alreadyDoneKeys reports exactly the (source, query) pairs present in the rows', () => {
@@ -373,19 +390,49 @@ describe('poolRowKey / alreadyDoneKeys', () => {
     expect(done.has(poolRowKey('personal', 'b'))).toBe(false)
     expect(done.size).toBe(3)
   })
+
+  it('a gemma@20 row and a jev@50 row for the SAME (source, query) are both tracked — a jev full run never skips an already gemma-graded query', () => {
+    const rows = [
+      poolRow({ source: 'eng', query: 'a', label_source: 'gemma', topk: 20 }),
+      poolRow({ source: 'eng', query: 'a', label_source: 'jev', topk: 50 }),
+    ]
+    const done = alreadyDoneKeys(rows)
+    expect(done.has(poolRowKey('eng', 'a', 'gemma', 20))).toBe(true)
+    expect(done.has(poolRowKey('eng', 'a', 'jev', 50))).toBe(true)
+    expect(done.size).toBe(2)
+  })
 })
 
 describe('loadPoolRows', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kms-label-pool-test-'))
+
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
   it('returns [] for a file that does not exist, without throwing', () => {
     expect(loadPoolRows('/nonexistent/path/does-not-exist.jsonl')).toEqual([])
+  })
+
+  it('defaults label_source to "gemma" and topk to 20 for a legacy row missing those fields', () => {
+    const file = path.join(tmpDir, 'legacy-pool.jsonl')
+    const legacyRow = { query: 'q', source: 'eng', kind: 'human', at: '2026-09-01T00:00:00.000Z', production_path: 'bypass', candidates: [] }
+    fs.writeFileSync(file, `${JSON.stringify(legacyRow)}\n`)
+    const [row] = loadPoolRows(file)
+    expect(row.label_source).toBe('gemma')
+    expect(row.topk).toBe(20)
+  })
+
+  it('preserves label_source/topk when already present', () => {
+    const file = path.join(tmpDir, 'current-pool.jsonl')
+    fs.writeFileSync(file, `${JSON.stringify(poolRow({ label_source: 'jev', topk: 50 }))}\n`)
+    const [row] = loadPoolRows(file)
+    expect(row.label_source).toBe('jev')
+    expect(row.topk).toBe(50)
   })
 })
 
 // ── grade/jev cache load (pure parsing over in-memory strings via a temp file) ──
-
-import fs from 'fs'
-import os from 'os'
-import path from 'path'
 
 describe('loadGradeCache / loadJevCache', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kms-label-test-'))
@@ -559,13 +606,37 @@ describe('buildReport / renderReport', () => {
     // Report prints ids/slices/numbers, never raw query text.
     expect(text).not.toContain(row.query)
   })
+
+  it('scores BOTH production order and the Jev v2 re-ranked order against Jev labels — no exclusion when label_source is "jev" (owner decision 2026-09-24)', () => {
+    const row = poolRow({
+      query: 'jev-labelled-query-marker',
+      source: 'eng',
+      kind: 'human',
+      label_source: 'jev',
+      topk: 20,
+      // production order (rank) picks 'b' first; the v2 re-rank score picks 'a' first —
+      // if both orderings are genuinely scored, production and jev metrics must differ.
+      candidates: [candidateRow('b', 0, 0.1, 1), candidateRow('a', 2, 0.9, 2)],
+    })
+    const metricRows = computeQueryMetrics(row)
+    const report = buildReport(metricRows)
+    const overallStrict = report.strict.find(s => s.slice === 'overall')!
+    // production top-1 ('b') is NOT relevant; jev-v2 top-1 ('a') IS — both are actually
+    // computed (not one substituted for or excluded in favour of the other).
+    expect(overallStrict.production.p1).toBe(0)
+    expect(overallStrict.jev.p1).toBe(1)
+
+    const text = renderReport(1, report)
+    expect(text).toContain('production')
+    expect(text).toContain('jev_v2')
+  })
 })
 
 // ── CLI arg parsing ──────────────────────────────────────────────────────────
 
 describe('parseArgs', () => {
-  it('defaults: no limit, source=all, not report-only, concurrency=1', () => {
-    expect(parseArgs([])).toEqual({ limit: null, source: 'all', reportOnly: false, concurrency: 1 })
+  it('defaults: no limit, source=all, not report-only, concurrency=1, labeler=gemma, topk=20', () => {
+    expect(parseArgs([])).toEqual({ limit: null, source: 'all', reportOnly: false, concurrency: 1, labeler: 'gemma', topk: 20 })
   })
 
   it('parses --limit N and --limit=N', () => {
@@ -604,8 +675,29 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--bogus'])).toThrow(/unrecognised argument/)
   })
 
+  it('parses --labeler and --labeler=', () => {
+    expect(parseArgs(['--labeler', 'jev']).labeler).toBe('jev')
+    expect(parseArgs(['--labeler=gemma']).labeler).toBe('gemma')
+  })
+
+  it('rejects an invalid --labeler', () => {
+    expect(() => parseArgs(['--labeler', 'bogus'])).toThrow(/--labeler must be/)
+  })
+
+  it('parses --topk and --topk=', () => {
+    expect(parseArgs(['--topk', '50']).topk).toBe(50)
+    expect(parseArgs(['--topk=50']).topk).toBe(50)
+  })
+
+  it('rejects a non-positive or non-integer --topk', () => {
+    expect(() => parseArgs(['--topk', '0'])).toThrow(/--topk must be/)
+    expect(() => parseArgs(['--topk', '-5'])).toThrow(/--topk must be/)
+    expect(() => parseArgs(['--topk', '3.5'])).toThrow(/--topk must be/)
+    expect(() => parseArgs(['--topk', 'nope'])).toThrow(/--topk must be/)
+  })
+
   it('combines multiple flags', () => {
-    const args = parseArgs(['--limit', '2', '--source', 'eng', '--report-only', '--concurrency', '3'])
-    expect(args).toEqual({ limit: 2, source: 'eng', reportOnly: true, concurrency: 3 })
+    const args = parseArgs(['--limit', '2', '--source', 'eng', '--report-only', '--concurrency', '3', '--labeler', 'jev', '--topk', '50'])
+    expect(args).toEqual({ limit: 2, source: 'eng', reportOnly: true, concurrency: 3, labeler: 'jev', topk: 50 })
   })
 })
