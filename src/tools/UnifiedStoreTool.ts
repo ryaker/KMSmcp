@@ -196,6 +196,20 @@ export interface InvalidActionResponse {
   error: string
 }
 
+/**
+ * Dedup-gate tier provenance, stamped into `knowledge.metadata.dedup_check`
+ * before the storage fan-out. Lets a stored entry be found and re-checked
+ * later when it went in unchecked because of a FAULT (embedder or backend
+ * outage) rather than a deliberate caller choice (writeMode: 'episodic' /
+ * options.skip_dedup, both of which report 'skipped').
+ */
+export interface DedupCheckMetadata {
+  tier0: 'ran' | 'skipped' | 'failed'
+  tier1: 'ran' | 'skipped' | 'unavailable' | 'failed'
+  /** Short cause, set only when a tier is 'unavailable' or 'failed'. */
+  reason?: string
+}
+
 export type UnifiedStoreResult =
   | {
       success: true
@@ -203,6 +217,13 @@ export type UnifiedStoreResult =
       storageDecision: StorageDecision
       cached: boolean
       performance: { routingTime: number; storageTime: number; totalTime: number }
+      /**
+       * Set only when the dedup gate was degraded by a FAULT (embedder
+       * unavailable, embed()/findSimilar() threw) rather than a caller
+       * choice. Absent on every normal write.
+       */
+      dedup_unchecked?: true
+      dedup_unchecked_reason?: string
     }
   | {
       success: false
@@ -570,6 +591,19 @@ export class UnifiedStoreTool {
     }
 
     // ---------------------------------------------------------------------
+    // Dedup-check provenance. Tracked through Tier 0 + Tier 1 below and
+    // stamped into knowledge.metadata.dedup_check just before the storage
+    // fan-out (after Tier 1) so every backend copy — including hosted Mem0 —
+    // carries which tiers actually ran. 'skipped' means a caller choice
+    // (writeMode: 'episodic' / options.skip_dedup, or an older binding that
+    // doesn't expose the lookup method); 'unavailable' / 'failed' mean a
+    // FAULT — the check should have run but couldn't.
+    // ---------------------------------------------------------------------
+    let dedupTier0: DedupCheckMetadata['tier0'] = 'skipped'
+    let dedupTier1: DedupCheckMetadata['tier1'] = 'skipped'
+    let dedupCheckReason: string | undefined
+
+    // ---------------------------------------------------------------------
     // Dedup gate — Tier 0 (DG-T0) fingerprint check (PREPENDS Tier 1)
     //
     // Cheap O(n) scan of the in-memory sidecar against a SHA-256 fingerprint
@@ -624,6 +658,7 @@ export class UnifiedStoreTool {
       args.options?.skip_dedup !== true &&
       typeof this.storage.graph.findByFingerprint === 'function'
     ) {
+      dedupTier0 = 'ran'
       try {
         // A review-queue write also dedups against flagged entries: re-running an
         // importer must not re-queue what is already pending, nor what a reviewer
@@ -690,6 +725,8 @@ export class UnifiedStoreTool {
         // project logger for consistency with the rest of the dedup-gate code
         // path (Tier 1 / Tier 2 also log via logger.warn — see the findSimilar
         // guard below).
+        dedupTier0 = 'failed'
+        dedupCheckReason = `tier0: findByFingerprint failed — ${e instanceof Error ? e.message : String(e)}`
         logger.warn(
           `⚠️ unified_store: findByFingerprint failed (continuing past Tier 0): ` +
           `${e instanceof Error ? e.message : String(e)}`
@@ -773,11 +810,29 @@ export class UnifiedStoreTool {
     // (2026-09-22): the interactive gate refused 25% of legitimate
     // chronological history.
     const gateTier1AndAbove = !skipDedup && args.writeMode !== 'episodic'
+
+    // Dedup-check provenance (DG-UNCHECKED): gateTier1AndAbove true means the
+    // caller did NOT choose to skip Tier 1 — so if we still have no
+    // embedding to search with, that's a FAULT (embedder unavailable or
+    // embed() threw above), not a caller choice. Flag it before the
+    // capability-gate below runs, so a missing findSimilar method (an older
+    // binding — a 'skipped' case, same as Tier 0's findByFingerprint gap)
+    // doesn't get misreported as 'unavailable'.
+    if (gateTier1AndAbove && !pendingEmbedding) {
+      dedupTier1 = 'unavailable'
+      dedupCheckReason = dedupCheckReason ?? 'tier1: embedder unavailable (no embedding generated)'
+      logger.warn(
+        `⚠️ unified_store: Tier 1 dedup check unavailable for id=${knowledge.id} — ` +
+        `no embedding generated (embedder unavailable or embed() failed)`
+      )
+    }
+
     if (
       pendingEmbedding &&
       gateTier1AndAbove &&
       typeof (this.storage.graph as any).findSimilar === 'function'
     ) {
+      dedupTier1 = 'ran'
       const subjectFacet = typeof knowledge.metadata?.subject === 'string'
         ? knowledge.metadata.subject
         : undefined
@@ -975,12 +1030,33 @@ export class UnifiedStoreTool {
         }
       } catch (e) {
         // Non-fatal: degrade to "no dedup check" rather than blocking the write.
-        console.warn(
+        // A fault, not a caller choice — the entry needs to carry that so it
+        // can be found and re-checked later (see dedup_check stamp below).
+        dedupTier1 = 'failed'
+        dedupCheckReason = `tier1: findSimilar failed — ${e instanceof Error ? e.message : String(e)}`
+        logger.warn(
           `⚠️ unified_store: findSimilar failed (continuing without dedup): ` +
           `${e instanceof Error ? e.message : String(e)}`
         )
       }
     }
+
+    // ---------------------------------------------------------------------
+    // Stamp dedup-check provenance (DG-UNCHECKED) into metadata so every
+    // backend copy — including hosted Mem0 — carries which tiers actually
+    // ran. dedupFault (below) drives the success-response dedup_unchecked
+    // flag; it is true only when a tier was skipped by a FAULT, never for a
+    // caller's own choice (episodic / skip_dedup / older binding).
+    // ---------------------------------------------------------------------
+    knowledge.metadata = {
+      ...knowledge.metadata,
+      dedup_check: {
+        tier0: dedupTier0,
+        tier1: dedupTier1,
+        ...(dedupCheckReason ? { reason: dedupCheckReason } : {})
+      } satisfies DedupCheckMetadata
+    }
+    const dedupFault = dedupTier0 === 'failed' || dedupTier1 === 'unavailable' || dedupTier1 === 'failed'
 
     // Step 1: Get intelligent storage decision
     const routingStartTime = Date.now()
@@ -1157,7 +1233,10 @@ export class UnifiedStoreTool {
           routingTime,
           storageTime,
           totalTime
-        }
+        },
+        ...(dedupFault
+          ? { dedup_unchecked: true as const, dedup_unchecked_reason: dedupCheckReason }
+          : {})
       }
 
     } catch (error) {

@@ -247,6 +247,12 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     expect(graph.store).toHaveBeenCalledTimes(1)
     expect(mongo.store).toHaveBeenCalledTimes(1)
     expect(mem0.store).toHaveBeenCalledTimes(1)
+
+    // DG-UNCHECKED: Tier 1 ran to completion — no fault, so the response
+    // carries no dedup_unchecked flag and the stored entry records tier1='ran'.
+    expect(result).not.toHaveProperty('dedup_unchecked')
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier1).toBe('ran')
   })
 
   it('proceeds to normal store when findSimilar returns []', async () => {
@@ -348,6 +354,12 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     expect(result.success).toBe(true)
     expect(findSimilar).not.toHaveBeenCalled()
     expect(graph.store).toHaveBeenCalledTimes(1)
+
+    // DG-UNCHECKED: skip_dedup is a deliberate caller choice, not a fault —
+    // tier1 reports 'skipped' and the response carries no dedup_unchecked flag.
+    expect(result).not.toHaveProperty('dedup_unchecked')
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier1).toBe('skipped')
   })
 
   // -------------------------------------------------------------------------
@@ -519,13 +531,21 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     if (isDedupRequired(result)) return
     expect(result.success).toBe(true)
     expect(graph.store).toHaveBeenCalledTimes(1)
+
+    // DG-UNCHECKED: findSimilar throwing is a FAULT (not a caller choice) —
+    // the response must flag it and the stored entry must record tier1='failed'.
+    expect(result.dedup_unchecked).toBe(true)
+    expect(typeof result.dedup_unchecked_reason).toBe('string')
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier1).toBe('failed')
+    expect(typeof stored.metadata.dedup_check.reason).toBe('string')
   })
 
   // -------------------------------------------------------------------------
   // 10. No embedder → gate inert
   // -------------------------------------------------------------------------
 
-  it('no embedding generated → no findSimilar call (gate inert)', async () => {
+  it('embed() throwing → tier1 unavailable, no findSimilar call (gate inert)', async () => {
     embedder.embed = jest.fn().mockRejectedValue(new Error('Ollama down'))
     const findSimilar = jest.fn()
     ;(graph as any).findSimilar = findSimilar
@@ -541,6 +561,76 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     if (isDedupRequired(result)) return
     expect(result.success).toBe(true)
     expect(findSimilar).not.toHaveBeenCalled()
+
+    // DG-UNCHECKED: embed() throwing is a FAULT — flagged in the response and
+    // stamped on the stored entry as tier1='unavailable', not 'skipped'.
+    expect(result.dedup_unchecked).toBe(true)
+    expect(typeof result.dedup_unchecked_reason).toBe('string')
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier1).toBe('unavailable')
+  })
+
+  it('embedder.isAvailable()=false → tier1 unavailable, no embed() call, dedup_unchecked flagged', async () => {
+    embedder.isAvailable = jest.fn().mockResolvedValue(false)
+    const findSimilar = jest.fn()
+    ;(graph as any).findSimilar = findSimilar
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'embedder is down entirely',
+      contentType: 'fact',
+      userId: 'u'
+    })
+
+    expect(isDedupRequired(result)).toBe(false)
+    if (isDedupRequired(result)) return
+    expect(result.success).toBe(true)
+    expect(embedder.embed).not.toHaveBeenCalled()
+    expect(findSimilar).not.toHaveBeenCalled()
+    expect(result.dedup_unchecked).toBe(true)
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier1).toBe('unavailable')
+  })
+
+  it('findByFingerprint throwing → tier0 failed, dedup_unchecked flagged (Tier 1 still runs)', async () => {
+    (graph as any).findByFingerprint = jest.fn().mockImplementation(() => {
+      throw new Error('sidecar index corrupt')
+    })
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'tier0 blew up but the write must still succeed',
+      contentType: 'fact',
+      userId: 'u'
+    })
+
+    expect(isDedupRequired(result)).toBe(false)
+    if (isDedupRequired(result)) return
+    expect(result.success).toBe(true)
+    expect(result.dedup_unchecked).toBe(true)
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier0).toBe('failed')
+    // Tier 0 failing doesn't block Tier 1 from running independently.
+    expect(stored.metadata.dedup_check.tier1).toBe('ran')
+  })
+
+  it('findByFingerprint present and clean → tier0 ran', async () => {
+    (graph as any).findByFingerprint = jest.fn().mockReturnValue(null)
+    ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
+
+    const tool = makeTool()
+    const result = await tool.store({
+      content: 'tier0 runs cleanly, no match',
+      contentType: 'fact',
+      userId: 'u'
+    })
+
+    expect(isDedupRequired(result)).toBe(false)
+    if (isDedupRequired(result)) return
+    expect(result).not.toHaveProperty('dedup_unchecked')
+    const stored = (graph.store as jest.Mock).mock.calls[0][0]
+    expect(stored.metadata.dedup_check.tier0).toBe('ran')
   })
 
   it('graph backend with no findSimilar method → gate inert (back-compat)', async () => {
@@ -720,7 +810,7 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     ;(graph as any).findSimilar = jest.fn().mockResolvedValue([])
 
     const tool = makeTool()
-    await tool.store({
+    const result = await tool.store({
       content: 'Moved to the new apartment in March',
       contentType: 'memory',
       userId: 'dolphin/alex/run1',
@@ -732,6 +822,13 @@ describe('DG-T1-B — UnifiedStoreTool dedup gate (issue #45)', () => {
     expect(stored.metadata.write_mode).toBe('episodic')
     // Caller-provided metadata is preserved alongside the stamp.
     expect(stored.metadata.lane).toBe('episodic')
+
+    // DG-UNCHECKED: episodic is a deliberate caller choice — Tier 1 reports
+    // 'skipped' (not 'unavailable'/'failed') and no dedup_unchecked flag.
+    expect(stored.metadata.dedup_check.tier1).toBe('skipped')
+    if (!isDedupRequired(result)) {
+      expect(result).not.toHaveProperty('dedup_unchecked')
+    }
   })
 
   it('standard mode does not stamp write_mode (default behavior unchanged)', async () => {
