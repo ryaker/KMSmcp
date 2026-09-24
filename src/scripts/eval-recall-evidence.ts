@@ -39,7 +39,7 @@ import { ndcgAtK, precisionAtK, reciprocalRank, type EvalCandidate, type Labels 
 
 // ── pool ─────────────────────────────────────────────────────────────────────
 
-interface PoolCandidate {
+export interface PoolCandidate {
   id: string
   prod_rank: number
   content: string
@@ -49,14 +49,14 @@ interface PoolCandidate {
   grade: number
 }
 
-interface PoolQuery {
+export interface PoolQuery {
   query: string
   at?: string
   candidates: PoolCandidate[]
 }
 
 export const POOL_PATH_ENV = 'RECALL_EVAL_POOL_PATH'
-const DEFAULT_POOL_PATH =
+export const DEFAULT_POOL_PATH =
   '/private/tmp/claude-501/-Users-ryaker-Dev-KMSmcp/1ce6df6c-67fe-49a9-ad58-3cdab1d12127/scratchpad/labels/pool.jsonl'
 
 export function loadPool(filePath: string): PoolQuery[] {
@@ -88,15 +88,15 @@ export interface CachedAnswer {
   cost_usd_estimate: number | null
 }
 
-interface CacheFile {
+export interface CacheFile {
   schema_version: string
   entries: Record<string, CachedAnswer>
 }
 
 export const CACHE_PATH_ENV = 'RECALL_EVAL_CACHE_PATH'
-const DEFAULT_CACHE_PATH = path.join(os.homedir(), '.kms', 'eval-cache', 'recall-evidence-v2.json')
+export const DEFAULT_CACHE_PATH = path.join(os.homedir(), '.kms', 'eval-cache', 'recall-evidence-v2.json')
 
-function loadCache(filePath: string): CacheFile {
+export function loadCache(filePath: string): CacheFile {
   try {
     const raw = JSON.parse(fs.readFileSync(filePath, 'utf8')) as CacheFile
     if (raw.schema_version === RECALL_EVIDENCE_V2_SCHEMA_VERSION && raw.entries) return raw
@@ -214,12 +214,12 @@ async function evaluatePool(pool: PoolQuery[], cache: CacheFile, cachePath: stri
 
 // ── ranking + scoring ────────────────────────────────────────────────────────
 
-interface RankedCandidate extends EvalCandidate {
+export interface RankedCandidate extends EvalCandidate {
   grade: number
   prodRank: number
 }
 
-function baseRanked(q: PoolQuery): RankedCandidate[] {
+export function baseRanked(q: PoolQuery): RankedCandidate[] {
   // Sorted by production rank first so every variant's `.sort()` (stable) breaks ties in
   // production order, the same rule `shadowOrder` uses.
   return [...q.candidates]
@@ -231,7 +231,7 @@ function productionOrder(q: PoolQuery): RankedCandidate[] {
   return baseRanked(q)
 }
 
-function v1Order(q: PoolQuery): RankedCandidate[] {
+export function v1Order(q: PoolQuery): RankedCandidate[] {
   const jevAById = new Map(q.candidates.map(c => [c.id, c.jevA]))
   return baseRanked(q).sort((a, b) => (jevAById.get(b.id) ?? 0) - (jevAById.get(a.id) ?? 0))
 }
@@ -263,23 +263,23 @@ function v2Order(q: PoolQuery, answersById: ReadonlyMap<string, CachedAnswer>): 
 
 // ── metrics ──────────────────────────────────────────────────────────────────
 
-type Mode = 'strict' | 'lenient'
+export type Mode = 'strict' | 'lenient'
 type Variant = 'production' | 'v1' | 'v2'
 
-interface MetricSet {
+export interface MetricSet {
   p1: number
   p3: number
   ndcg10: number
   mrr: number
 }
 
-function labelsFor(candidates: RankedCandidate[], mode: Mode): Labels {
+export function labelsFor(candidates: RankedCandidate[], mode: Mode): Labels {
   const labels: Labels = {}
   for (const c of candidates) labels[c.id] = (mode === 'strict' ? c.grade === 2 : c.grade >= 1) ? 1 : 0
   return labels
 }
 
-function metricsFor(ordered: RankedCandidate[], labels: Labels): MetricSet {
+export function metricsFor(ordered: RankedCandidate[], labels: Labels): MetricSet {
   return {
     p1: precisionAtK(ordered, labels, 1),
     p3: precisionAtK(ordered, labels, 3),
@@ -288,11 +288,11 @@ function metricsFor(ordered: RankedCandidate[], labels: Labels): MetricSet {
   }
 }
 
-function avg(xs: number[]): number {
+export function avg(xs: number[]): number {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0
 }
 
-function meanMetricSet(sets: MetricSet[]): MetricSet {
+export function meanMetricSet(sets: MetricSet[]): MetricSet {
   return {
     p1: avg(sets.map(s => s.p1)),
     p3: avg(sets.map(s => s.p3)),
