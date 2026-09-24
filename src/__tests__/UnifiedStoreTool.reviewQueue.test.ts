@@ -172,9 +172,19 @@ describe('UnifiedStoreTool — review queue + secret scrubbing', () => {
 
     it('review warns when a backend did not take the flag change', async () => {
       graph.findById.mockReturnValue({ id: 'c1', flag: 'CANDIDATE' })
+      mongodb.findById = jest.fn().mockResolvedValue({ id: 'c1' })
       mongodb.flag.mockResolvedValue(false)
       const r = await tool.review({ action: 'approve', id: 'c1' })
       expect(r.warning).toMatch(/mongodb/)
+    })
+
+    it('does not warn about MongoDB when the router never wrote the entry there', async () => {
+      graph.findById.mockReturnValue({ id: 'c1', flag: 'CANDIDATE' })
+      mongodb.findById = jest.fn().mockResolvedValue(null)
+      mongodb.flag.mockResolvedValue(false)
+      const r = await tool.review({ action: 'reject', id: 'c1' })
+      expect(r.success).toBe(true)
+      expect(r.warning).toBeUndefined()
     })
 
     it('scrubs secrets in the free-text reason of kms_update', async () => {
