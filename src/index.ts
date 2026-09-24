@@ -1281,6 +1281,19 @@ export class UnifiedKMSServer {
       console.log(`🔍 [getMemoryById] Calling storage.mem0.getById...`)
       const memory = await this.storage.mem0.getById(args.memoryId)
       console.log(`✅ [getMemoryById] Successfully retrieved memory`)
+
+      // Mem0 has no flag concept: honour the parent KMS entry's flag, as search does,
+      // so a CANDIDATE/SUPERSEDED/DELETED entry is not readable by memory id.
+      const parentId = memory?.metadata?.kms_id
+      const parentFlag = parentId ? (this.storage.graph as any).findById?.(parentId)?.flag : null
+      if (parentFlag) {
+        return {
+          success: false,
+          memoryId: args.memoryId,
+          error: `parent entry ${parentId} is flagged ${parentFlag}; hidden from reads`,
+          timestamp: new Date().toISOString()
+        }
+      }
       
       return {
         success: true,

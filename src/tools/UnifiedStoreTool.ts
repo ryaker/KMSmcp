@@ -19,7 +19,7 @@ import {
 import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js'
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { logger } from '../logger.js'
-import { scrubWrite } from '../security/secretScrub.js'
+import { scrubSecrets, scrubWrite } from '../security/secretScrub.js'
 import {
   JEV_WRITE_DEDUP_ACT_FLAG,
   JEV_WRITE_DEDUP_FLAG,
@@ -591,6 +591,7 @@ export class UnifiedStoreTool {
       ? (knowledge.metadata.subject as string)
       : undefined
 
+    const reviewWrite = args.review === 'candidate'
     const fingerprint = computeFingerprint({
       content: knowledge.content,
       userId: knowledge.userId,
@@ -624,12 +625,16 @@ export class UnifiedStoreTool {
       typeof this.storage.graph.findByFingerprint === 'function'
     ) {
       try {
+        // A review-queue write also dedups against flagged entries: re-running an
+        // importer must not re-queue what is already pending, nor what a reviewer
+        // already rejected.
         const existing = this.storage.graph.findByFingerprint(
           fingerprint,
-          knowledge.userId
+          knowledge.userId,
+          { includeFlagged: reviewWrite }
         )
 
-        if (existing && !existing.flag) {
+        if (existing && (!existing.flag || reviewWrite)) {
           const subject = typeof existing.metadata?.subject === 'string'
             ? (existing.metadata.subject as string)
             : undefined
@@ -789,7 +794,8 @@ export class UnifiedStoreTool {
             userId: knowledge.userId,
             contentType: knowledge.contentType,
             subject: subjectFacet,
-            topK: 5
+            topK: 5,
+            includeFlagged: reviewWrite
           }
         ) as Array<{
           id: string
@@ -1491,14 +1497,21 @@ export class UnifiedStoreTool {
    * re-matches, so a supersede reached through execute()'s action dispatch is
    * not double-counted.
    */
-  private _scrubArgs<T extends { metadata?: Record<string, any> }>(args: T, field: keyof T & string, tool: string): T {
+  private _scrubArgs<T extends { metadata?: Record<string, any>; reason?: string }>(args: T, field: keyof T & string, tool: string): T {
     const value = args[field]
-    if (typeof value !== 'string') return args
-    const r = scrubWrite(value, args.metadata)
-    if (r.redactions.length === 0) return args
+    const r = scrubWrite(typeof value === 'string' ? value : '', args.metadata)
+    // Free-text justifications land in metadata (force_new_reason, update_history) too.
+    const why = typeof args.reason === 'string' ? scrubSecrets(args.reason) : null
+    const redactions = [...r.redactions, ...(why?.redactions ?? [])]
+    if (redactions.length === 0) return args
     const prior = Array.isArray(args.metadata?.redactions) ? args.metadata!.redactions : []
-    console.warn(`${tool}: masked ${r.redactions.map(x => `${x.count}× ${x.type}`).join(', ')} before storing`)
-    return { ...args, [field]: r.content, metadata: { ...r.metadata, redactions: [...prior, ...r.redactions] } }
+    console.warn(`${tool}: masked ${redactions.map(x => `${x.count}× ${x.type}`).join(', ')} before storing`)
+    return {
+      ...args,
+      ...(typeof value === 'string' && { [field]: r.content }),
+      ...(why && { reason: why.text }),
+      metadata: { ...r.metadata, redactions: [...prior, ...redactions] }
+    }
   }
 
   async update(args: {
@@ -1509,7 +1522,7 @@ export class UnifiedStoreTool {
     reason?: string
     userId?: string
   }): Promise<{ success: boolean; id: string; backends: string[]; reason?: string }> {
-    if (args.content !== undefined) args = this._scrubArgs(args, 'content', 'kms_update')
+    args = this._scrubArgs(args, 'content', 'kms_update')
     const updates: Partial<UnifiedKnowledge> = {}
     if (args.content !== undefined) updates.content = args.content
     if (args.confidence !== undefined) updates.confidence = args.confidence
@@ -1698,7 +1711,13 @@ export class UnifiedStoreTool {
     const result = args.action === 'approve'
       ? await this.flag({ id: args.id, flag: null, note: args.reason ?? 'approved', by: 'kms_review' })
       : await this.delete({ id: args.id, reason: args.reason ?? 'rejected in review', by: 'kms_review' })
-    return { ...result, action: args.action }
+    // flag() is best-effort per backend; say so when the two stores now disagree.
+    const missed = ['sparrowdb', 'mongodb'].filter(b => !result.backends.includes(b))
+    return {
+      ...result,
+      action: args.action,
+      ...(missed.length > 0 && { warning: `not applied on ${missed.join(', ')}; backends disagree — converge with kms_flag(id, ${args.action === 'approve' ? 'null' : "'DELETED'"})` })
+    }
   }
 
   /**

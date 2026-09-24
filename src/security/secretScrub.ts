@@ -48,6 +48,7 @@ const RULES: Rule[] = [
   { type: 'aws_access_key', re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
   { type: 'google_api_key', re: /\bAIza[0-9A-Za-z_-]{35}\b/g },
   { type: 'stripe_key', re: /\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}/g },
+  { type: 'doppler_token', re: /\bdp\.(?:st|ct|pt|sa|scim|audit)\.[A-Za-z0-9_.-]{20,}/g },
   { type: 'jwt', re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
   {
     type: 'bearer_token',
@@ -58,6 +59,12 @@ const RULES: Rule[] = [
     type: 'url_credential',
     re: /([?&](?:token|access_token|api_key|apikey|key|secret|sig|signature)=)([^&\s"'`<>]{16,})/gi,
     keep: m => ({ before: m[1], after: '' }),
+  },
+  {
+    // Connection strings with inline credentials: postgres://user:pass@host, mongodb+srv://…
+    type: 'url_userinfo',
+    re: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@"'`]+:)([^\s@/"'`]{4,})(@)/gi,
+    keep: m => ({ before: m[1], after: m[3] }),
   },
   {
     // ENV-style assignment: NAME_WITH_KEY/SECRET/TOKEN/PASSWORD = value
@@ -94,8 +101,8 @@ export function scrubSecrets(text: string): ScrubResult {
 }
 
 /**
- * Scrub content plus every string value in metadata (one level deep, and
- * string arrays). Returns merged redaction counts; callers record them as
+ * Scrub content plus every string in metadata, at any depth (nested objects and
+ * arrays). Returns merged redaction counts; callers record them as
  * `metadata.redactions` so a masked entry is auditable without the value.
  */
 export function scrubWrite(
@@ -104,20 +111,18 @@ export function scrubWrite(
 ): { content: string; metadata: Record<string, any> | undefined; redactions: Redaction[] } {
   const merged = new Map<string, number>()
   const add = (rs: Redaction[]) => rs.forEach(r => merged.set(r.type, (merged.get(r.type) ?? 0) + r.count))
+  const str = (v: string) => { const s = scrubSecrets(v); add(s.redactions); return s.text }
 
-  const c = scrubSecrets(content)
-  add(c.redactions)
-
-  let meta = metadata ?? undefined
-  if (meta && typeof meta === 'object') {
-    meta = { ...meta }
-    for (const [k, v] of Object.entries(meta)) {
-      if (typeof v === 'string') {
-        const s = scrubSecrets(v); add(s.redactions); meta[k] = s.text
-      } else if (Array.isArray(v) && v.every(x => typeof x === 'string')) {
-        meta[k] = v.map((x: string) => { const s = scrubSecrets(x); add(s.redactions); return s.text })
-      }
-    }
+  const walk = (v: any, depth: number): any => {
+    if (typeof v === 'string') return str(v)
+    if (depth > 8 || v === null || typeof v !== 'object') return v
+    if (Array.isArray(v)) return v.map(x => walk(x, depth + 1))
+    // Leave class instances (Date, ObjectId, …) alone; only plain objects are walked.
+    if (Object.getPrototypeOf(v) !== Object.prototype) return v
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, depth + 1)]))
   }
-  return { content: c.text, metadata: meta, redactions: [...merged].map(([type, count]) => ({ type, count })) }
+
+  const c = str(content)
+  const meta = metadata && typeof metadata === 'object' ? walk(metadata, 0) : (metadata ?? undefined)
+  return { content: c, metadata: meta, redactions: [...merged].map(([type, count]) => ({ type, count })) }
 }

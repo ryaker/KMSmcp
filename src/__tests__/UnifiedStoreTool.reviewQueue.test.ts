@@ -145,4 +145,43 @@ describe('UnifiedStoreTool — review queue + secret scrubbing', () => {
       expect(sent).not.toContain(HEX64)
     })
   })
+
+  describe('review fixes', () => {
+    it('candidate writes dedup against flagged entries (importer re-runs do not re-queue)', async () => {
+      graph.findByFingerprint = jest.fn().mockReturnValue({ id: 'pending1', content: 'x', flag: 'CANDIDATE' })
+      const r: any = await tool.store({
+        content: 'Granola: team agreed to ship Friday', contentType: 'fact', source: 'personal',
+        userId: 'eng_kms', review: 'candidate'
+      } as any)
+      expect(graph.findByFingerprint).toHaveBeenCalledWith(expect.any(String), 'eng_kms', { includeFlagged: true })
+      expect(r.status).toBe('dedup_required')
+      expect(graph.store).not.toHaveBeenCalled()
+    })
+
+    it('deliberate writes still ignore flagged fingerprint matches', async () => {
+      graph.findByFingerprint = jest.fn().mockReturnValue(null)
+      await tool.store({ content: 'Deliberate fact', contentType: 'fact', source: 'personal', userId: 'eng_kms' } as any)
+      expect(graph.findByFingerprint).toHaveBeenCalledWith(expect.any(String), 'eng_kms', { includeFlagged: false })
+      expect((graph.findSimilar as jest.Mock).mock.calls[0][1].includeFlagged).toBe(false)
+    })
+
+    it('candidate writes pass includeFlagged to the Tier 1 similarity lookup', async () => {
+      await tool.store({ content: 'Claim X', contentType: 'fact', source: 'personal', userId: 'eng_kms', review: 'candidate' } as any)
+      expect((graph.findSimilar as jest.Mock).mock.calls[0][1].includeFlagged).toBe(true)
+    })
+
+    it('review warns when a backend did not take the flag change', async () => {
+      graph.findById.mockReturnValue({ id: 'c1', flag: 'CANDIDATE' })
+      mongodb.flag.mockResolvedValue(false)
+      const r = await tool.review({ action: 'approve', id: 'c1' })
+      expect(r.warning).toMatch(/mongodb/)
+    })
+
+    it('scrubs secrets in the free-text reason of kms_update', async () => {
+      graph.findById.mockReturnValue({ id: 'u1', content: 'old', contentType: 'fact', userId: 'eng_kms', metadata: {} })
+      await tool.update({ id: 'u1', content: 'new text', reason: `rotated DB_PASSWORD=${HEX64}` })
+      const sent = JSON.stringify((graph.update as jest.Mock).mock.calls)
+      expect(sent).not.toContain(HEX64)
+    })
+  })
 })

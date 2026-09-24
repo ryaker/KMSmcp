@@ -75,3 +75,36 @@ describe('scrubWrite — content plus string metadata', () => {
     expect(r).toEqual({ content: 'Phoenix has 8 cameras', metadata: { subject: 'Phoenix.camera_count' }, redactions: [] })
   })
 })
+
+describe('review fixes — nested metadata, connection strings, Doppler', () => {
+  it('scrubs strings nested in metadata objects and arrays of objects', () => {
+    const r = scrubWrite('clean', { source_meta: { auth: `Bearer ${HEX64}`, items: [{ k: `?token=${HEX64}` }] }, n: 1 })
+    expect(JSON.stringify(r.metadata)).not.toContain(HEX64)
+    expect(r.metadata!.n).toBe(1)
+    expect(r.redactions).toEqual(expect.arrayContaining([
+      { type: 'bearer_token', count: 1 }, { type: 'url_credential', count: 1 },
+    ]))
+  })
+
+  it('leaves Date values in metadata intact', () => {
+    const d = new Date('2026-09-23T00:00:00Z')
+    expect(scrubWrite('x', { at: d }).metadata!.at).toBe(d)
+  })
+
+  it.each([
+    ['postgres://kms:hunter2pass@db.local:5432/kms', 'postgres://kms:[REDACTED:url_userinfo]@db.local:5432/kms'],
+    ['mongodb+srv://app:S3cr3tValue@cluster0.x.mongodb.net', 'mongodb+srv://app:[REDACTED:url_userinfo]@cluster0.x.mongodb.net'],
+  ])('masks the password in %s', (input, expected) => {
+    expect(scrubSecrets(input).text).toBe(expected)
+  })
+
+  it('masks Doppler service tokens', () => {
+    expect(scrubSecrets('dp.st.dev_eng.' + 'a1B2c3D4e5F6g7H8i9J0k1L2').text).toBe('[REDACTED:doppler_token]')
+  })
+
+  it('leaves ssh-style and credential-less URLs alone', () => {
+    for (const t of ['git@github.com:ryaker/KMSmcp.git', 'https://kms.yaker.org/mcp', 'mongodb://localhost:27017/kms']) {
+      expect(scrubSecrets(t)).toEqual({ text: t, redactions: [] })
+    }
+  })
+})
