@@ -102,7 +102,7 @@ The runner expects either:
    - `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_TOKEN_ENDPOINT`,
      `OAUTH_AUDIENCE` — Auth0 client_credentials for KMS at
      `http://localhost:8180/mcp`.
-   - Ollama reachable at `OLLAMA_BASE_URL` (default `http://localhost:11434`) for the distillation step.
+   - Ollama reachable at `OLLAMA_BASE_URL` (default: rym1, `http://100.127.128.76:11434` — `DEFAULT_OLLAMA_BASE_URL`) for the distillation step.
    - For slack-huddles only: any creds the live Slack source needs (it falls
      back to `--source file` and a JSON dump when no Slack tools are wired).
 

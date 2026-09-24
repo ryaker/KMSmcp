@@ -90,7 +90,7 @@
  *
  *   # Custom paths (env vars):
  *   SPARROWDB_PATH=/custom/db node dist/scripts/backfill-hnsw-embeddings.js
- *   OLLAMA_BASE_URL=http://localhost:11434 node dist/scripts/...
+ *   OLLAMA_BASE_URL=http://100.127.128.76:11434 node dist/scripts/...
  *
  * Resumable state
  * ===============
@@ -118,6 +118,7 @@ import { execSync } from 'child_process'
 
 import { OllamaEmbeddingService, type EmbeddingService } from '../embedding/EmbeddingService.js'
 import { resolveSparrowDBPath } from '../storage/sparrowDbPath.js'
+import { DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -842,7 +843,7 @@ async function main(argv: string[]): Promise<number> {
   console.log('')
 
   const embeddingService = new OllamaEmbeddingService({
-    baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+    baseUrl: process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
   })
 
   // Pre-flight: confirm Ollama is reachable. If not, abort early so we
@@ -850,7 +851,7 @@ async function main(argv: string[]): Promise<number> {
   if (!dryRun) {
     const available = await embeddingService.isAvailable()
     if (!available) {
-      console.error('❌ Ollama is not reachable at ' + (process.env.OLLAMA_BASE_URL || 'http://localhost:11434'))
+      console.error('❌ Ollama is not reachable at ' + (process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL))
       console.error('   Start it with `ollama serve` and ensure nomic-embed-text is pulled:')
       console.error('     ollama pull nomic-embed-text')
       return 1

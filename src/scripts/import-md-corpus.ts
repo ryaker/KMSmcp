@@ -25,7 +25,7 @@ import * as os from 'os'
 import { createHash } from 'crypto'
 import { execFileSync } from 'child_process'
 
-import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -902,7 +902,7 @@ export function parseArgs(argv: string[]): CliOptions {
     bearerToken: process.env.KMS_BEARER_TOKEN || null,
     kmsUrl: process.env.KMS_URL || DEFAULT_KMS_URL,
     syncLogPath: DEFAULT_SYNC_LOG,
-    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
     ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     verbose: false
   }
@@ -991,7 +991,7 @@ Default roots:
 ${DEFAULT_ROOTS.map(r => '  ' + r).join('\n')}
 
 Required environment:
-  OLLAMA_BASE_URL         (optional) default http://localhost:11434
+  OLLAMA_BASE_URL         (optional) default ${DEFAULT_OLLAMA_BASE_URL} (rym1)
   OLLAMA_MODEL            (optional) default ${DEFAULT_OLLAMA_MODEL} — used for distillation
   KMS_BEARER_TOKEN        (optional) sent to KMS as Authorization: Bearer <…>
 `)

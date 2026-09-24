@@ -7,6 +7,16 @@
  */
 export const DEFAULT_OLLAMA_MODEL = 'gemma4:12b-mlx'
 
+/**
+ * The one default Ollama host for every KMS consumer: rym1, the M1 mini, by its
+ * Tailscale address (its LAN DHCP lease drifts; the tailnet IP does not).
+ * Deliberately NOT localhost: KMS runs on the M4 mini, a 16 GB CI host that must
+ * not run local-model inference (Rich, 2026-09-23: "Ollama especially for KMS
+ * should be on the M1"). A missing OLLAMA_BASE_URL used to fall back to the M4
+ * silently. OLLAMA_BASE_URL still overrides everywhere.
+ */
+export const DEFAULT_OLLAMA_BASE_URL = 'http://100.127.128.76:11434'
+
 export interface ClassifyResult {
   targets: Array<'mem0' | 'mongodb' | 'graph'>
   contentType: 'episodic' | 'procedural' | 'relational' | 'factual' | 'insight'
@@ -88,7 +98,7 @@ export class OllamaInference {
   private availableCache: { value: boolean; expiresAt: number } | null = null
 
   constructor(
-    private baseUrl = 'http://localhost:11434',
+    private baseUrl = DEFAULT_OLLAMA_BASE_URL,
     private model = DEFAULT_OLLAMA_MODEL
   ) {}
 
