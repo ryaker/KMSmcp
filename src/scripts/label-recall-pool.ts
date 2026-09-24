@@ -12,18 +12,35 @@
  *
  * Usage:
  *   doppler run --project ry-local --config dev_eng -- \
- *     npx tsx src/scripts/label-recall-pool.ts [--limit N] [--source eng|personal|all] [--report-only] [--concurrency N]
+ *     npx tsx src/scripts/label-recall-pool.ts [--limit N] [--source eng|personal|all] \
+ *       [--report-only] [--concurrency N] [--labeler gemma|jev] [--topk N]
  *
  * For each query (its own server, `options.jevRerank: false` — the eval-only bypass in
  * `UnifiedSearchTool.search()`):
- *   1. Search top 20, establish PRODUCTION order (see "bypass fallback" below).
- *   2. Grade every candidate 0/1/2 with Gemma (gemma4:12b-mlx on rym1 ONLY — never
- *      localhost, this Mac never runs inference), cached on disk by
- *      sha256(query + candidate id + content).
+ *   1. Search top `--topk` (default 20), establish PRODUCTION order (see "bypass
+ *      fallback" below).
+ *   2. Grade every candidate 0/1/2 with the LABELLER (`--labeler`, default `gemma` for
+ *      compatibility with existing pool rows):
+ *        - `gemma`: gemma4:12b-mlx on rym1 ONLY (never localhost, this Mac never runs
+ *          inference), ~170 s/query, cached by sha256(query + candidate id + content) in
+ *          `cache/grades.jsonl`.
+ *        - `jev`: one Jev Choice question per (query, candidate) (`../eval/jevLabel.ts`),
+ *          ~200 ms/query, cached the same way in `cache/jev-labels.jsonl`. Gemma's grades
+ *          are kept as an INDEPENDENT calibration set — see
+ *          `../scripts/jev-label-agreement.ts` for how far Jev's labels can be trusted
+ *          against them. The two labellers never share a pool row: resume is keyed on
+ *          (source, label_source, topk, query), so switching `--labeler` (or `--topk`) on
+ *          an already-labelled query adds a second row rather than silently overwriting
+ *          the first.
  *   3. Score every candidate with the v2 Jev policy (`RECALL_EVIDENCE_QUESTIONS_V2` /
  *      `buildRecallStateV2` / `shadowScoreV2`, through `createJevDecisionEngineFromEnv()`
  *      and `withEngineSlot` — the same production rate limiter every other Jev caller
- *      shares), cached the same way.
+ *      shares), cached the same way, REGARDLESS of `--labeler`. This is a structurally
+ *      separate Jev call (a different question) from the labeller above; the report scores
+ *      BOTH production order and this v2 re-ranked order against whichever labeller
+ *      produced `grade` — including when that labeller is Jev itself (owner decision,
+ *      2026-09-24: the labelling call and the re-rank-scoring call never share an answer,
+ *      so this is not the model vetting its own ranking).
  *
  * Bypass fallback: the `jevRerank:false` bypass may not be deployed on the server this
  * script is pointed at yet. Detected the same way any caller reads `_rerank`:
@@ -33,12 +50,19 @@
  * `rankResults` computes before any Jev reorder touches it) and logs a warning. Every pool
  * row records which path produced its order (`production_path`).
  *
- * Output (append-only, resumable by (source, query)):
- *   ~/.kms/eval/label-pool.jsonl      — one row per (source, query): candidates, grades, jev scores
+ * Output (append-only, resumable by (source, label_source, topk, query)):
+ *   ~/.kms/eval/label-pool.jsonl      — one row per (source, label_source, topk, query)
  *   ~/.kms/eval/labels-strict.jsonl   — {"query","labels"} recomputed from the pool every run
  *   ~/.kms/eval/labels-lenient.jsonl  — same, relevant = grade >= 1
- *   ~/.kms/eval/cache/grades.jsonl    — {"key","grade"} — Gemma grade cache
- *   ~/.kms/eval/cache/jev-v2.jsonl    — {"key", ...JevCacheEntry} — Jev v2 answer cache
+ *   ~/.kms/eval/cache/grades.jsonl      — {"key","grade"} — Gemma grade cache
+ *   ~/.kms/eval/cache/jev-labels.jsonl  — {"key", ...JevLabelCacheEntry} — Jev label cache
+ *   ~/.kms/eval/cache/jev-v2.jsonl      — {"key", ...JevCacheEntry} — Jev v2 re-rank score cache
+ *
+ * The report additionally prints, only over rows whose `label_source` is `jev`, a "recall
+ * beyond the re-rank window" section (`../eval/recallWindow.ts`): where the first grade-2
+ * candidate sits in production order relative to the served re-rank's window
+ * (`KMS_JEV_SHADOW_TOPK`, default 20) — only measurable at `--topk 50`, since Gemma's
+ * latency made a 50-deep pool impractical.
  */
 import crypto from 'crypto'
 import fs from 'fs'
@@ -52,9 +76,12 @@ import {
   isCandidateCorrectedOrReplaced,
   type RecallCandidate,
 } from '../decision/recallEvidence.js'
+import { JEV_SHADOW_TOPK_DEFAULT } from '../decision/shadowRerank.js'
 import { shadowScoreV2, type ShadowJudgmentV2 } from '../decision/shadowPolicy.js'
 import type { DecisionEngine } from '../decision/types.js'
+import { appendJevLabelCacheEntry, judgeJevLabel, loadJevLabelCache } from '../eval/jevLabel.js'
 import { ndcgAtK, precisionAtK, reciprocalRank, type EvalCandidate, type Labels } from '../eval/rankers.js'
+import { buildRecallWindowReport, renderRecallWindowReport, type RecallWindowQuery } from '../eval/recallWindow.js'
 import { bootstrapDeltaCI, pairedWinsLosses } from './eval-recall-evidence.js'
 import { MinimalMcpClient } from './import-slack-huddles.js'
 
@@ -85,6 +112,11 @@ export const LABELS_STRICT_PATH = path.join(OUT_DIR, 'labels-strict.jsonl')
 export const LABELS_LENIENT_PATH = path.join(OUT_DIR, 'labels-lenient.jsonl')
 export const GRADE_CACHE_PATH = path.join(OUT_DIR, 'cache', 'grades.jsonl')
 export const JEV_CACHE_PATH = path.join(OUT_DIR, 'cache', 'jev-v2.jsonl')
+export const JEV_LABEL_CACHE_PATH = path.join(OUT_DIR, 'cache', 'jev-labels.jsonl')
+
+/** Requests kept "in acquire()" at once for the Jev labeller — same bound
+ *  `eval-recall-evidence.ts` uses, well under the shared rate limiter's 100-deep queue. */
+export const JEV_LABEL_CONCURRENCY = 40
 
 /** The one-off prototype's output — seeds the grade cache so the same (query, candidate,
  *  content) never gets asked of Gemma twice across the two runs. */
@@ -98,6 +130,11 @@ export const TOPK = 20
 
 export type Source = 'eng' | 'personal'
 export type QueryKind = 'human' | 'agent-payload'
+export type LabelSource = 'gemma' | 'jev'
+
+/** Historical rows (written before `--labeler`/`--topk` existed) were all gemma@20 — the
+ *  defaults every resume/report path falls back to for a row missing these fields. */
+export const DEFAULT_LABEL_SOURCE: LabelSource = 'gemma'
 
 export interface QueryItem {
   query: string
@@ -206,7 +243,22 @@ export interface PoolRow {
   at: string
   /** Which path produced `candidates`' order — see the module doc comment. */
   production_path: 'bypass' | 'score-reconstructed'
+  /** Which labeller produced every candidate's `grade` in this row. */
+  label_source: LabelSource
+  /** `--topk` this row was fetched at (how deep `candidates` goes). */
+  topk: number
   candidates: PoolCandidateRow[]
+}
+
+/** Parses a raw pool line, defaulting `label_source`/`topk` for rows written before those
+ *  fields existed (see `DEFAULT_LABEL_SOURCE`) so every consumer downstream sees a fully
+ *  populated row without repeating the fallback. */
+function normalizePoolRow(row: Partial<PoolRow>): PoolRow {
+  return {
+    ...(row as PoolRow),
+    label_source: row.label_source ?? DEFAULT_LABEL_SOURCE,
+    topk: row.topk ?? TOPK,
+  }
 }
 
 export function loadPoolRows(filePath: string): PoolRow[] {
@@ -217,7 +269,7 @@ export function loadPoolRows(filePath: string): PoolRow[] {
     const line = raw.trim()
     if (!line) continue
     try {
-      out.push(JSON.parse(line) as PoolRow)
+      out.push(normalizePoolRow(JSON.parse(line) as Partial<PoolRow>))
     } catch {
       // A partial tail line from a run in flight, or corruption — skip, don't fail the read.
     }
@@ -225,14 +277,16 @@ export function loadPoolRows(filePath: string): PoolRow[] {
   return out
 }
 
-/** `${source}\0${query}` — the same query text against two different servers is two
- *  separate work items (see `collectAllQueries`), so resume keys on the pair. */
-export function poolRowKey(source: Source, query: string): string {
-  return `${source}\u0000${query}`
+/** `${source}\0${label_source}\0${topk}\0${query}` — the same query text against two
+ *  different servers (see `collectAllQueries`), or labelled by a different labeller, or
+ *  fetched to a different depth, is a separate work item. Defaults match the pipeline's
+ *  pre-`--labeler`/`--topk` behaviour, so an old pool's rows resume exactly as before. */
+export function poolRowKey(source: Source, query: string, labelSource: LabelSource = DEFAULT_LABEL_SOURCE, topk: number = TOPK): string {
+  return `${source}\u0000${labelSource}\u0000${topk}\u0000${query}`
 }
 
 export function alreadyDoneKeys(rows: PoolRow[]): Set<string> {
-  return new Set(rows.map(r => poolRowKey(r.source, r.query)))
+  return new Set(rows.map(r => poolRowKey(r.source, r.query, r.label_source, r.topk)))
 }
 
 function appendJsonLine(filePath: string, row: unknown): void {
@@ -686,6 +740,8 @@ export interface CliArgs {
   source: Source | 'all'
   reportOnly: boolean
   concurrency: number
+  labeler: LabelSource
+  topk: number
 }
 
 export function parseArgs(argv: string[]): CliArgs {
@@ -693,6 +749,8 @@ export function parseArgs(argv: string[]): CliArgs {
   let source: Source | 'all' = 'all'
   let reportOnly = false
   let concurrency = 1
+  let labeler: LabelSource = DEFAULT_LABEL_SOURCE
+  let topk = TOPK
 
   const takeValue = (i: number, flag: string): string => {
     const v = argv[i]
@@ -716,6 +774,14 @@ export function parseArgs(argv: string[]): CliArgs {
       concurrency = Number(takeValue(++i, '--concurrency'))
     } else if (a.startsWith('--concurrency=')) {
       concurrency = Number(a.slice('--concurrency='.length))
+    } else if (a === '--labeler') {
+      labeler = takeValue(++i, '--labeler') as LabelSource
+    } else if (a.startsWith('--labeler=')) {
+      labeler = a.slice('--labeler='.length) as LabelSource
+    } else if (a === '--topk') {
+      topk = Number(takeValue(++i, '--topk'))
+    } else if (a.startsWith('--topk=')) {
+      topk = Number(a.slice('--topk='.length))
     } else {
       throw new Error(`unrecognised argument: ${a}`)
     }
@@ -728,8 +794,14 @@ export function parseArgs(argv: string[]): CliArgs {
     throw new Error(`--limit must be a non-negative number, got "${argv.join(' ')}"`)
   }
   if (!Number.isFinite(concurrency) || concurrency < 1) concurrency = 1
+  if (labeler !== 'gemma' && labeler !== 'jev') {
+    throw new Error(`--labeler must be gemma|jev, got "${labeler}"`)
+  }
+  if (!Number.isInteger(topk) || topk < 1) {
+    throw new Error(`--topk must be a positive integer, got "${argv.join(' ')}"`)
+  }
 
-  return { limit, source, reportOnly, concurrency }
+  return { limit, source, reportOnly, concurrency, labeler, topk }
 }
 
 // ── bounded concurrency ──────────────────────────────────────────────────────
@@ -765,12 +837,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
     const allItems = collectAllQueries(engText, personalText)
     const inScope = args.source === 'all' ? allItems : allItems.filter(i => i.source === args.source)
-    const pending = inScope.filter(i => !doneKeys.has(poolRowKey(i.source, i.query)))
+    const pending = inScope.filter(i => !doneKeys.has(poolRowKey(i.source, i.query, args.labeler, args.topk)))
     const toProcess = args.limit !== null ? pending.slice(0, args.limit) : pending
 
     console.error(
       `queries: ${allItems.length} distinct total (eng+personal), ${inScope.length} in scope for --source ${args.source}, ` +
-        `${pending.length} not yet in the pool, processing ${toProcess.length} this run`
+        `${pending.length} not yet labelled ${args.labeler}@top${args.topk}, processing ${toProcess.length} this run`
     )
 
     const gradeCache = loadGradeCache(GRADE_CACHE_PATH)
@@ -779,9 +851,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       if (seeded) console.error(`grade cache: seeded ${seeded} grade(s) from the 60-query prototype pool`)
     }
     const jevCache = loadJevCache(JEV_CACHE_PATH)
+    const jevLabelCache = loadJevLabelCache(JEV_LABEL_CACHE_PATH)
 
     const engine = createJevDecisionEngineFromEnv()
     if (!engine) console.error('warn: no Jev credential route (OneCLI gateway or TYPESAFE_API_KEY) — every candidate will be scored with jev=null')
+    if (!engine && args.labeler === 'jev') {
+      throw new Error('--labeler jev needs a Jev credential route (OneCLI gateway or TYPESAFE_API_KEY) — none configured')
+    }
+
+    let jevLabelNewCalls = 0
+    let jevLabelCost = 0
 
     let engClient: MinimalMcpClient | null = null
     let personalClient: MinimalMcpClient | null = null
@@ -805,7 +884,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
       let outcome: SearchOutcome
       try {
-        outcome = await searchOneQueryWithRetry(client, item.query)
+        outcome = await searchOneQueryWithRetry(client, item.query, args.topk)
       } catch (e) {
         console.error(`skip ${queryTag(item.query)}: search failed: ${e instanceof Error ? e.message : String(e)}`)
         skipped++
@@ -813,7 +892,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       }
       pathCounts[outcome.path]++
 
-      const cands = outcome.candidates.filter(c => c && typeof c.id === 'string' && typeof c.content === 'string').slice(0, TOPK)
+      const cands = outcome.candidates.filter(c => c && typeof c.id === 'string' && typeof c.content === 'string').slice(0, args.topk)
       if (cands.length === 0) {
         console.error(`skip ${queryTag(item.query)}: 0 usable candidates`)
         skipped++
@@ -825,17 +904,35 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         return { c, content, key: labelCacheKey(item.query, c.id, content) }
       })
 
-      await mapBounded(
-        targets.filter(t => !gradeCache.has(t.key)),
-        args.concurrency,
-        async t => {
-          const grade = await gemmaGrade(item.query, t.content)
-          if (grade !== null) {
-            gradeCache.set(t.key, grade)
-            appendJsonLine(GRADE_CACHE_PATH, { key: t.key, grade })
+      if (args.labeler === 'gemma') {
+        await mapBounded(
+          targets.filter(t => !gradeCache.has(t.key)),
+          args.concurrency,
+          async t => {
+            const grade = await gemmaGrade(item.query, t.content)
+            if (grade !== null) {
+              gradeCache.set(t.key, grade)
+              appendJsonLine(GRADE_CACHE_PATH, { key: t.key, grade })
+            }
           }
-        }
-      )
+        )
+      } else {
+        await mapBounded(
+          targets.filter(t => !jevLabelCache.has(t.key)),
+          JEV_LABEL_CONCURRENCY,
+          async t => {
+            try {
+              const label = await judgeJevLabel(engine!, item.query, t.content)
+              jevLabelCache.set(t.key, label)
+              appendJevLabelCacheEntry(JEV_LABEL_CACHE_PATH, t.key, label)
+              jevLabelNewCalls++
+              jevLabelCost += label.costUsdEstimate ?? 0
+            } catch (e) {
+              console.error(`jev label failed for ${queryTag(item.query)} candidate ${t.c.id}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+          }
+        )
+      }
 
       const jevTargets = targets.filter(t => !jevCache.has(t.key))
       if (engine && jevTargets.length) {
@@ -858,7 +955,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         content: t.content,
         subject: t.c.metadata?.subject ?? null,
         sourceSystem: t.c.sourceSystem ?? (Array.isArray(t.c._sourceSystems) ? t.c._sourceSystems[0] : null) ?? null,
-        grade: gradeCache.get(t.key) ?? null,
+        grade: (args.labeler === 'gemma' ? gradeCache.get(t.key) : jevLabelCache.get(t.key)?.grade) ?? null,
         jev: jevCache.get(t.key) ?? null,
       }))
 
@@ -868,11 +965,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         kind: item.kind,
         at: new Date().toISOString(),
         production_path: outcome.path,
+        label_source: args.labeler,
+        topk: args.topk,
         candidates: candidateRows,
       }
       appendJsonLine(POOL_PATH, poolRow)
       existingRows.push(poolRow)
-      doneKeys.add(poolRowKey(item.source, item.query))
+      doneKeys.add(poolRowKey(item.source, item.query, args.labeler, args.topk))
 
       const elapsedS = (Date.now() - started) / 1000
       perQuerySeconds.push(elapsedS)
@@ -889,18 +988,32 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
     console.error(
       `paths this run: bypass=${pathCounts.bypass} score-reconstructed=${pathCounts['score-reconstructed']}` +
-        (skipped ? `  (${skipped} skipped)` : '')
+        (skipped ? `  (${skipped} skipped)` : '') +
+        (pathCounts['score-reconstructed'] > 0
+          ? '  — WARNING: some responses came back Jev-reordered (jevRerank:false bypass ignored)'
+          : '  — bypass honoured on every response; none came back re-ranked')
     )
+    if (args.labeler === 'jev') {
+      console.error(
+        `jev labeller: ${jevLabelNewCalls} new call(s), cost $${jevLabelCost.toFixed(4)}` +
+          (jevLabelNewCalls > 0 ? ` (mean $${(jevLabelCost / jevLabelNewCalls).toFixed(6)}/call)` : '')
+      )
+    }
     if (perQuerySeconds.length) {
       const meanS = avg(perQuerySeconds)
       const totalS = perQuerySeconds.reduce((a, b) => a + b, 0)
       const remainingAfterThisRun = pending.length - toProcess.length
+      // "remaining across ALL sources" for THIS run's (labeler, topk) — not raw pool-row
+      // count, which now double-counts once a query carries both a gemma@20 row and a
+      // jev@50 row (see `poolRowKey`).
+      const doneForThisConfig = existingRows.filter(r => r.label_source === args.labeler && r.topk === args.topk).length
+      const remainingAllSources = allItems.length - doneForThisConfig
       console.error(
         `timing: ${perQuerySeconds.length} quer${perQuerySeconds.length === 1 ? 'y' : 'ies'} in ${totalS.toFixed(1)}s ` +
           `(mean ${meanS.toFixed(2)}s/query). ${remainingAfterThisRun} more not yet in the pool for --source ${args.source} ` +
           `(~${((remainingAfterThisRun * meanS) / 60).toFixed(1)} min at this rate); ` +
-          `${allItems.length - existingRows.length} remaining across ALL sources ` +
-          `(~${(((allItems.length - existingRows.length) * meanS) / 60).toFixed(1)} min at this rate)`
+          `${remainingAllSources} remaining across ALL sources for --labeler ${args.labeler} --topk ${args.topk} ` +
+          `(~${((remainingAllSources * meanS) / 60).toFixed(1)} min at this rate)`
       )
     }
   }
@@ -916,6 +1029,20 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   const metricRows = allRows.flatMap(computeQueryMetrics)
   const report = buildReport(metricRows)
   console.log(renderReport(allRows.length, report))
+
+  const jevLabelledRows = allRows.filter(r => r.label_source === 'jev')
+  console.log('')
+  if (jevLabelledRows.length === 0) {
+    console.log('Recall beyond the re-rank window: no Jev-labelled rows in the pool yet (run with --labeler jev).')
+  } else {
+    const recallWindowQueries: RecallWindowQuery[] = jevLabelledRows.map(r => ({
+      source: r.source,
+      kind: r.kind,
+      candidates: r.candidates.map(c => ({ id: c.id, prod_rank: c.prod_rank, grade: c.grade })),
+    }))
+    const recallWindowReport = buildRecallWindowReport(recallWindowQueries, JEV_SHADOW_TOPK_DEFAULT, 50)
+    console.log(renderRecallWindowReport(recallWindowReport, JEV_SHADOW_TOPK_DEFAULT, 50))
+  }
 }
 
 // Only run when executed directly, not when imported by a test for its pure helpers.
