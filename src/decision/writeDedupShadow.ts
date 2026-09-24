@@ -202,7 +202,7 @@ export function writeDedupLogFromEnv(env: NodeJS.ProcessEnv = process.env): Deci
   return new JsonlDecisionLog<WriteDedupLogRow>(filePath)
 }
 
-function readJudgment(result: DecisionResult): NonNullable<WriteDedupCandidateRecord['jev']> {
+export function readJudgment(result: DecisionResult): NonNullable<WriteDedupCandidateRecord['jev']> {
   const relation = result.answers.relation
   if (relation?.type !== 'choice') {
     throw new Error('engine returned an answer of the wrong kind for the write-dedup relation question')
