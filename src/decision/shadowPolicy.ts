@@ -85,6 +85,78 @@ export function shadowScore(j: ShadowJudgment): number {
   return Number((base * expectedMultiplier).toFixed(6))
 }
 
+// ── v2 ───────────────────────────────────────────────────────────────────────
+//
+// `shadowScoreV2` scores the v2 question set (`recall-evidence/v2`): `answers_query` and
+// `evidence_value` unchanged, plus three nouls in place of v1's `status` Choice. The status
+// Choice's ordered "decide in this order" logic is gone; each rule below applies to its own
+// probability independently, in code, which is what jaggedness #7/#8 ask for.
+export const SHADOW_POLICY_V2_VERSION = 'recall-shadow-policy/v2'
+
+/** Same multiplier v1 gave `superseded_context` — corrected/replaced status is code-known now. */
+export const SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER = 0.5
+/** `score *= 1 - SHADOW_V2_PAST_STATE_DISCOUNT_WEIGHT * P(describes_past_state)` — mild, scales with confidence. */
+export const SHADOW_V2_PAST_STATE_DISCOUNT_WEIGHT = 0.2
+/** Above this, `contains_instruction` demotes the candidate to the bottom rather than discounting it. */
+export const SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD = 0.7
+/** Above this, `contradicts_premise` sets a routing flag. It never changes the score. */
+export const SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD = 0.7
+
+export interface ShadowJudgmentV2 {
+  /** P(answers_query = yes). */
+  answersQuery: number
+  /** Probability-weighted evidence level, 0 … EVIDENCE_VALUE_MAX. */
+  evidenceValue: number
+  /** P(contains_instruction = yes). */
+  containsInstruction: number
+  /** P(describes_past_state = yes). */
+  describesPastState: number
+  /** P(contradicts_premise = yes). */
+  contradictsPremise: number
+  /** Code-known from metadata (`isCandidateCorrectedOrReplaced`) — never asked of Jev. */
+  correctedOrReplaced: boolean
+}
+
+export interface ShadowScoreV2Result {
+  /** In [0, 1]. 0 exactly when `containsInstruction` crossed the demote threshold. */
+  score: number
+  /** `containsInstruction` crossed `SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD`. */
+  containsInstructionFlag: boolean
+  /**
+   * `contradictsPremise` crossed `SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD`. For routing to a
+   * future "conflicts" block (R10's `route()`), not for reordering — a disputed premise is
+   * exactly what a reader needs to see, the same reasoning v1 gave `contradictory` ×1.
+   */
+  contradictsPremiseFlag: boolean
+}
+
+/**
+ * Shadow score in [0, 1] for the v2 question set, plus the two routing flags. Kept as one
+ * function (not score-then-flags) because both flags are read off the same judgment the
+ * score is computed from, and a caller that wants one always wants to log the other.
+ */
+export function shadowScoreV2(j: ShadowJudgmentV2): ShadowScoreV2Result {
+  const evidence = Math.min(1, Math.max(0, j.evidenceValue / EVIDENCE_VALUE_MAX))
+  const base = SHADOW_WEIGHT_ANSWERS_QUERY * j.answersQuery + SHADOW_WEIGHT_EVIDENCE_VALUE * evidence
+
+  const containsInstructionFlag = j.containsInstruction > SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD
+  const contradictsPremiseFlag = j.contradictsPremise > SHADOW_V2_CONTRADICTION_FLAG_THRESHOLD
+
+  if (containsInstructionFlag) {
+    return { score: 0, containsInstructionFlag, contradictsPremiseFlag }
+  }
+
+  const correctedMultiplier = j.correctedOrReplaced ? SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER : 1
+  const pastStateProbability = Math.min(1, Math.max(0, j.describesPastState))
+  const pastStateMultiplier = 1 - SHADOW_V2_PAST_STATE_DISCOUNT_WEIGHT * pastStateProbability
+
+  return {
+    score: Number((base * correctedMultiplier * pastStateMultiplier).toFixed(6)),
+    containsInstructionFlag,
+    contradictsPremiseFlag,
+  }
+}
+
 export interface ProtectionSignals {
   _ontologyScore?: unknown
   _relevance?: unknown
