@@ -455,6 +455,10 @@ export class UnifiedKMSServer {
         result = await this.tools.store.flag(args)
         break
 
+      case 'kms_review':
+        result = await this.tools.store.review(args)
+        break
+
       case 'kms_reap':
         result = await this.tools.store.reap(args)
         break
@@ -531,6 +535,11 @@ export class UnifiedKMSServer {
               type: 'string',
               enum: ['standard', 'episodic'],
               description: 'OPTIONAL - DG-EPISODIC write mode. Use "episodic" for bulk/episodic ingestion (benchmark history, transcript imports) where a restatement is temporal signal, not redundancy: the dedup gate then runs Tier 0 exact-fingerprint only, so legitimate near-duplicates are STORED instead of refused; the entry is tagged metadata.write_mode="episodic". An exact duplicate is still refused (retry with action=force-new). Default "standard" keeps the full interactive gate.'
+            },
+            review: {
+              type: 'string',
+              enum: ['candidate'],
+              description: 'OPTIONAL - "candidate" puts the entry in the review queue: stored in every backend but hidden from search and context injection until approved with kms_review. Use for machine-generated writes (importer distillations, harvests) nobody has checked yet. Omit for deliberate stores.'
             },
             timestamp: {
               type: ['string', 'number'],
@@ -892,6 +901,21 @@ export class UnifiedKMSServer {
         }
       },
       {
+        name: 'kms_review',
+        description: 'Review queue for machine-generated entries (written with unified_store review="candidate"). list: pending candidates, newest first. approve: make the entry visible to search and context injection. reject: soft-delete it (reversible 90 days). approve/reject only act on entries that are currently CANDIDATE.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['list', 'approve', 'reject'], description: 'What to do' },
+            id: { type: 'string', description: 'Entry ID (approve/reject)' },
+            reason: { type: 'string', description: 'OPTIONAL — why (recorded as the flag note)' },
+            userId: { type: 'string', description: 'OPTIONAL — list only this user\'s candidates' },
+            limit: { type: 'integer', minimum: 1, maximum: 200, default: 25, description: 'OPTIONAL — list size' }
+          },
+          required: ['action']
+        }
+      },
+      {
         name: 'kms_reap',
         description: 'Find or hard-delete flagged entries older than the threshold (default 90 days). DRY-RUN BY DEFAULT — pass dryRun=false to actually delete. Use to clean up the soft-deleted graveyard once entries are past the reversibility window. Returns the list of candidates and (when applied) the per-backend deletion results.',
         inputSchema: {
@@ -982,6 +1006,9 @@ export class UnifiedKMSServer {
             result = await this.tools.store.supersede(args as any)
             break
 
+          case 'kms_review':
+            result = await this.tools.store.review(args as any)
+            break
           case 'kms_flag':
             result = await this.tools.store.flag(args as any)
             break

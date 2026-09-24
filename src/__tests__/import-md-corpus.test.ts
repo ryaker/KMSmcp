@@ -627,3 +627,11 @@ describe('chunkLongDoc', () => {
     expect(chunks.some(c => c.startsWith('## Second'))).toBe(true)
   })
 })
+
+describe('review queue default', () => {
+  it('parseArgs defaults to review on; --no-review turns it off', async () => {
+    const { parseArgs } = await import('../scripts/import-md-corpus.js')
+    expect(parseArgs([]).review).toBe(true)
+    expect(parseArgs(['--no-review']).review).toBe(false)
+  })
+})

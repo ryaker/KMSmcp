@@ -35,6 +35,17 @@ Both entries would leak into every future session's injected context.
 Flagged entries are hidden from search and context injection, including Mem0 shards.
 Prefer supersede over delete: the mistake is data.
 
+## Review queue and secret scrubbing
+
+- **Review queue.** `unified_store` with `review: "candidate"` writes the entry flagged
+  `CANDIDATE`: stored everywhere, hidden from search and injection until `kms_review`
+  (`list` / `approve` / `reject`) acts on it. The importers (Granola, Slack, markdown
+  claims) default to it; `--no-review` writes live. Deliberate stores don't use it.
+  `kms_review` refuses anything that isn't a `CANDIDATE`.
+- **Secrets are masked on every write** (`unified_store`, `kms_update`, `kms_supersede`)
+  before any backend, since Mem0 is hosted. Values become `[REDACTED:<type>]`; only
+  `metadata.redactions` (`{type, count}`) is recorded. `src/security/secretScrub.ts`.
+
 ## Dedup gate
 
 Every `unified_store` is checked against near-duplicates with the same `userId` +

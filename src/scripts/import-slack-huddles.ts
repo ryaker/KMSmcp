@@ -143,6 +143,8 @@ export interface CliOptions {
   ollamaModel: string
   workspace: string
   dryRun: boolean
+  /** Write distilled entries to the review queue (kms_review) instead of live. Default on; --no-review writes live. */
+  review: boolean
   maxHuddles?: number
   bearerToken?: string
 }
@@ -167,6 +169,7 @@ export function parseArgs(argv: string[]): CliOptions {
     ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     workspace: process.env.SLACK_WORKSPACE || 'tengo',
     dryRun: false,
+    review: true,
     bearerToken: process.env.KMS_BEARER_TOKEN
   }
 
@@ -185,6 +188,7 @@ export function parseArgs(argv: string[]): CliOptions {
       case '--workspace':       opts.workspace = next(); break
       case '--bearer-token':    opts.bearerToken = next(); break
       case '--dry-run':         opts.dryRun = true; break
+      case '--no-review':       opts.review = false; break
       case '--max-huddles':     opts.maxHuddles = parseInt(next(), 10); break
       case '-h':
       case '--help':
@@ -230,6 +234,7 @@ Options:
   --bearer-token <token>     Bypass OAuth client-credentials, pass token directly.
                              Or set KMS_BEARER_TOKEN env var.
   --dry-run                  Don't actually write to KMS. Log what would happen.
+  --no-review                Write distilled entries live instead of to the review queue (kms_review).
   --max-huddles <N>          Cap huddles processed (smoke-test).
   -h, --help                 This help.
 
@@ -847,6 +852,7 @@ export async function processHuddle(
   const subject = buildHuddleSubject(huddle)
   const sourceDoc = buildSourceDoc(huddle)
   const summaryArgs = {
+    ...(deps.opts.review && { review: 'candidate' as const }),
     content: distilled.summary,
     contentType: 'memory' as const,
     source: 'personal' as const,
@@ -901,6 +907,7 @@ export async function processHuddle(
   for (let ci = 0; ci < distilled.claims.length; ci++) {
     const claim = distilled.claims[ci]
     const claimArgs = {
+      ...(deps.opts.review && { review: 'candidate' as const }),
       content: claim.content,
       contentType: mapClaimTypeToContentType(claim.type),
       source: 'personal' as const,

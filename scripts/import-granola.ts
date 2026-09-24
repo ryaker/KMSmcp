@@ -159,6 +159,8 @@ interface CliOptions {
   userId: string
   ollamaModel: string
   dryRun: boolean
+  /** Write distilled entries to the review queue (kms_review) instead of live. Default on; --no-review writes live. */
+  review: boolean
   maxMeetings?: number
   bearerToken?: string
 }
@@ -176,6 +178,7 @@ export function parseArgs(argv: string[]): CliOptions {
     userId: process.env.KMS_DEFAULT_USER_ID || 'richard_yaker',
     ollamaModel: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     dryRun: false,
+    review: true,
     bearerToken: process.env.KMS_BEARER_TOKEN
   }
 
@@ -214,6 +217,7 @@ export function parseArgs(argv: string[]): CliOptions {
       case '--ollama-model':       opts.ollamaModel = next('--ollama-model'); break
       case '--bearer-token':       opts.bearerToken = next('--bearer-token'); break
       case '--dry-run':            opts.dryRun = true; break
+      case '--no-review':          opts.review = false; break
       case '--max-meetings': {
         const raw = next('--max-meetings')
         const parsed = parseInt(raw, 10)
@@ -272,6 +276,7 @@ Options:
   --bearer-token <token>    Bypass OAuth client-credentials, pass token directly.
                             Or set KMS_BEARER_TOKEN env var.
   --dry-run                 Don't actually write to KMS. Log what would happen.
+  --no-review               Write distilled entries live instead of to the review queue (kms_review).
   --max-meetings <N>        Cap meetings processed (smoke-test).
   -h, --help                This help.
 
@@ -685,6 +690,7 @@ export async function processMeeting(
   const subject = `Granola.${meeting.title}`
   const sourceDoc = `granola://${meeting.id}`
   const summaryArgs = {
+    ...(deps.opts.review && { review: 'candidate' as const }),
     content: distilled.summary,
     contentType: 'memory' as const,
     source: 'personal' as const,
@@ -738,6 +744,7 @@ export async function processMeeting(
   for (let ci = 0; ci < distilled.claims.length; ci++) {
     const claim = distilled.claims[ci]
     const claimArgs = {
+      ...(deps.opts.review && { review: 'candidate' as const }),
       content: claim.content,
       contentType: mapClaimTypeToContentType(claim.type),
       source: 'personal' as const,

@@ -19,6 +19,7 @@ import {
 import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.js'
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { logger } from '../logger.js'
+import { scrubWrite } from '../security/secretScrub.js'
 import {
   JEV_WRITE_DEDUP_ACT_FLAG,
   JEV_WRITE_DEDUP_FLAG,
@@ -412,6 +413,15 @@ export class UnifiedStoreTool {
      */
     writeMode?: 'standard' | 'episodic'
     /**
+     * Review queue. `'candidate'` stores the entry flagged CANDIDATE: written to
+     * every backend (Mem0 shards included) but hidden from search and context
+     * injection until approved with `kms_review`. For machine-generated writes —
+     * importer distillations, harvests — whose quality nobody has checked yet.
+     * The flag is set on the entry at write time, never via flag(): flag() drops
+     * Mem0 copies, which an approval could not bring back.
+     */
+    review?: 'candidate'
+    /**
      * Narrative timestamp for the knowledge entry — the date the stored
      * content is ABOUT, not the ingestion date. ISO 8601 string or epoch
      * seconds. Flows into knowledge.timestamp (mem0's extractor then uses it
@@ -438,6 +448,7 @@ export class UnifiedStoreTool {
     }
   }): Promise<UnifiedStoreResult> {
     const startTime = Date.now()
+    args = this._scrubArgs(args, 'content', 'unified_store')
 
     debug(`\n🚀 UNIFIED STORE Starting...`)
     debug(`📝 Content: "${args.content.slice(0, 100)}${args.content.length > 100 ? '...' : ''}"`)
@@ -549,7 +560,13 @@ export class UnifiedStoreTool {
       metadata: enrichedArgs.metadata || {},
       timestamp: knowledgeTimestamp,
       confidence: enrichedArgs.confidence || 0.8,
-      relationships: enrichedArgs.relationships || []
+      relationships: enrichedArgs.relationships || [],
+      ...(args.review === 'candidate' && {
+        flag: 'CANDIDATE' as const,
+        flag_note: 'awaiting review (kms_review)',
+        flag_date: new Date(),
+        flag_by: typeof args.metadata?.provenance === 'string' ? args.metadata.provenance : 'unified_store',
+      }),
     }
 
     // ---------------------------------------------------------------------
@@ -1466,6 +1483,24 @@ export class UnifiedStoreTool {
    * Mem0's LLM-extracted memories drift from corrected truth and leak stale
    * content into search + the kms-context-fetch hook.
    */
+  /**
+   * Mask credentials in a write's content field and string metadata before
+   * anything else sees it (see src/security/secretScrub.ts). Records
+   * `metadata.redactions` ({type, count} only) so a masked entry is auditable,
+   * and logs the types — never a value. Idempotent: a masked value never
+   * re-matches, so a supersede reached through execute()'s action dispatch is
+   * not double-counted.
+   */
+  private _scrubArgs<T extends { metadata?: Record<string, any> }>(args: T, field: keyof T & string, tool: string): T {
+    const value = args[field]
+    if (typeof value !== 'string') return args
+    const r = scrubWrite(value, args.metadata)
+    if (r.redactions.length === 0) return args
+    const prior = Array.isArray(args.metadata?.redactions) ? args.metadata!.redactions : []
+    console.warn(`${tool}: masked ${r.redactions.map(x => `${x.count}× ${x.type}`).join(', ')} before storing`)
+    return { ...args, [field]: r.content, metadata: { ...r.metadata, redactions: [...prior, ...r.redactions] } }
+  }
+
   async update(args: {
     id: string
     content?: string
@@ -1474,6 +1509,7 @@ export class UnifiedStoreTool {
     reason?: string
     userId?: string
   }): Promise<{ success: boolean; id: string; backends: string[]; reason?: string }> {
+    if (args.content !== undefined) args = this._scrubArgs(args, 'content', 'kms_update')
     const updates: Partial<UnifiedKnowledge> = {}
     if (args.content !== undefined) updates.content = args.content
     if (args.confidence !== undefined) updates.confidence = args.confidence
@@ -1628,6 +1664,44 @@ export class UnifiedStoreTool {
   }
 
   /**
+   * Review queue for entries written with `review: 'candidate'`.
+   *   - list    — pending CANDIDATE entries, newest first (optionally one user's).
+   *   - approve — clears the flag, so the entry (and its Mem0 shards) becomes visible.
+   *   - reject  — soft-deletes it (DELETED, reversible for 90 days like kms_delete).
+   * approve/reject refuse anything that is not currently a CANDIDATE: the review
+   * tool must never resurrect a SUPERSEDED/DELETED/RETRACTED entry.
+   */
+  async review(args: {
+    action: 'list' | 'approve' | 'reject'
+    id?: string
+    reason?: string
+    userId?: string
+    limit?: number
+  }): Promise<Record<string, any>> {
+    const graph = this.storage.graph as any
+    if (args.action === 'list') {
+      if (typeof graph?.listByFlag !== 'function') {
+        return { success: false, error: 'graph backend cannot list flagged entries' }
+      }
+      const candidates = graph.listByFlag('CANDIDATE', { userId: args.userId, limit: args.limit })
+      return { success: true, pending: candidates.length, candidates }
+    }
+    if (args.action !== 'approve' && args.action !== 'reject') {
+      return { success: false, error: `unknown action ${String(args.action)} (expected list | approve | reject)` }
+    }
+    if (!args.id) return { success: false, error: `${args.action} requires id` }
+    const current = typeof graph?.findById === 'function' ? graph.findById(args.id) : null
+    if (!current) return { success: false, id: args.id, error: 'entry not found' }
+    if (current.flag !== 'CANDIDATE') {
+      return { success: false, id: args.id, error: `entry is ${current.flag ?? 'not flagged'}, not CANDIDATE — review only acts on the queue` }
+    }
+    const result = args.action === 'approve'
+      ? await this.flag({ id: args.id, flag: null, note: args.reason ?? 'approved', by: 'kms_review' })
+      : await this.delete({ id: args.id, reason: args.reason ?? 'rejected in review', by: 'kms_review' })
+    return { ...result, action: args.action }
+  }
+
+  /**
    * Mark an entry with an arbitrary flag without modifying its content.
    * Pass `flag=null` to clear (un-retract).
    *
@@ -1776,6 +1850,8 @@ export class UnifiedStoreTool {
     reason?: string
     error?: string
   }> {
+    args = this._scrubArgs(args, 'new_content', 'kms_supersede')
+
     // Step 0: probe backends to find out where the old entry actually lives.
     // We do this BEFORE storing the new entry so we can fail fast (and avoid
     // a wasted store + rollback) when old_id is wrong / truly missing.

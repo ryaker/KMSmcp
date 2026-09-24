@@ -658,3 +658,23 @@ function defaultOpts(): any {
     dryRun: true
   }
 }
+
+describe('review queue default', () => {
+  it('parseArgs defaults to review on; --no-review turns it off', () => {
+    expect(parseArgs([]).review).toBe(true)
+    expect(parseArgs(['--no-review']).review).toBe(false)
+  })
+
+  it.each([[true, 'candidate'], [false, undefined]])('review=%s → summary and claims review=%s', async (review, expected) => {
+    const kms = new FakeMcpClient()
+    await processMeeting({ id: 'mr', title: 'R', transcript: 'hello world' }, {
+      source: new FakeGranolaSource([]),
+      distiller: new FakeDistiller(),
+      kms: kms as any,
+      opts: { ...defaultOpts(), dryRun: false, review },
+      log: { completed: [] }
+    })
+    expect(kms.calls).toHaveLength(3)
+    for (const call of kms.calls) expect(call.args.review).toBe(expected)
+  })
+})

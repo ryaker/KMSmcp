@@ -88,6 +88,8 @@ export interface CliOptions {
   /** Opt-in for /Volumes-style path to L16 reverse-engineering (codex-curated, trusted). */
   includeL16ReverseEng: boolean
   dryRun: boolean
+  /** Write distilled CLAIMS (the whole doc is the author's own text and stays live) to the review queue (kms_review) instead of live. Default on; --no-review writes live. */
+  review: boolean
   limit: number | null
   after: Date | null
   force: boolean
@@ -572,6 +574,7 @@ export interface UnifiedStoreArgs {
   action?: 'supersede' | 'update' | 'complement' | 'force-new'
   old_id?: string
   reason?: string
+  review?: 'candidate'
 }
 
 /** Result wrapper from KMS — covers both success and dedup_required shapes. */
@@ -896,6 +899,7 @@ export function parseArgs(argv: string[]): CliOptions {
     includeLightWork: false,
     includeL16ReverseEng: false,
     dryRun: false,
+    review: true,
     limit: null,
     after: null,
     force: false,
@@ -923,6 +927,9 @@ export function parseArgs(argv: string[]): CliOptions {
         break
       case '--dry-run':
         opts.dryRun = true
+        break
+      case '--no-review':
+        opts.review = false
         break
       case '--limit': {
         const limitVal = parseInt(argv[++i], 10)
@@ -978,6 +985,7 @@ Options:
   --include-l16-reveng    Include /Users/ryaker/Dev/L16_Lumen_ReverseEngineering
                           (124 files, codex-curated, trusted)
   --dry-run               Plan only, no writes
+  --no-review             Write distilled entries live instead of to the review queue (kms_review).
   --limit <n>             Process at most N files
   --after <YYYY-MM-DD>    Only files mtime > date
   --force                 Re-process even if hash unchanged
@@ -1127,7 +1135,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       const { file, hash, action, priorEntry } = item
       try {
         const content = await fs.readFile(file.absolutePath, 'utf8')
-        await processFile(client!, generate, file, content, hash, action, priorEntry, syncLog, stats)
+        await processFile(client!, generate, file, content, hash, action, priorEntry, syncLog, stats, opts.review)
         flushSyncLog()
         const total = idx + 1
         if (total % 5 === 0 || total === toProcess.length) {
@@ -1178,7 +1186,8 @@ async function processFile(
   action: 'new' | 'update' | 'retry',
   priorEntry: SyncLogEntry | undefined,
   syncLog: SyncLog,
-  stats: ProcessStats
+  stats: ProcessStats,
+  review = true
 ): Promise<void> {
   const filename = path.basename(file.absolutePath)
   const subject = computeSubject(file.sourceProject, file.absolutePath)
@@ -1238,6 +1247,7 @@ async function processFile(
   const claimIds: string[] = []
   for (const claim of distillation.claims) {
     const claimArgs: UnifiedStoreArgs = {
+      ...(review && { review: 'candidate' as const }),
       content: claim.content,
       contentType: mapClaimTypeToContentType(claim.type),
       source: 'cross_domain',
