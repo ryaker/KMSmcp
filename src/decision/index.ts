@@ -23,13 +23,32 @@ export {
   type ShadowRunRecord,
 } from './decisionLog.js'
 export {
+  JEV_RERANK_DEADLINE_ENV,
+  JEV_RERANK_DEADLINE_DEFAULT_MS,
   JEV_SHADOW_RERANK_FLAG,
   JEV_SHADOW_REORDER_FLAG,
+  JEV_SHADOW_TOPK_DEFAULT,
+  JEV_SHADOW_TOPK_MAX,
+  evaluateRecallCandidates,
   isJevShadowRerankEnabled,
+  jevRerankDeadlineMs,
   jevShadowAction,
   jevShadowTopK,
   runShadowRerank,
+  type EvaluateCandidatesResult,
+  type RankedRecallCandidate,
+  type ShadowRerankInput,
 } from './shadowRerank.js'
+export {
+  JEV_SERVED_RERANK_FLAG,
+  collapseMem0Duplicates,
+  isJevServedRerankEnabled,
+  runServedRerank,
+  type RerankFallbackReason,
+  type RerankMeta,
+  type ServedRerankInput,
+  type ServedRerankOutcome,
+} from './servedRerank.js'
 export {
   JEV_WRITE_DEDUP_ACT_FLAG,
   JEV_WRITE_DEDUP_FLAG,
