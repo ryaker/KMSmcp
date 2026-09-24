@@ -25,7 +25,7 @@
 # Environment expectations:
 #   - KMS at http://localhost:8180/mcp must be reachable.
 #   - OAuth client_credentials env supplied via Doppler (preferred) or via .env.
-#   - Ollama must be reachable for distillation (OLLAMA_BASE_URL, default http://localhost:11434).
+#   - Ollama must be reachable for distillation (OLLAMA_BASE_URL, default rym1 http://100.127.128.76:11434 — never this Mac).
 
 set -uo pipefail
 

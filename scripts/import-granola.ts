@@ -103,7 +103,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../src/inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_BASE_URL } from '../src/inference/OllamaInference.js'
 import {
   buildDistillPrompt,
   DistilledMeeting,
@@ -279,7 +279,7 @@ Environment:
   KMS_BEARER_TOKEN          Preferred OAuth path for one-off runs.
   KMS_URL                   Override --kms-url.
   KMS_DEFAULT_USER_ID       Default --user-id.
-  OLLAMA_BASE_URL           Local model host (default: http://localhost:11434).
+  OLLAMA_BASE_URL           Local model host (default: ${DEFAULT_OLLAMA_BASE_URL}, rym1).
   OLLAMA_MODEL              Local model for distillation (default: ${DEFAULT_OLLAMA_MODEL}).
 
   When KMS_BEARER_TOKEN is unset, the script falls back to Auth0 client_credentials
@@ -909,7 +909,7 @@ async function main(): Promise<void> {
     sinceDate = d
   }
 
-  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL
 
   console.log(`🚀 Granola → KMS importer starting`)
   console.log(`   Source:       ${opts.source}`)

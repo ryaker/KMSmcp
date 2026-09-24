@@ -70,6 +70,15 @@ describe('OllamaInference structured output', () => {
     warn.mockRestore()
   })
 
+  it('defaults to rym1, never this Mac: an unset OLLAMA_BASE_URL must not fall back to localhost', async () => {
+    const { DEFAULT_OLLAMA_BASE_URL } = await import('../inference/OllamaInference.js')
+    expect(DEFAULT_OLLAMA_BASE_URL).not.toMatch(/localhost|127\.0\.0\.1/)
+
+    const fetchMock = mockFetch('free text')
+    await new OllamaInference().generate('hello', { numPredict: 8 })
+    expect(String(fetchMock.mock.calls[0][0])).toBe(`${DEFAULT_OLLAMA_BASE_URL}/api/generate`)
+  })
+
   it('generate() omits format unless the caller asks for it (distillers unchanged)', async () => {
     const fetchMock = mockFetch('free text')
     const inf = new OllamaInference('http://ollama.test', 'gemma4:12b-mlx')

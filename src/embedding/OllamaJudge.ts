@@ -33,9 +33,9 @@ import {
   parseLLMRelation,
 } from './LLMJudgeService.js'
 import { logger } from '../logger.js'
-import { DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
+import { DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
 
-const DEFAULT_BASE_URL = 'http://localhost:11434'
+const DEFAULT_BASE_URL = DEFAULT_OLLAMA_BASE_URL
 const DEFAULT_MODEL = DEFAULT_OLLAMA_MODEL
 const DEFAULT_CACHE_SIZE = 1000
 
@@ -83,7 +83,7 @@ const SYSTEM_PROMPT = `You are a strict classifier. Compare two pieces of knowle
 Respond with ONLY the single enum word. No punctuation, no explanation, no formatting.`
 
 export interface OllamaJudgeConfig {
-  /** Ollama base URL. Defaults to env OLLAMA_BASE_URL, then localhost:11434. */
+  /** Ollama base URL. Defaults to env OLLAMA_BASE_URL, then DEFAULT_OLLAMA_BASE_URL (rym1). */
   baseUrl?: string
   /** Model id (defaults to env OLLAMA_MODEL, then DEFAULT_OLLAMA_MODEL). */
   model?: string

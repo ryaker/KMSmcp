@@ -86,7 +86,7 @@
  *   }
  */
 
-import { OllamaInference, DEFAULT_OLLAMA_MODEL } from '../inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -235,7 +235,7 @@ Options:
 
 Environment:
   KMS_BEARER_TOKEN           Preferred OAuth path for one-off runs.
-  OLLAMA_BASE_URL            (optional) default http://localhost:11434 — distillation.
+  OLLAMA_BASE_URL            (optional) default ${DEFAULT_OLLAMA_BASE_URL} (rym1) — distillation.
   OLLAMA_MODEL               (optional) default ${DEFAULT_OLLAMA_MODEL}.
   KMS_URL                    Override --kms-url.
   KMS_DEFAULT_USER_ID        Default --user-id.
@@ -1086,7 +1086,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     process.exit(2)
   }
 
-  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL
 
   console.log(`🚀 Slack Huddle → KMS importer starting`)
   console.log(`   Source:       ${opts.source}`)
@@ -1188,7 +1188,7 @@ export async function runImportLive(args: {
   // here any more — the only prerequisite is that the model answers. Probe it
   // before touching KMS, as main() does: otherwise an unreachable host fails
   // each huddle only after its full distill timeout.
-  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL
   const distiller = opts.dryRun
     ? new NoopDistiller()
     : new OllamaDistiller(ollamaBaseUrl, opts.ollamaModel)

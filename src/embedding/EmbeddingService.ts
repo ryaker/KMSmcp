@@ -13,6 +13,7 @@
  *     just without an embedding. A backfill job can re-embed later.
  */
 import { logger } from '../logger.js'
+import { DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
 
 /**
  * Transient metadata keys for the embedding-handoff pattern (PR #69).
@@ -64,7 +65,7 @@ export interface EmbeddingService {
 
 // ---------------------------------------------------------------------------
 
-const DEFAULT_BASE_URL = 'http://localhost:11434'
+const DEFAULT_BASE_URL = DEFAULT_OLLAMA_BASE_URL
 const DEFAULT_MODEL = 'nomic-embed-text'
 const DEFAULT_VERSION = 'v1'  // bump when pre-processing/model changes
 const DEFAULT_DIMENSIONS = 768
@@ -88,7 +89,7 @@ const AVAILABILITY_CACHE_TTL_MS = 30_000
 const AVAILABILITY_CACHE_TTL_FAIL_MS = 5_000
 
 export interface OllamaEmbeddingServiceConfig {
-  /** Ollama base URL (defaults to env OLLAMA_BASE_URL or http://localhost:11434). */
+  /** Ollama base URL (defaults to env OLLAMA_BASE_URL, then DEFAULT_OLLAMA_BASE_URL — rym1). */
   baseUrl?: string
   /** Model name passed to `/api/embeddings` (default: nomic-embed-text). */
   model?: string

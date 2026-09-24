@@ -21,7 +21,7 @@ import { FACTCache } from './cache/FACTCache.js'
 import { RedisKeepAlive } from './cache/RedisKeepAlive.js'
 import { IntelligentStorageRouter } from './routing/IntelligentStorageRouter.js'
 import { OllamaStorageRouter } from './routing/OllamaStorageRouter.js'
-import { OllamaInference, DEFAULT_OLLAMA_MODEL } from './inference/OllamaInference.js'
+import { OllamaInference, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_BASE_URL } from './inference/OllamaInference.js'
 import { EnrichmentQueue } from './inference/EnrichmentQueue.js'
 import { EntityLinker } from './inference/EntityLinker.js'
 import { OllamaEmbeddingService } from './embedding/EmbeddingService.js'
@@ -152,7 +152,7 @@ export class UnifiedKMSServer {
     // Step 3b: Initialize Ollama inference layer (with regex fallback)
     console.log('🤖 Initializing Ollama Inference Layer...')
     const ollamaInference = new OllamaInference(
-      process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+      process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
       process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL
     )
     const ollamaRouter = new OllamaStorageRouter(ollamaInference, this.router)
@@ -171,7 +171,7 @@ export class UnifiedKMSServer {
     // Failures here are non-fatal — UnifiedStoreTool catches and continues.
     console.log('🧬 Initializing Embedding Service (nomic-embed-text)...')
     const embeddingService = new OllamaEmbeddingService({
-      baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
+      baseUrl: process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL
     })
 
     // LLM judge for the dedup gate's Tier 2 borderline classification
@@ -185,7 +185,7 @@ export class UnifiedKMSServer {
       `🤖 Initializing LLM Judge (Ollama ${process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL})...`
     )
     const llmJudge: LLMJudgeService = new OllamaJudge({
-      baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+      baseUrl: process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
       model: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL
     })
 
