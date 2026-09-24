@@ -16,7 +16,7 @@
  * back to a live call.
  *
  * The five variants share the exact production constants from `shadowPolicy.ts`
- * (`SHADOW_WEIGHT_ANSWERS_QUERY`, `SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD`, etc.) — this
+ * (`SHADOW_WEIGHT_ANSWERS_QUERY`, `SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD`, etc.) — this
  * file does not hardcode a second copy of a weight the shipped policy already owns.
  *
  *   A  v2 as shipped                          (shadowScoreV2, unmodified)
@@ -38,7 +38,7 @@ import {
 } from '../decision/recallEvidence.js'
 import {
   SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER,
-  SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD,
+  SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD,
   SHADOW_V2_PAST_STATE_DISCOUNT_WEIGHT,
   SHADOW_WEIGHT_ANSWERS_QUERY,
   SHADOW_WEIGHT_EVIDENCE_VALUE,
@@ -93,7 +93,7 @@ export function variantScore(a: CachedAnswer, cfg: VariantConfig, correctedOrRep
   const evidence = Math.min(1, Math.max(0, a.evidence_value / EVIDENCE_VALUE_MAX))
   const base = SHADOW_WEIGHT_ANSWERS_QUERY * a.answers_query + SHADOW_WEIGHT_EVIDENCE_VALUE * evidence
 
-  if (cfg.applyInstructionDemotion && a.contains_instruction > SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD) return 0
+  if (cfg.applyInstructionDemotion && a.contains_instruction > SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD) return 0
 
   const correctedMultiplier =
     cfg.applyCorrectionMultiplier && correctedOrReplaced ? SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER : 1
@@ -247,7 +247,7 @@ export function instructionFlaggedGradeBreakdown(
     if (!byId) return
     for (const candidate of q.candidates) {
       const a = byId.get(candidate.id)
-      if (!a || a.contains_instruction <= SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD) continue
+      if (!a || a.contains_instruction <= SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD) continue
       total++
       if (candidate.grade === 2) grade2++
       else if (candidate.grade === 1) grade1++
@@ -301,7 +301,7 @@ export async function main(): Promise<void> {
     console.log('')
   }
 
-  console.log(`contains_instruction > ${SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD} — Gemma grade breakdown of the ${grades.total} flagged candidates:`)
+  console.log(`contains_instruction > ${SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD} — Gemma grade breakdown of the ${grades.total} flagged candidates:`)
   console.log(`  grade 2 (strict-relevant): ${grades.grade2}`)
   console.log(`  grade 1 (lenient-relevant only): ${grades.grade1}`)
   console.log(`  grade 0 (irrelevant): ${grades.grade0}`)

@@ -2,10 +2,10 @@
  * Served recall re-rank — step 3 of the KMS × Jev v2 build order
  * (`~/Documents/Notes/kms-jev-architecture-v2.md` §3A / §5).
  *
- * Same judgments `shadowRerank.ts` already asks (one request per candidate, three
- * questions, one whole-search deadline, one shared rate limiter — see
- * `evaluateRecallCandidates`), but AWAITED and RETURNED to the `unified_search` caller
- * instead of only logged. Behind `KMS_JEV_RERANK`, default OFF; the owner flips it.
+ * Same judgments `shadowRerank.ts` already asks (one request per candidate, the
+ * `recall-evidence/v2` questions, one whole-search deadline, one shared rate limiter —
+ * see `evaluateRecallCandidates`), but AWAITED and RETURNED to the `unified_search`
+ * caller instead of only logged. Behind `KMS_JEV_RERANK`, default OFF; the owner flips it.
  *
  * The one new thing this file owns: collapsing a Mem0 shard and its graph/Mongo parent
  * into one candidate before judging (§3A: "production top-K … deduped by parent id").
@@ -31,8 +31,8 @@ import {
   jevRerankDeadlineMs,
   type RankedRecallCandidate,
 } from './shadowRerank.js'
-import { RECALL_EVIDENCE_SCHEMA_VERSION } from './recallEvidence.js'
-import { SHADOW_POLICY_VERSION, shadowOrder } from './shadowPolicy.js'
+import { RECALL_EVIDENCE_V2_SCHEMA_VERSION } from './recallEvidence.js'
+import { SHADOW_POLICY_V2_VERSION, shadowOrder } from './shadowPolicy.js'
 import type { DecisionEngine } from './types.js'
 
 /** Serves the Jev order instead of only shadowing it. Default OFF. Strictly `'1'`. */
@@ -229,8 +229,8 @@ function buildRunRecord(args: {
     provider: engine.provider,
     requested_model: engine.requestedModel,
     models: Array.from(new Set(succeeded.map(r => r.model).filter((m): m is string => m !== null))),
-    question_schema_version: RECALL_EVIDENCE_SCHEMA_VERSION,
-    policy_version: SHADOW_POLICY_VERSION,
+    question_schema_version: RECALL_EVIDENCE_V2_SCHEMA_VERSION,
+    policy_version: SHADOW_POLICY_V2_VERSION,
     policy_decision: 'shadow_reorder',
     served: true,
     query,

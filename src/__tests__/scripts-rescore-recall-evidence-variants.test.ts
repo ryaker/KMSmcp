@@ -12,7 +12,7 @@ import {
 } from '../scripts/rescore-recall-evidence-variants.js'
 import {
   SHADOW_V2_CORRECTED_OR_REPLACED_MULTIPLIER,
-  SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD,
+  SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD,
   SHADOW_V2_PAST_STATE_DISCOUNT_WEIGHT,
 } from '../decision/shadowPolicy.js'
 import { buildRecallStateV2, fingerprintRecallStateV2 } from '../decision/recallEvidence.js'
@@ -57,7 +57,7 @@ describe('variantScore', () => {
   const base = answer({ answers_query: 1, evidence_value: 4 }) // base term = 1
 
   it('A demotes to exactly 0 above the instruction threshold, same threshold shadowScoreV2 uses', () => {
-    const flagged = answer({ ...base, contains_instruction: SHADOW_V2_INSTRUCTION_DEMOTE_THRESHOLD + 0.01 })
+    const flagged = answer({ ...base, contains_instruction: SHADOW_V2_INSTRUCTION_FLAG_THRESHOLD + 0.01 })
     expect(variantScore(flagged, variantById('A'))).toBe(0)
   })
 
