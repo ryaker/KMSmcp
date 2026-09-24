@@ -1705,6 +1705,9 @@ export class UnifiedStoreTool {
     if (!args.id) return { success: false, error: `${args.action} requires id` }
     const current = typeof graph?.findById === 'function' ? graph.findById(args.id) : null
     if (!current) return { success: false, id: args.id, error: 'entry not found' }
+    // The router may skip MongoDB for an entry; only a store that holds it can miss the change.
+    let inMongo = false
+    try { inMongo = Boolean(await this.storage.mongodb.findById?.(args.id)) } catch { inMongo = false }
     if (current.flag !== 'CANDIDATE') {
       return { success: false, id: args.id, error: `entry is ${current.flag ?? 'not flagged'}, not CANDIDATE — review only acts on the queue` }
     }
@@ -1712,7 +1715,7 @@ export class UnifiedStoreTool {
       ? await this.flag({ id: args.id, flag: null, note: args.reason ?? 'approved', by: 'kms_review' })
       : await this.delete({ id: args.id, reason: args.reason ?? 'rejected in review', by: 'kms_review' })
     // flag() is best-effort per backend; say so when the two stores now disagree.
-    const missed = ['sparrowdb', 'mongodb'].filter(b => !result.backends.includes(b))
+    const missed = ['sparrowdb', ...(inMongo ? ['mongodb'] : [])].filter(b => !result.backends.includes(b))
     return {
       ...result,
       action: args.action,
