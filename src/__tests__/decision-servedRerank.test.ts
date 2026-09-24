@@ -234,31 +234,46 @@ describe('runServedRerank', () => {
     expect(run.runRecord).toBeNull()
   })
 
-  it('serves the FULL, unmodified production order on a deadline miss — no partial reorder', async () => {
+  // Helper: an engine where the candidate with `hangContent` never answers until aborted.
+  const hangingEngine = (hangContent: string): DecisionEngine => ({
+    provider: 'mock', requestedModel: 'm',
+    evaluate: jest.fn((request: DecisionRequest): Promise<DecisionResult> => {
+      const content = (request.state as any).candidate.content as string
+      if (content !== hangContent) return mockEngine(VERDICTS).engine.evaluate(request)
+      return new Promise((_, reject) => request.signal!.addEventListener('abort', () => reject(new Error('aborted'))))
+    }),
+  })
+
+  it('a deadline hit with some judgments still serves the policy order; the late candidate keeps its production slot', async () => {
     jest.useFakeTimers()
     try {
-      const evaluate = jest.fn((request: DecisionRequest): Promise<DecisionResult> => {
-        const content = (request.state as any).candidate.content as string
-        // 'answer' hangs until its signal fires; the rest resolve immediately.
-        if (content !== 'phoenix uses 16 cameras') return mockEngine(VERDICTS).engine.evaluate(request)
-        return new Promise((_, reject) => request.signal!.addEventListener('abort', () => reject(new Error('aborted'))))
-      })
-      const engine: DecisionEngine = { provider: 'mock', requestedModel: 'm', evaluate }
       const { sink, rows } = memorySink()
-
-      const pending = runServedRerank({ engine, query: QUERY, ranked: RANKED, now: NOW, deadlineMs: 300, sink })
+      // 'answer' (production #3) misses the deadline; 'old' and 'noise' are judged.
+      const pending = runServedRerank({ engine: hangingEngine('phoenix uses 16 cameras'), query: QUERY, ranked: RANKED, now: NOW, deadlineMs: 300, sink })
       await jest.advanceTimersByTimeAsync(300)
       const run = await pending
 
-      expect(run.meta.applied).toBe(false)
-      expect(run.meta.reason).toBe('deadline')
-      // Two of three judged in time, but the served order is production, unpartitioned.
-      expect(run.meta.judged).toBe(2)
-      expect(run.ordered).toBe(RANKED)
-      expect(run.ordered.map((c: any) => c.id)).toEqual(['noise', 'old', 'answer'])
-      // Still logged, so the deadline-miss rate is measurable even though nothing served.
+      expect(run.meta).toMatchObject({ applied: true, partial: true, judged: 2, unjudged: 1 })
+      expect(run.meta.reason).toBeUndefined()
+      expect(run.ordered.map((c: any) => c.id)).toEqual(['old', 'noise', 'answer'])
       expect(rows).toHaveLength(1)
       expect(rows[0].served).toBe(true)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('an unjudged candidate is never demoted below its production position', async () => {
+    jest.useFakeTimers()
+    try {
+      // 'noise' (production #1) misses the deadline: it must stay first even though it
+      // would score lowest; the judged pair is re-ranked behind it.
+      const pending = runServedRerank({ engine: hangingEngine('phoenix session notes'), query: QUERY, ranked: RANKED, now: NOW, deadlineMs: 300 })
+      await jest.advanceTimersByTimeAsync(300)
+      const run = await pending
+
+      expect(run.meta).toMatchObject({ applied: true, partial: true, judged: 2, unjudged: 1 })
+      expect(run.ordered.map((c: any) => c.id)).toEqual(['noise', 'answer', 'old'])
     } finally {
       jest.useRealTimers()
     }

@@ -56,6 +56,10 @@ export interface RerankMeta {
   judged: number
   /** Mem0 shard candidates dropped before judging — see the module comment. */
   collapsed: number
+  /** The deadline cut some judgments off; those candidates kept their production positions. */
+  partial?: boolean
+  /** Candidates not judged in time (present when `partial`). */
+  unjudged?: number
 }
 
 export interface ServedRerankOutcome<C> {
@@ -179,20 +183,22 @@ export async function runServedRerank<C extends RankedRecallCandidate>(input: Se
       }
     }
 
-    if (deadlineHit) {
-      // The deadline is for the WHOLE batch: some candidates may have judged in time,
-      // but a partial reorder would serve an order the policy never actually decided on
-      // (unjudged candidates keep their spot, but a caller can't tell "judged" from
-      // "judged after everyone else got a fair shot"). Safer and simpler: on a deadline
-      // miss, the search behaves exactly as if Jev had not run at all.
-      logger.warn(`decision: served rerank deadline ${deadlineMs}ms HIT — serving production order`)
+    if (deadlineHit && judged === 0) {
+      logger.warn(`decision: served rerank deadline ${deadlineMs}ms HIT with nothing judged — serving production order`)
       return { ordered: input.ranked, meta: { applied: false, reason: 'deadline', latency_ms: latencyMs, judged, collapsed: collapsedCount }, runRecord }
     }
-
+    // A deadline hit with some judgments in hand still serves the policy order: the policy
+    // never moves an unjudged candidate below its production position (shadowOrder), so the
+    // late ones stay where production put them and only the judged ones are re-ranked. One
+    // slow call — seen live, ~1 in 40 — must not throw away the other 19 judgments.
+    const unjudged = records.length - judged
     const orderedHead = positions.map(position => dedupedHead[position])
     return {
       ordered: [...orderedHead, ...tail],
-      meta: { applied: true, latency_ms: latencyMs, judged, collapsed: collapsedCount },
+      meta: {
+        applied: true, latency_ms: latencyMs, judged, collapsed: collapsedCount,
+        ...(deadlineHit && { partial: true, unjudged }),
+      },
       runRecord,
     }
   } catch (e) {
