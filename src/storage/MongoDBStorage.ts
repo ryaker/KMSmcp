@@ -5,6 +5,12 @@
 import { MongoClient, Db, Collection } from 'mongodb'
 import { createHash } from 'node:crypto'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig, KnowledgeFlag } from '../types/index.js'
+import { expandKeywordsBounded } from '../search/compoundTokens.js'
+
+/** Bound on the total number of keywords (original + compound-split parts) that go
+ *  into a single `$or` regex filter, so a query with many compound terms cannot blow
+ *  up the number of clauses Mongo has to evaluate. */
+const MAX_REGEX_KEYWORDS = 40
 
 export interface StoredDocument {
   id: string
@@ -103,8 +109,13 @@ export class MongoDBStorage implements StorageSystem {
           .map(k => k.trim())
           .filter(k => k.length >= 2) // keep short technical terms like "AI", "C#" but skip noisy 1-char tokens
 
-        if (keywords.length > 0) {
-          filter.$or = keywords.flatMap(k => [
+        // Add compound split parts ("mem0ParentId" -> also "mem0", "parent", "id") so a
+        // compound query term matches content written as separate words, bounded so a
+        // query with many compound terms can't grow the $or without limit.
+        const expandedKeywords = expandKeywordsBounded(keywords, MAX_REGEX_KEYWORDS)
+
+        if (expandedKeywords.length > 0) {
+          filter.$or = expandedKeywords.flatMap(k => [
             { content: { $regex: escapeRegex(k), $options: 'i' } },
             { 'metadata.tags': { $regex: escapeRegex(k), $options: 'i' } }
           ])
@@ -352,7 +363,8 @@ export class MongoDBStorage implements StorageSystem {
       }
       if (kws.length > 0) {
         const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        filter.$or = kws.flatMap(k => [
+        const expandedKws = expandKeywordsBounded(kws, MAX_REGEX_KEYWORDS)
+        filter.$or = expandedKws.flatMap(k => [
           { content: { $regex: esc(k), $options: 'i' } },
           { title: { $regex: esc(k), $options: 'i' } },
           { tags: { $regex: esc(k), $options: 'i' } }
