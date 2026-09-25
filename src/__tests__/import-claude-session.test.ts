@@ -167,6 +167,17 @@ describe('extractTurnUnits', () => {
     expect(units[0].userMessage).toBe(LONG_ENOUGH)
   })
 
+  it('drops subagent hand-backs and cross-session messages (not typed by the user)', () => {
+    const path = writeTranscript([
+      userLine('Another Claude session sent a message: <agent-message from="a1">report text here</agent-message>'),
+      userLine('<cross-session-message from="peer">some long enough message body</cross-session-message>'),
+      userLine(LONG_ENOUGH)
+    ])
+    const units = extractTurnUnits(path)
+    expect(units).toHaveLength(1)
+    expect(units[0].userMessage).toBe(LONG_ENOUGH)
+  })
+
   it('drops turns under the 40-char floor', () => {
     const path = writeTranscript([userLine('ok thanks'), userLine(LONG_ENOUGH)])
     const units = extractTurnUnits(path)
@@ -291,21 +302,27 @@ describe('isSophia', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('computeScore + topDurableKind', () => {
-  it('score is max(durable) * (1 - ephemeral)', () => {
+  it('score is max(durable) * (1 - 0.5 * ephemeral)', () => {
     const nouls = {
       ...zeroNouls(),
-      durable_preference_or_correction: 0.9,
+      states_standing_rule: 0.9,
       decision_with_reason: 0.2,
       verified_fact_or_fix: 0.1,
       ephemeral: 0.5
     }
-    expect(computeScore(nouls)).toBeCloseTo(0.45)
-    expect(topDurableKind(nouls)).toBe('durable_preference_or_correction')
+    expect(computeScore(nouls)).toBeCloseTo(0.675)
+    expect(topDurableKind(nouls)).toBe('states_standing_rule')
   })
 
-  it('ephemeral near 1 drives the score to ~0 regardless of durable nouls', () => {
+  it('ephemeral near 1 halves the score', () => {
     const nouls = { ...zeroNouls(), verified_fact_or_fix: 0.95, ephemeral: 0.98 }
-    expect(computeScore(nouls)).toBeCloseTo(0.019, 2)
+    expect(computeScore(nouls)).toBeCloseTo(0.4845, 3)
+  })
+
+  it('a frustrated correction still clears the default threshold', () => {
+    const nouls = { ...zeroNouls(), corrects_assistant: 0.9, ephemeral: 0.6 }
+    expect(computeScore(nouls)).toBeGreaterThan(0.6)
+    expect(topDurableKind(nouls)).toBe('corrects_assistant')
   })
 
   it('topDurableKind picks the highest of the three durable nouls', () => {
@@ -344,7 +361,7 @@ describe('scoreUnits', () => {
     const u1 = unit({ userMessage: 'From now on always run the linter before committing code.' })
     const u2 = unit({ userMessage: 'What time is the standup tomorrow morning?' })
     const byMessage = new Map<string, Record<SessionNoul, number>>([
-      [u1.userMessage, { ...zeroNouls(), durable_preference_or_correction: 0.9, ephemeral: 0.05 }],
+      [u1.userMessage, { ...zeroNouls(), states_standing_rule: 0.9, ephemeral: 0.05 }],
       [u2.userMessage, { ...zeroNouls(), ephemeral: 0.9 }]
     ])
     const jev = new StubJevClient(byMessage)
@@ -374,7 +391,7 @@ describe('rankAndKeep', () => {
 
 describe('contentTypeForTopKind', () => {
   it('maps each topKind', () => {
-    expect(contentTypeForTopKind('durable_preference_or_correction')).toBe('pattern')
+    expect(contentTypeForTopKind('states_standing_rule')).toBe('pattern')
     expect(contentTypeForTopKind('decision_with_reason')).toBe('insight')
     expect(contentTypeForTopKind('verified_fact_or_fix')).toBe('fact')
   })
@@ -382,7 +399,7 @@ describe('contentTypeForTopKind', () => {
 
 describe('buildContent', () => {
   it('includes the context prefix and the user message verbatim', () => {
-    const content = buildContent(unit(), 'durable_preference_or_correction', 'KMSmcp')
+    const content = buildContent(unit(), 'states_standing_rule', 'KMSmcp')
     expect(content).toBe(`${buildContextPrefix(unit(), 'KMSmcp')} ${LONG_ENOUGH}`)
   })
 
@@ -392,10 +409,15 @@ describe('buildContent', () => {
     expect(content).toContain('Assistant: Switched to the token bucket approach.')
   })
 
-  it('does NOT append an assistant excerpt for durable_preference_or_correction', () => {
+  it('does NOT append an assistant excerpt for a standing rule', () => {
     const u = unit({ assistantExcerpt: 'Sure, will do that from now on.' })
-    const content = buildContent(u, 'durable_preference_or_correction', 'KMSmcp')
+    const content = buildContent(u, 'states_standing_rule', 'KMSmcp')
     expect(content).not.toContain('Assistant:')
+  })
+
+  it('appends the reply for a correction, so the stored entry says what was corrected', () => {
+    const u = unit({ assistantExcerpt: 'Understood: Jev is the default labeller.' })
+    expect(buildContent(u, 'corrects_assistant', 'KMSmcp')).toContain('Assistant: Understood')
   })
 
   it('trims the user message to MAX_USER_CHARS', () => {

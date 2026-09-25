@@ -69,7 +69,11 @@ const NOISE_PREFIXES = [
   'Stop hook feedback',
   'This session is being continued',
   '# Chief of Staff',
-  'Base directory for this skill'
+  'Base directory for this skill',
+  // Subagent hand-backs and cross-session messages arrive as user turns but were not typed by the user
+  'Another Claude session sent a message',
+  '<agent-message',
+  '<cross-session-message'
 ]
 
 /**
@@ -207,7 +211,8 @@ export function extractTurnUnits(absTranscriptPath: string): TurnUnit[] {
 // ─────────────────────────────────────────────────────────────────────────
 
 export const SESSION_NOULS = [
-  'durable_preference_or_correction',
+  'states_standing_rule',
+  'corrects_assistant',
   'decision_with_reason',
   'verified_fact_or_fix',
   'ephemeral',
@@ -217,7 +222,8 @@ export const SESSION_NOULS = [
 export type SessionNoul = (typeof SESSION_NOULS)[number]
 
 const DURABLE_NOULS = [
-  'durable_preference_or_correction',
+  'states_standing_rule',
+  'corrects_assistant',
   'decision_with_reason',
   'verified_fact_or_fix'
 ] as const satisfies readonly SessionNoul[]
@@ -225,10 +231,15 @@ const DURABLE_NOULS = [
 export type TopKind = (typeof DURABLE_NOULS)[number]
 
 export const SESSION_QUESTIONS: Record<SessionNoul, NoulDecisionQuestion> = {
-  durable_preference_or_correction: {
+  states_standing_rule: {
     type: 'noul',
     instructions:
-      "Does the user state a lasting rule or preference, or correct the assistant's prior behavior — something meant to apply beyond this one exchange, not a one-off instruction?"
+      'Does the user state a rule, preference, or default that should apply to future work, not only to this one request?'
+  },
+  corrects_assistant: {
+    type: 'noul',
+    instructions:
+      'Does the user push back on, disagree with, or correct something the assistant said, assumed, or did?'
   },
   decision_with_reason: {
     type: 'noul',
@@ -252,9 +263,13 @@ export const SESSION_QUESTIONS: Record<SessionNoul, NoulDecisionQuestion> = {
   }
 }
 
+/**
+ * Half-weight ephemeral penalty: a correction phrased in frustration ("why do you keep…
+ * wtf?") reads as chatter to the ephemeral noul, and a full penalty buried it.
+ */
 export function computeScore(nouls: Record<SessionNoul, number>): number {
   const durable = Math.max(...DURABLE_NOULS.map(k => nouls[k]))
-  return durable * (1 - nouls.ephemeral)
+  return durable * (1 - 0.5 * nouls.ephemeral)
 }
 
 export function topDurableKind(nouls: Record<SessionNoul, number>): TopKind {
@@ -381,7 +396,8 @@ export function rankAndKeep(
 
 export function contentTypeForTopKind(topKind: TopKind): 'pattern' | 'insight' | 'fact' {
   switch (topKind) {
-    case 'durable_preference_or_correction':
+    case 'states_standing_rule':
+    case 'corrects_assistant':
       return 'pattern'
     case 'decision_with_reason':
       return 'insight'
@@ -400,7 +416,8 @@ export function buildContent(unit: TurnUnit, topKind: TopKind, project: string):
   const prefix = buildContextPrefix(unit, project)
   const user = unit.userMessage.slice(0, MAX_USER_CHARS).trim()
   let content = `${prefix} ${user}`
-  const wantsExcerpt = topKind === 'decision_with_reason' || topKind === 'verified_fact_or_fix'
+  // A standing rule stands alone; a correction, decision, or fix needs the reply for context.
+  const wantsExcerpt = topKind !== 'states_standing_rule'
   if (wantsExcerpt && unit.assistantExcerpt) {
     const excerpt = unit.assistantExcerpt.slice(0, MAX_ASSISTANT_CHARS).trim()
     if (excerpt) content += `\nAssistant: ${excerpt}`

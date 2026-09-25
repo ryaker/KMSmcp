@@ -163,7 +163,7 @@ nothing but parse stdin and launch the importer in the background.
 **What the importer does** (see `src/scripts/import-claude-session.ts` for the full design):
 parses the session's JSONL transcript into candidate turn units (skipping tool results, system
 reminders, hook-injected KMS recall context, subagent turns, and anything under 40 chars), has Jev
-triage each one with small atomic nouls (`durable_preference_or_correction`, `decision_with_reason`,
+triage each one with small atomic nouls (`states_standing_rule`, `corrects_assistant`, `decision_with_reason`,
 `verified_fact_or_fix`, `ephemeral`, `mentions_sophia`), hard-drops anything Sophia-related (the
 MyMoneyCoach.ai persona — HARD RULE, never eng_kms or personal_kms), ranks the rest, and writes the
 top few to the KMS review queue (`unified_store` with `review: "candidate"`) — held for
@@ -190,7 +190,7 @@ chmod +x ~/.claude/hooks/kms-session-end.sh
 | Variable | Purpose |
 |---|---|
 | `KMS_REPO` | Where the built importer lives. Default `~/Dev/KMSmcp`. |
-| `KMS_SESSION_IMPORT_DOPPLER_CONFIG` | Optional Doppler config (e.g. `dev_eng`) to wrap the importer in, so it inherits `ONECLI_TOKEN`/`ONECLI_GATEWAY` for Jev even when the hook's own shell doesn't have them. Unset by default. |
+| `KMS_SESSION_IMPORT_DOPPLER_CONFIG` | Doppler config the importer runs under, for Jev's `ONECLI_TOKEN`/`ONECLI_GATEWAY` (the hook shell has neither). Default `dev_eng`; set to empty to use the hook's own environment. |
 
 **Logs:** `~/.kms-session-import/<session_id>.log` (importer stdout/stderr — the hook itself never
 prints anything, by design).

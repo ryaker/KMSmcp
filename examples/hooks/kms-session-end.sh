@@ -47,10 +47,10 @@ ENTRY="$KMS_REPO/dist/scripts/import-claude-session-cli.js"
 
 LOG_FILE="$LOG_DIR/${SESSION_ID:-unknown}.log"
 
-# Optional: run the importer under a Doppler config (e.g. "dev_eng") so it inherits
-# ONECLI_TOKEN / ONECLI_GATEWAY for Jev even when the hook's own shell doesn't have
-# them. Off by default — set KMS_SESSION_IMPORT_DOPPLER_CONFIG to enable.
-DOPPLER_CONFIG="${KMS_SESSION_IMPORT_DOPPLER_CONFIG:-}"
+# Jev needs ONECLI_TOKEN / ONECLI_GATEWAY, which Claude Code's hook shell doesn't have.
+# Run the importer under a Doppler config (default dev_eng); set
+# KMS_SESSION_IMPORT_DOPPLER_CONFIG="" to run it with the hook's own environment.
+DOPPLER_CONFIG="${KMS_SESSION_IMPORT_DOPPLER_CONFIG-dev_eng}"
 if [ -n "$DOPPLER_CONFIG" ] && command -v doppler >/dev/null 2>&1; then
   RUNNER=(doppler run --project ry-local --config "$DOPPLER_CONFIG" -- node "$ENTRY")
 else
