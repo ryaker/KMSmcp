@@ -25,17 +25,6 @@ describe('UnifiedSearchTool calculateRelevance — compound-token expansion', ()
     ).toBeGreaterThan(0)
   })
 
-  it('matches snake_case content against a space-separated query', () => {
-    // dedup_unchecked — content compound (underscore is a JS \b word char, so the old
-    // \b<term>\b regex never found a boundary inside it)
-    expect(
-      relevance(
-        'Entries flagged dedup_unchecked skip the Tier 1 check.',
-        'dedup unchecked',
-      ),
-    ).toBeGreaterThan(0)
-  })
-
   it('matches kebab-case content against a space-separated query', () => {
     // kms-context-inject — hyphen is not a JS regex word character, so this direction
     // mostly worked pre-fix too; kept as a regression guard now that content is

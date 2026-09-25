@@ -5,7 +5,7 @@
 import { MongoClient, Db, Collection } from 'mongodb'
 import { createHash } from 'node:crypto'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KMSConfig, KnowledgeFlag } from '../types/index.js'
-import { expandKeywordsBounded } from '../search/compoundTokens.js'
+import { keywordRegexSources } from '../search/compoundTokens.js'
 
 /** Bound on the total number of keywords (original + compound-split parts) that go
  *  into a single `$or` regex filter, so a query with many compound terms cannot blow
@@ -103,7 +103,6 @@ export class MongoDBStorage implements StorageSystem {
       // Text search — split into keywords so "MCP session recovery" finds docs containing
       // those words individually, not the exact phrase as a substring.
       if (query.query) {
-        const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
         const keywords = query.query
           .split(/\s+/)
           .map(k => k.trim())
@@ -112,12 +111,12 @@ export class MongoDBStorage implements StorageSystem {
         // Add compound split parts ("mem0ParentId" -> also "mem0", "parent", "id") so a
         // compound query term matches content written as separate words, bounded so a
         // query with many compound terms can't grow the $or without limit.
-        const expandedKeywords = expandKeywordsBounded(keywords, MAX_REGEX_KEYWORDS)
+        const patterns = keywordRegexSources(keywords, MAX_REGEX_KEYWORDS)
 
-        if (expandedKeywords.length > 0) {
-          filter.$or = expandedKeywords.flatMap(k => [
-            { content: { $regex: escapeRegex(k), $options: 'i' } },
-            { 'metadata.tags': { $regex: escapeRegex(k), $options: 'i' } }
+        if (patterns.length > 0) {
+          filter.$or = patterns.flatMap(p => [
+            { content: { $regex: p, $options: 'i' } },
+            { 'metadata.tags': { $regex: p, $options: 'i' } }
           ])
         }
       }
@@ -362,12 +361,11 @@ export class MongoDBStorage implements StorageSystem {
         return []
       }
       if (kws.length > 0) {
-        const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        const expandedKws = expandKeywordsBounded(kws, MAX_REGEX_KEYWORDS)
-        filter.$or = expandedKws.flatMap(k => [
-          { content: { $regex: esc(k), $options: 'i' } },
-          { title: { $regex: esc(k), $options: 'i' } },
-          { tags: { $regex: esc(k), $options: 'i' } }
+        const patterns = keywordRegexSources(kws, MAX_REGEX_KEYWORDS)
+        filter.$or = patterns.flatMap(p => [
+          { content: { $regex: p, $options: 'i' } },
+          { title: { $regex: p, $options: 'i' } },
+          { tags: { $regex: p, $options: 'i' } }
         ])
       }
     }

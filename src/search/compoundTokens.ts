@@ -81,104 +81,69 @@ export function isCompoundToken(token: string): boolean {
   return expandCompoundToken(token).length > 1
 }
 
-/**
- * Quick, cheap test for whether `text` contains ANY token that could decompose — a
- * delimiter, a case transition, or a letter/digit transition. Used to skip the (slightly
- * more expensive) per-token scan in `compoundExpansionSuffix` for ordinary prose, which
- * is the overwhelming majority of stored content.
- */
-const HAS_COMPOUND_HINT_RE = /[_\-.]|[a-z][A-Z]|[A-Za-z][0-9]|[0-9][A-Za-z]/
+/** Separators allowed between the parts of a compound term when matching it in text. */
+const PART_SEPARATOR = '[\\s_.\\-]*'
 
-/** Tokens made of letters, digits, and the compound delimiters. */
-const TOKEN_RE = /[a-zA-Z0-9_.-]+/g
+function escapeRegexSource(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
-/**
- * Extra sub-tokens to append to `text` so a compound identifier's parts become
- * independently word-boundary-matchable, WITHOUT touching text that has no compound
- * tokens (returns `''`, so plain prose is byte-for-byte unaffected downstream).
- *
- * Only the split PARTS are returned (never the original whole token, which is already
- * present in `text` itself) — appending whole tokens back in would double-count their
- * occurrences for every match, including plain non-compound words, and inflate density
- * scoring across the board rather than only where it's needed.
- */
-export function compoundExpansionSuffix(text: string): string {
-  if (!text || !HAS_COMPOUND_HINT_RE.test(text)) return ''
-
-  const seen = new Set<string>()
-  const extras: string[] = []
-  const tokens = text.match(TOKEN_RE) ?? []
-  for (const raw of tokens) {
-    const parts = expandCompoundToken(raw)
-    if (parts.length <= 1) continue // not compound — nothing to add
-    const original = raw.toLowerCase()
-    for (const part of parts) {
-      if (part === original || seen.has(part)) continue
-      seen.add(part)
-      extras.push(part)
-    }
-  }
-  return extras.length ? ` ${extras.join(' ')}` : ''
+/** The ordered atomic parts of a term: "mem0ParentId" -> ["mem", "0", "parent", "id"]. */
+function atomicParts(term: string): string[] {
+  return term
+    .split(DELIMITER_RE)
+    .filter(Boolean)
+    .flatMap(splitCamelAndDigits)
+    .map((p) => p.toLowerCase())
 }
 
 /**
- * True if `textLower` (already lowercased) contains `term` verbatim, OR contains one of
- * `term`'s compound split parts.
- *
- * `term` must be passed in its ORIGINAL case, not pre-lowercased — camelCase/PascalCase
- * boundaries ("mem0ParentId") only exist before lowercasing, and `expandCompoundToken`
- * needs them to split correctly. The verbatim comparison is still case-insensitive
- * (`term` is lowercased here before either check).
- *
- * For a non-compound term this is exactly `textLower.includes(term.toLowerCase())` —
- * the expansion path only runs when `term` actually decomposes.
+ * Regex source matching a compound term's parts IN ORDER, with optional separators
+ * between them, so "mem0ParentId" matches "mem0 parent id", "mem0_parent_id" and
+ * "mem0ParentId" alike. Null for a non-compound term. Matching all parts in sequence,
+ * rather than any single part, keeps "OneCLI" from matching every text containing
+ * "one" and "mem0" from matching every text containing "memory".
+ */
+export function compoundSequencePattern(term: string): string | null {
+  const parts = atomicParts(term)
+  if (parts.length < 2) return null
+  return parts.map(escapeRegexSource).join(PART_SEPARATOR)
+}
+
+/**
+ * True if `textLower` contains `term` as a substring, or contains the term's
+ * compound parts in sequence (see `compoundSequencePattern`).
  */
 export function textIncludesTermOrParts(
   textLower: string,
   term: string,
 ): boolean {
   if (!term) return false
-  const lowerTerm = term.toLowerCase()
-  if (textLower.includes(lowerTerm)) return true
-  for (const part of expandCompoundToken(term)) {
-    if (part !== lowerTerm && part.length > 1 && textLower.includes(part))
-      return true
-  }
-  return false
+  if (textLower.includes(term.toLowerCase())) return true
+  const pattern = compoundSequencePattern(term)
+  return pattern !== null && new RegExp(pattern).test(textLower)
 }
 
 /**
- * Expand a list of already-split query keywords with their compound parts, for a
- * caller (Mongo's `$or` keyword list) that needs a bounded, deduplicated flat list
- * rather than a per-keyword predicate. Original keywords are always kept; expansion
- * parts are appended only while the total stays under `maxTotal`, so a query with many
- * compound terms cannot blow up the number of `$or` clauses.
+ * Regex sources for a Mongo `$or` keyword filter: each keyword escaped, plus the
+ * sequence pattern of each compound keyword, capped at `maxTotal` entries.
  */
-export function expandKeywordsBounded(
+export function keywordRegexSources(
   keywords: readonly string[],
   maxTotal: number,
 ): string[] {
   const out: string[] = []
   const seen = new Set<string>()
-  const push = (k: string): boolean => {
-    if (seen.has(k)) return true
-    if (out.length >= maxTotal) return false
-    seen.add(k)
-    out.push(k)
-    return true
-  }
-
-  // Original keywords first — never dropped for a compound expansion of an earlier one.
-  for (const k of keywords) {
-    const lower = k.toLowerCase()
-    if (!push(lower)) return out
-  }
-  for (const k of keywords) {
-    const lower = k.toLowerCase()
-    for (const part of expandCompoundToken(k)) {
-      if (part === lower || part.length < 2) continue
-      if (!push(part)) return out
+  const push = (src: string): void => {
+    if (out.length < maxTotal && !seen.has(src)) {
+      seen.add(src)
+      out.push(src)
     }
+  }
+  for (const k of keywords) push(escapeRegexSource(k.toLowerCase()))
+  for (const k of keywords) {
+    const pattern = compoundSequencePattern(k)
+    if (pattern) push(pattern)
   }
   return out
 }

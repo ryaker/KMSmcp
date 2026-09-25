@@ -7,9 +7,9 @@
  */
 
 import {
-  compoundExpansionSuffix,
   expandCompoundToken,
-  expandKeywordsBounded,
+  keywordRegexSources,
+  compoundSequencePattern,
   isCompoundToken,
   textIncludesTermOrParts,
 } from '../search/compoundTokens.js'
@@ -104,32 +104,6 @@ describe('isCompoundToken', () => {
   })
 })
 
-describe('compoundExpansionSuffix', () => {
-  it('is empty for plain prose with no compound tokens', () => {
-    expect(
-      compoundExpansionSuffix('the request timed out after a timeout'),
-    ).toBe('')
-  })
-
-  it('appends split parts for a camelCase identifier', () => {
-    const suffix = compoundExpansionSuffix('the mem0ParentId field is required')
-    expect(suffix).toContain('parent')
-    expect(suffix).toContain('id')
-    // The original whole token must not be re-appended — it is already in the text.
-    expect(suffix.split(/\s+/).filter(Boolean)).not.toContain('mem0parentid')
-  })
-
-  it('appends split parts for a snake_case identifier', () => {
-    const suffix = compoundExpansionSuffix('flag: dedup_unchecked')
-    expect(suffix).toContain('dedup')
-    expect(suffix).toContain('unchecked')
-  })
-
-  it('is empty for empty input', () => {
-    expect(compoundExpansionSuffix('')).toBe('')
-  })
-})
-
 describe('textIncludesTermOrParts', () => {
   it('matches a plain substring as before', () => {
     expect(textIncludesTermOrParts('the request timed out', 'timed')).toBe(true)
@@ -147,10 +121,26 @@ describe('textIncludesTermOrParts', () => {
     ).toBe(true)
   })
 
-  it('matches via the camelCase "Parent" part alone, with no other overlap', () => {
+  it('never matches on a single part alone', () => {
     expect(
       textIncludesTermOrParts('the field named parent exists', 'mem0ParentId'),
+    ).toBe(false)
+    expect(
+      textIncludesTermOrParts('done in one continuous stretch', 'OneCLI'),
+    ).toBe(false)
+    expect(textIncludesTermOrParts('stored in memory', 'mem0')).toBe(false)
+  })
+
+  it('matches the parts in sequence across separators', () => {
+    expect(textIncludesTermOrParts('use the one cli gateway', 'OneCLI')).toBe(
+      true,
+    )
+    expect(
+      textIncludesTermOrParts('flag dedup-unchecked set', 'dedup_unchecked'),
     ).toBe(true)
+    expect(textIncludesTermOrParts('see mem0_parent_id', 'mem0ParentId')).toBe(
+      true,
+    )
   })
 
   it('is case-insensitive on the term side for the plain (non-expanded) match', () => {
@@ -169,28 +159,39 @@ describe('textIncludesTermOrParts', () => {
   })
 })
 
-describe('expandKeywordsBounded', () => {
-  it('keeps plain keywords unchanged', () => {
-    expect(expandKeywordsBounded(['timeout', 'route'], 40)).toEqual([
-      'timeout',
-      'route',
-    ])
+describe('compoundSequencePattern', () => {
+  it('is null for a plain term', () => {
+    expect(compoundSequencePattern('timeout')).toBeNull()
   })
 
-  it('appends compound split parts after the originals', () => {
-    const out = expandKeywordsBounded(['mem0ParentId'], 40)
+  it('joins the ordered parts with optional separators', () => {
+    const re = new RegExp(compoundSequencePattern('mem0ParentId')!, 'i')
+    expect(re.test('mem0ParentId')).toBe(true)
+    expect(re.test('mem0 parent id')).toBe(true)
+    expect(re.test('parent id mem0')).toBe(false)
+  })
+})
+
+describe('keywordRegexSources', () => {
+  it('escapes plain keywords', () => {
+    expect(keywordRegexSources(['timeout', 'a.b+'], 40)).toEqual(
+      expect.arrayContaining(['timeout', 'a\\.b\\+']),
+    )
+  })
+
+  it('adds a sequence pattern for compound keywords, never bare parts', () => {
+    const out = keywordRegexSources(['mem0ParentId'], 40)
     expect(out[0]).toBe('mem0parentid')
-    expect(out).toEqual(expect.arrayContaining(['parent', 'id']))
+    expect(out).toContain(compoundSequencePattern('mem0ParentId'))
+    expect(out).not.toContain('parent')
+    expect(out).not.toContain('mem')
   })
 
-  it('never drops an original keyword to make room for expansion parts', () => {
-    const out = expandKeywordsBounded(['mem0ParentId', 'dedup_unchecked'], 2)
-    expect(out).toEqual(['mem0parentid', 'dedup_unchecked'])
-  })
-
-  it('caps the total keyword count', () => {
+  it('keeps originals first and caps the total', () => {
+    expect(keywordRegexSources(['mem0ParentId', 'dedup_unchecked'], 2)).toEqual(
+      ['mem0parentid', 'dedup_unchecked'],
+    )
     const many = Array.from({ length: 10 }, (_, i) => `kms-context-inject-${i}`)
-    const out = expandKeywordsBounded(many, 5)
-    expect(out.length).toBeLessThanOrEqual(5)
+    expect(keywordRegexSources(many, 5).length).toBe(5)
   })
 })
