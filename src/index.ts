@@ -55,6 +55,8 @@ export class UnifiedKMSServer {
     instructions: KMSInstructionsTool
     documentStore: DocumentStoreTool
   }
+  /** Kept for analytics (circuit breaker state) — the tools hold their own reference. */
+  private embeddingService!: OllamaEmbeddingService
 
   constructor(private config: KMSConfig) {
     this.server = new Server({
@@ -79,7 +81,7 @@ export class UnifiedKMSServer {
   async initialize(): Promise<void> {
     console.log('🚀 Initializing Unified KMS Server v2.0...')
     console.log('━'.repeat(60))
-    
+
     // Step 1: Initialize Redis for FACT cache
     console.log('⚡ Initializing FACT Cache with Redis...')
     this.redis = new Redis(this.config.redis.uri, {
@@ -89,33 +91,33 @@ export class UnifiedKMSServer {
       connectTimeout: 3000, // 3 second timeout
       commandTimeout: 2000  // 2 second command timeout
     })
-    
+
     // Handle Redis connection errors gracefully
     this.redis.on('error', (error) => {
       console.warn('⚠️  Redis connection error (cache disabled):', error.message)
     })
-    
+
     this.redis.on('connect', () => {
       console.log('✅ Redis cache connected')
-      
+
       // Start Redis keep-alive only when connected
       if (!this.redisKeepAlive) {
         this.redisKeepAlive = new RedisKeepAlive(this.redis, 60 * 24) // 24 hours
         this.redisKeepAlive.start()
       }
     })
-    
+
     this.redis.on('close', () => {
       console.warn('⚠️  Redis cache disconnected (fallback to L1 only)')
     })
-    
+
     this.factCache = new FACTCache(this.config.fact, this.redis)
-    
+
     // Connect to Redis asynchronously (don't block startup)
     this.redis.connect().catch(err => {
       console.warn('⚠️  Redis connection failed (cache will use L1 only):', err.message)
     })
-    
+
     // Step 2: Initialize storage systems
     console.log('📊 Initializing Storage Systems...')
     // Graph backend: SparrowDB (default — embedded, ~5ms read latency).
@@ -148,7 +150,7 @@ export class UnifiedKMSServer {
         console.warn(`⚠️  ${systemNames[index]} failed to initialize (continuing in degraded mode):`, result.reason?.message || result.reason)
       }
     })
-    
+
     // Step 3: Initialize intelligent router
     console.log('🧠 Initializing Intelligent Router...')
     this.router = new IntelligentStorageRouter()
@@ -177,6 +179,7 @@ export class UnifiedKMSServer {
     const embeddingService = new OllamaEmbeddingService({
       baseUrl: process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL
     })
+    this.embeddingService = embeddingService
 
     // LLM judge for the dedup gate's Tier 2 borderline classification
     // (DG-T2-A, issue #49). Runs on the same local Ollama host as the
@@ -215,13 +218,13 @@ export class UnifiedKMSServer {
       instructions: new KMSInstructionsTool(),
       documentStore: new DocumentStoreTool(this.storage.mongodb)
     }
-    
+
     // Step 5: Initialize HTTP transport if needed
     if (this.config.transport.mode === 'http' || this.config.transport.mode === 'dual') {
       if (!this.config.transport.http) {
         throw new Error('HTTP transport configuration is required when mode is http or dual')
       }
-      
+
       console.log('🌐 Initializing HTTP Transport...')
       this.httpTransport = new HttpTransport({
         port: this.config.transport.http.port,
@@ -230,7 +233,7 @@ export class UnifiedKMSServer {
         rateLimit: this.config.transport.http.rateLimit,
         oauth: this.config.oauth
       })
-      
+
       // Set MCP server factory for HTTP transport
       this.httpTransport.setMcpServerFactory(() => {
         const server = new Server({
@@ -251,7 +254,7 @@ export class UnifiedKMSServer {
         return server
       })
     }
-    
+
     console.log('━'.repeat(60))
     console.log('✅ Unified KMS Server initialized successfully!')
     console.log(`🎯 Transport mode: ${this.config.transport.mode}`)
@@ -304,7 +307,7 @@ export class UnifiedKMSServer {
     console.log(`📥 Full initialize request:`, JSON.stringify(request, null, 2))
     console.log(`📥 Request params:`, JSON.stringify(request.params, null, 2))
     console.log(`📥 Protocol version from client:`, request.params?.protocolVersion)
-    
+
     const response = {
       jsonrpc: '2.0',
       result: {
@@ -324,11 +327,11 @@ export class UnifiedKMSServer {
       },
       id: request.id
     }
-    
+
     console.log(`📤 Sending initialize response:`, JSON.stringify(response, null, 2))
     console.log(`📤 Response capabilities:`, JSON.stringify(response.result.capabilities, null, 2))
     console.log(`📤 Response tools capability:`, JSON.stringify(response.result.capabilities.tools, null, 2))
-    
+
     // CRITICAL DEBUG - What exactly are we returning?
     console.log('=== EXACT INITIALIZE RESPONSE ===');
     console.log('Full response object:', response);
@@ -338,7 +341,7 @@ export class UnifiedKMSServer {
     console.log('Capabilities value:', response.result.capabilities);
     console.log('Tools value:', response.result.capabilities.tools);
     console.log('=== END INITIALIZE RESPONSE ===');
-    
+
     return response
   }
 
@@ -357,22 +360,22 @@ export class UnifiedKMSServer {
   private async handleListTools(request: any, authContext: AuthContext): Promise<any> {
     console.log(`🔧 Handling tools/list request - this means Claude is proceeding after initialize!`)
     console.log(`📥 Full tools/list request:`, JSON.stringify(request, null, 2))
-    
-    // For now, all authenticated users get access to all tools  
+
+    // For now, all authenticated users get access to all tools
     // In production, you might want to filter tools based on user roles/scopes
     const tools = this.getToolDefinitions()
-    
+
     console.log(`📤 Returning ${tools.length} tools to client`)
     console.log(`📤 First tool being returned:`, JSON.stringify(tools[0], null, 2))
-    
+
     const response = {
       jsonrpc: '2.0',
       result: { tools },
       id: request.id
     }
-    
+
     console.log(`📤 Full tools/list response:`, JSON.stringify(response, null, 2).substring(0, 1000) + '...')
-    
+
     return response
   }
 
@@ -381,10 +384,10 @@ export class UnifiedKMSServer {
    */
   private async handleCallTool(request: any, authContext: AuthContext): Promise<any> {
     const { name, arguments: args } = request.params
-    
+
     // Add auth context to the tool call for audit logging
     console.log(`🔧 Tool call: ${name} by user: ${authContext.user?.id || 'anonymous'}`)
-    
+
     let result: any
 
     switch (name) {
@@ -570,24 +573,24 @@ export class UnifiedKMSServer {
         inputSchema: {
           type: 'object',
           properties: {
-            query: { 
-              type: 'string', 
-              description: 'Search query' 
+            query: {
+              type: 'string',
+              description: 'Search query'
             },
             filters: {
               type: 'object',
               properties: {
-                contentType: { 
-                  type: 'array', 
+                contentType: {
+                  type: 'array',
                   items: { type: 'string' },
                   description: 'Filter by content types'
                 },
-                source: { 
-                  type: 'array', 
+                source: {
+                  type: 'array',
                   items: { type: 'string' },
                   description: 'Filter by source domains'
                 },
-                userId: { 
+                userId: {
                   type: 'string',
                   description: 'Filter by user ID'
                 },
@@ -610,14 +613,14 @@ export class UnifiedKMSServer {
             options: {
               type: 'object',
               properties: {
-                includeRelationships: { 
-                  type: 'boolean', 
+                includeRelationships: {
+                  type: 'boolean',
                   default: true,
                   description: 'Include related knowledge in results'
                 },
-                maxResults: { 
-                  type: 'number', 
-                  default: 10, 
+                maxResults: {
+                  type: 'number',
+                  default: 10,
                   maximum: 100,
                   description: 'Maximum number of results'
                 },
@@ -649,15 +652,15 @@ export class UnifiedKMSServer {
         inputSchema: {
           type: 'object',
           properties: {
-            content: { 
+            content: {
               type: 'string',
               description: 'Content to analyze for storage recommendation'
             },
-            contentType: { 
+            contentType: {
               type: 'string',
               description: 'Optional content type hint'
             },
-            metadata: { 
+            metadata: {
               type: 'object',
               description: 'Optional metadata for context'
             }
@@ -671,14 +674,14 @@ export class UnifiedKMSServer {
         inputSchema: {
           type: 'object',
           properties: {
-            timeRange: { 
-              type: 'string', 
-              enum: ['1h', '24h', '7d', '30d'], 
+            timeRange: {
+              type: 'string',
+              enum: ['1h', '24h', '7d', '30d'],
               default: '24h',
               description: 'Time range for analytics'
             },
-            includeCache: { 
-              type: 'boolean', 
+            includeCache: {
+              type: 'boolean',
               default: true,
               description: 'Include cache performance metrics'
             },
@@ -696,13 +699,13 @@ export class UnifiedKMSServer {
         inputSchema: {
           type: 'object',
           properties: {
-            pattern: { 
-              type: 'string', 
+            pattern: {
+              type: 'string',
               description: 'Cache key pattern to invalidate (supports wildcards)'
             },
-            level: { 
-              type: 'string', 
-              enum: ['L1', 'L2', 'all'], 
+            level: {
+              type: 'string',
+              enum: ['L1', 'L2', 'all'],
               default: 'all',
               description: 'Cache level to invalidate'
             }
@@ -1069,7 +1072,7 @@ export class UnifiedKMSServer {
    */
   private async getKMSAnalytics(args: any): Promise<any> {
     console.log('📊 Gathering KMS analytics...')
-    
+
     const [cacheStats, mongoStats, graphStats, mem0Stats] = await Promise.allSettled([
       this.factCache ? this.factCache.getStats() : Promise.resolve({ disabled: true }),
       this.storage.mongodb.getStats(),
@@ -1102,6 +1105,21 @@ export class UnifiedKMSServer {
       vectorIndex = { status: 'unknown', reason: e instanceof Error ? e.message : String(e) }
     }
 
+    // Embedder circuit breaker state. Same "never break the thing it
+    // monitors" guard as vectorIndex above — a bad read here must not fail
+    // the whole analytics call.
+    let embedder: unknown = { status: 'unknown' }
+    try {
+      if (this.embeddingService) {
+        embedder = {
+          embedderId: this.embeddingService.embedderId,
+          circuitState: this.embeddingService.getCircuitBreakerState()
+        }
+      }
+    } catch (e) {
+      embedder = { status: 'unknown', reason: e instanceof Error ? e.message : String(e) }
+    }
+
     const analytics = {
       timestamp: new Date().toISOString(),
       cache: cacheStats.status === 'fulfilled' ? cacheStats.value : { error: cacheStats.reason },
@@ -1111,12 +1129,13 @@ export class UnifiedKMSServer {
         mem0: mem0Stats.status === 'fulfilled' ? mem0Stats.value : { error: mem0Stats.reason }
       },
       vectorIndex,
+      embedder,
       routing: this.tools.store.getRoutingStats(),
       overall: {
         systemsHealthy: [mongoStats, graphStats, mem0Stats].filter(s => s.status === 'fulfilled').length,
         totalSystems: 3,
-        cacheEfficiency: cacheStats.status === 'fulfilled' && cacheStats.value && typeof cacheStats.value === 'object' && 'overall' in cacheStats.value 
-          ? (cacheStats.value as any).overall?.cacheEfficiency || 0 
+        cacheEfficiency: cacheStats.status === 'fulfilled' && cacheStats.value && typeof cacheStats.value === 'object' && 'overall' in cacheStats.value
+          ? (cacheStats.value as any).overall?.cacheEfficiency || 0
           : 0
       }
     }
@@ -1243,11 +1262,11 @@ export class UnifiedKMSServer {
 
   private async handleCacheInvalidate(args: any): Promise<any> {
     console.log(`🗑️ Invalidating cache pattern: ${args.pattern}`)
-    
+
     if (this.factCache) {
       await this.factCache.invalidate(args.pattern)
     }
-    
+
     return {
       success: true,
       pattern: args.pattern,
@@ -1262,11 +1281,11 @@ export class UnifiedKMSServer {
    */
   private async testMem0DirectSearch(args: any): Promise<any> {
     console.log(`🧪 [testMem0DirectSearch] Testing direct Mem0 search: ${args.query}`)
-    
+
     try {
       const result = await this.storage.mem0.testDirectSearch(args.query, args.userId)
       console.log(`✅ [testMem0DirectSearch] Test completed`)
-      
+
       return {
         success: true,
         testType: 'direct_mem0_search',
@@ -1277,7 +1296,7 @@ export class UnifiedKMSServer {
       }
     } catch (error) {
       console.error(`❌ [testMem0DirectSearch] Test failed:`, error)
-      
+
       return {
         success: false,
         testType: 'direct_mem0_search',
@@ -1295,7 +1314,7 @@ export class UnifiedKMSServer {
   private async getMemoryById(args: any): Promise<any> {
     console.log(`🔍 [getMemoryById] Starting retrieval for memory ID: ${args.memoryId}`)
     console.log(`🔍 [getMemoryById] Args received:`, JSON.stringify(args, null, 2))
-    
+
     try {
       console.log(`🔍 [getMemoryById] Calling storage.mem0.getById...`)
       const memory = await this.storage.mem0.getById(args.memoryId)
@@ -1313,7 +1332,7 @@ export class UnifiedKMSServer {
           timestamp: new Date().toISOString()
         }
       }
-      
+
       return {
         success: true,
         memoryId: args.memoryId,
@@ -1324,7 +1343,7 @@ export class UnifiedKMSServer {
     } catch (error) {
       console.error(`❌ [getMemoryById] Failed to retrieve memory ${args.memoryId}:`, error)
       console.error(`❌ [getMemoryById] Error stack:`, error instanceof Error ? error.stack : 'No stack trace')
-      
+
       return {
         success: false,
         memoryId: args.memoryId,
@@ -1356,10 +1375,10 @@ export class UnifiedKMSServer {
     }
 
     await Promise.all(promises)
-    
+
     console.log('🌟 Unified KMS MCP Server is running!')
     console.log(`📡 Transport mode: ${this.config.transport.mode}`)
-    
+
     if (this.httpTransport) {
       const httpConfig = this.config.transport.http!
       console.log(`🌐 HTTP endpoint: http://${httpConfig.host || 'localhost'}:${httpConfig.port}/mcp`)
@@ -1372,12 +1391,12 @@ export class UnifiedKMSServer {
    */
   async close(): Promise<void> {
     console.log('🔌 Closing Unified KMS Server...')
-    
+
     // Stop Redis keep-alive
     if (this.redisKeepAlive) {
       this.redisKeepAlive.stop()
     }
-    
+
     const promises = [
       this.storage.mongodb.close(),
       this.storage.graph.close(),
@@ -1389,9 +1408,9 @@ export class UnifiedKMSServer {
     if (this.httpTransport) {
       promises.push(this.httpTransport.stop())
     }
-    
+
     await Promise.all(promises)
-    
+
     console.log('✅ All connections closed')
   }
 }
@@ -1531,7 +1550,7 @@ async function main() {
       console.error('❌ OAUTH_ISSUER and OAUTH_AUDIENCE are required when OAuth is enabled')
       process.exit(1)
     }
-    
+
     if (!config.oauth.jwksUri && !config.oauth.tokenIntrospectionEndpoint) {
       console.error('❌ Either OAUTH_JWKS_URI or OAUTH_TOKEN_INTROSPECTION_ENDPOINT is required for token validation')
       process.exit(1)
@@ -1545,7 +1564,7 @@ async function main() {
   }
 
   const server = new UnifiedKMSServer(config)
-  
+
   // Handle graceful shutdown
   process.on('SIGINT', async () => {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...')
