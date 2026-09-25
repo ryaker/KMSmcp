@@ -145,6 +145,18 @@ describe('extractTurnUnits', () => {
     expect(units[0].assistantExcerpt).toBe('Here is the final answer.')
   })
 
+  it('carries the previous assistant text, so a correction can be judged against it', () => {
+    const path = writeTranscript([
+      userLine(LONG_ENOUGH),
+      assistantTextLine('Models should not grade their own rankings.'),
+      userLine('I do not agree with that at all, Jev is not an LLM and can label itself.')
+    ])
+    const units = extractTurnUnits(path)
+    expect(units).toHaveLength(2)
+    expect(units[0].previousAssistantExcerpt).toBeNull()
+    expect(units[1].previousAssistantExcerpt).toBe('Models should not grade their own rankings.')
+  })
+
   it('skips tool-result turns entirely (not a turn boundary, not a candidate)', () => {
     const path = writeTranscript([
       userLine(LONG_ENOUGH),
@@ -302,7 +314,7 @@ describe('isSophia', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('computeScore + topDurableKind', () => {
-  it('score is max(durable) * (1 - 0.5 * ephemeral)', () => {
+  it('score is max(durable) * (1 - ephemeral)', () => {
     const nouls = {
       ...zeroNouls(),
       states_standing_rule: 0.9,
@@ -310,19 +322,13 @@ describe('computeScore + topDurableKind', () => {
       verified_fact_or_fix: 0.1,
       ephemeral: 0.5
     }
-    expect(computeScore(nouls)).toBeCloseTo(0.675)
+    expect(computeScore(nouls)).toBeCloseTo(0.45)
     expect(topDurableKind(nouls)).toBe('states_standing_rule')
   })
 
-  it('ephemeral near 1 halves the score', () => {
+  it('ephemeral near 1 drives the score to ~0 regardless of durable nouls', () => {
     const nouls = { ...zeroNouls(), verified_fact_or_fix: 0.95, ephemeral: 0.98 }
-    expect(computeScore(nouls)).toBeCloseTo(0.4845, 3)
-  })
-
-  it('a frustrated correction still clears the default threshold', () => {
-    const nouls = { ...zeroNouls(), corrects_assistant: 0.9, ephemeral: 0.6 }
-    expect(computeScore(nouls)).toBeGreaterThan(0.6)
-    expect(topDurableKind(nouls)).toBe('corrects_assistant')
+    expect(computeScore(nouls)).toBeCloseTo(0.019, 2)
   })
 
   it('topDurableKind picks the highest of the three durable nouls', () => {
