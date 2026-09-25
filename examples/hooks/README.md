@@ -144,3 +144,61 @@ Pattern adapted from [MemPalace](https://github.com/milla-jovovich/mempalace) �
 AI memory system on LongMemEval (96.6%). Their key insight: periodic blocking saves with Claude
 doing the classification outperforms regex extraction because Claude has the full conversational
 context to decide what matters.
+
+---
+
+### `kms-session-end.sh` — SessionEnd hook
+
+Fires when a session ends. Extracts `transcript_path` / `cwd` / `session_id` from the hook JSON
+and launches `src/scripts/import-claude-session-cli.ts` (built:
+`dist/scripts/import-claude-session-cli.js` — the thin CLI wrapper around the import-only
+`import-claude-session.ts`) fully detached — `nohup` + `disown`, no stdout, exits 0 immediately.
+
+**Why detached.** SessionEnd hooks cannot block session exit, and share a small time budget with
+any other SessionEnd hooks (~1.5s by default, raised to at most 60s if a longer `timeout` is
+configured — see the [hooks docs](https://code.claude.com/docs/en/hooks)). Mining a transcript is
+one Jev request per candidate turn, which routinely runs past that budget, so the hook itself does
+nothing but parse stdin and launch the importer in the background.
+
+**What the importer does** (see `src/scripts/import-claude-session.ts` for the full design):
+parses the session's JSONL transcript into candidate turn units (skipping tool results, system
+reminders, hook-injected KMS recall context, subagent turns, and anything under 40 chars), has Jev
+triage each one with small atomic nouls (`durable_preference_or_correction`, `decision_with_reason`,
+`verified_fact_or_fix`, `ephemeral`, `mentions_sophia`), hard-drops anything Sophia-related (the
+MyMoneyCoach.ai persona — HARD RULE, never eng_kms or personal_kms), ranks the rest, and writes the
+top few to the KMS review queue (`unified_store` with `review: "candidate"`) — held for
+`kms_review approve` rather than injected live. Routes eng_kms vs personal_kms from `cwd`, mirroring
+`kms-context-inject.sh`'s `is_eng_cwd`. A per-session watermark
+(`~/.kms-session-import/<session_id>.json`) makes re-runs (e.g. a resumed session ending again)
+idempotent — already-considered transcript lines are never re-classified.
+
+**Install:**
+
+```bash
+cp kms-session-end.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/kms-session-end.sh
+```
+
+```json
+"SessionEnd": [{
+  "hooks": [{ "type": "command", "command": "/Users/YOU/.claude/hooks/kms-session-end.sh" }]
+}]
+```
+
+**Environment:**
+
+| Variable | Purpose |
+|---|---|
+| `KMS_REPO` | Where the built importer lives. Default `~/Dev/KMSmcp`. |
+| `KMS_SESSION_IMPORT_DOPPLER_CONFIG` | Optional Doppler config (e.g. `dev_eng`) to wrap the importer in, so it inherits `ONECLI_TOKEN`/`ONECLI_GATEWAY` for Jev even when the hook's own shell doesn't have them. Unset by default. |
+
+**Logs:** `~/.kms-session-import/<session_id>.log` (importer stdout/stderr — the hook itself never
+prints anything, by design).
+
+**Test (no network, no KMS writes):**
+
+```bash
+npx tsx src/scripts/import-claude-session.ts \
+  --transcript ~/.claude/projects/<slug>/<session>.jsonl \
+  --cwd ~/Dev/KMSmcp --dry-run
+```
