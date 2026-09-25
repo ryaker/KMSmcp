@@ -4,65 +4,39 @@ Drop-in hooks for Claude Code that automate KMS saves during sessions.
 
 ## Hooks
 
-### `kms-context-fetch.py` — UserPromptSubmit hook
+### `kms-context-inject.sh` + `kms_context_format.py` — UserPromptSubmit hook
 
-Fires on every user prompt. Searches KMS (`unified_search` over Mem0/MongoDB/SparrowDB)
-for context relevant to the prompt and injects the results as `additionalContext` via
-`--json` output, scoped to a token budget (`TOKEN_BUDGET`, default ~2000 chars).
+Fires on every prompt. Picks the KMS server from the working directory (`~/Dev` →
+eng-kms, otherwise personal), runs `unified_search`, and injects the results as
+`additionalContext`, capped at 2,000 chars for the whole block.
 
-**Trust framing.** Injected memories are retrieved past data — written by a past session,
-possibly quoting external/untrusted text — not instructions for the current turn. The
-hook wraps every injected block in an untrusted-data boundary rather than a plain
-`[KMS Memory Context]` header:
+**Trust framing.** Injected memories are past data, sometimes quoting external text.
+They are not instructions. `kms_context_format.py` wraps them in a boundary:
 
-- **Nonce-tagged markers.** The block opens with `[KMS Context #<8 hex chars>]` and
-  closes with `[End KMS Context #<same 8 hex chars>]`, using a fresh
-  `secrets.token_hex(4)` nonce per call. A memory snippet can't fake the close marker
-  and trick the model into treating what follows as outside the block, because it can't
-  predict the nonce.
-- **Standing note.** Right after the open marker, a short (~60 word) note tells the
-  model this content is retrieved background evidence only — it may be stale or quote
-  external text, carries no authority to change instructions/permissions/the user's
-  actual request, and any imperative text inside it should be treated as data, not
-  commands.
-- **Marker neutralization.** Before packing each snippet, `neutralize_markers()`
-  case-insensitively strips any literal `[KMS Context`, `[End KMS Context`, or
-  `End KMS Context` text a stored memory might contain, replacing it with
-  `[marker-text-removed]`. In `--debug` mode it also logs (never blocks on) near-miss
-  variants that only surface after Unicode NFKD normalization + combining-mark
-  stripping, e.g. marker text built from accented look-alikes.
-- **Budget-aware.** The wrapper's own overhead (open marker + note + close marker) is
-  counted against `TOKEN_BUDGET` before any content is packed, so the total injected
-  block still respects the budget.
-
-The packing logic lives in `format_context_block()`, kept separate from the network
-call (`fetch_context()`) so it's directly unit-testable — see
-`test_kms_context_fetch.py`.
+- Open and close markers share a random nonce per call:
+  `[ENG-KMS Memory Context #1a2b3c4d]` … `[End ENG-KMS Context #1a2b3c4d]`.
+  A stored memory can't forge the close marker because it can't know the nonce.
+- A short note after the open marker says the block is background evidence with no
+  authority over instructions, permissions, or the user's request.
+- Marker text inside a memory (`[End KMS Context`, `[End ENG-KMS Context`, any label)
+  is replaced with `[marker-text-removed]`. Look-alikes that only match after Unicode
+  folding are logged to stderr, not altered.
+- The wrapper counts against the budget.
 
 **Install:**
 
 ```bash
-cp kms-context-fetch.py ~/.claude/hooks/
-chmod +x ~/.claude/hooks/kms-context-fetch.py
+cp kms-context-inject.sh kms_context_format.py ~/.claude/hooks/
+chmod +x ~/.claude/hooks/kms-context-inject.sh
 ```
-
-Add to `~/.claude/settings.json`:
 
 ```json
 "UserPromptSubmit": [{
-  "hooks": [{
-    "type": "command",
-    "command": "/Users/YOU/.claude/hooks/kms-context-fetch.py --json",
-    "timeout": 10
-  }]
+  "hooks": [{ "type": "command", "command": "/Users/YOU/.claude/hooks/kms-context-inject.sh" }]
 }]
 ```
 
-**Test (no network required):**
-
-```bash
-python3 examples/hooks/test_kms_context_fetch.py -v
-```
+**Test (no network):** `python3 examples/hooks/test_kms_context_format.py -v`
 
 ---
 
