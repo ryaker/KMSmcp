@@ -14,6 +14,12 @@
  */
 import { logger } from '../logger.js'
 import { DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
+import {
+  CircuitBreaker,
+  type CircuitState,
+  readCircuitCooldownMsFromEnv,
+  readCircuitThresholdFromEnv,
+} from './circuitBreaker.js'
 
 /**
  * Transient metadata keys for the embedding-handoff pattern (PR #69).
@@ -34,6 +40,20 @@ import { DEFAULT_OLLAMA_BASE_URL } from '../inference/OllamaInference.js'
 export const PENDING_EMBEDDING_KEY = '__pending_embedding'
 export const PENDING_EMBEDDER_ID_KEY = '__pending_embedder_id'
 
+/**
+ * Thrown by `embed()` (and consulted internally by `isAvailable()`) when the
+ * embedder's circuit breaker is open — i.e. enough consecutive failures were
+ * seen recently that we fast-fail instead of waiting out another timeout.
+ * Distinguishable from a transport/dim-mismatch error so callers/tests can
+ * tell "we didn't even try" apart from "we tried and it failed".
+ */
+export class EmbedderCircuitOpenError extends Error {
+  constructor(public readonly embedderId: string) {
+    super(`OllamaEmbeddingService: circuit open for ${embedderId} — skipping embed attempt (cooling down)`)
+    this.name = 'EmbedderCircuitOpenError'
+  }
+}
+
 /** A function that turns a string into a fixed-dim vector. */
 export interface EmbeddingService {
   /**
@@ -51,7 +71,9 @@ export interface EmbeddingService {
    * Embed a single text string. Throws on transport / model failure — the
    * caller is responsible for catching and degrading gracefully (the dedup
    * gate ticket DG-T1-A explicitly does NOT fail unified_store on embed
-   * failure).
+   * failure). May throw `EmbedderCircuitOpenError` immediately, with no
+   * network call, when the implementation's circuit breaker is open —
+   * callers should treat it exactly like any other embed failure.
    */
   embed(text: string): Promise<Float32Array>
 
@@ -99,6 +121,18 @@ export interface OllamaEmbeddingServiceConfig {
   dimensions?: number
   /** Per-request timeout in ms (default: 5000). */
   timeoutMs?: number
+  /**
+   * Consecutive embed failures (timeout / transport / 5xx) before the circuit
+   * breaker opens (default: env KMS_EMBED_CIRCUIT_THRESHOLD, else 3).
+   */
+  circuitThreshold?: number
+  /**
+   * How long the breaker stays open before allowing a single half-open probe,
+   * in ms (default: env KMS_EMBED_CIRCUIT_COOLDOWN_MS, else 60000).
+   */
+  circuitCooldownMs?: number
+  /** Clock injection for the circuit breaker (tests only; default Date.now). */
+  clock?: () => number
 }
 
 /**
@@ -132,6 +166,20 @@ function isRetryableEmbedError(err: unknown): boolean {
 }
 
 /**
+ * Decides whether a failed embed() call should count against the circuit
+ * breaker. Timeouts and network/transport errors always count (same set as
+ * `isRetryableEmbedError`); an HTTP 5xx also counts even though we don't
+ * retry it inline. A 4xx, dimension mismatch, malformed body, or non-finite
+ * value does NOT count — those indicate a reachable-but-misbehaving/mismatched
+ * endpoint, not an outage, so they must not trip an outage breaker.
+ */
+function isCircuitBreakerFailure(err: unknown): boolean {
+  if (isRetryableEmbedError(err)) return true
+  if (err instanceof Error && /OllamaEmbeddingService: HTTP 5\d\d/.test(err.message)) return true
+  return false
+}
+
+/**
  * Ollama-backed implementation. Calls POST /api/embeddings and returns the
  * resulting vector. Single retry on transient failure (timeout / network
  * error); throws thereafter.
@@ -142,6 +190,7 @@ export class OllamaEmbeddingService implements EmbeddingService {
   private readonly baseUrl: string
   private readonly model: string
   private readonly timeoutMs: number
+  private readonly breaker: CircuitBreaker
   private availableCache: { value: boolean; expiresAt: number } | null = null
 
   constructor(config: OllamaEmbeddingServiceConfig = {}) {
@@ -153,9 +202,25 @@ export class OllamaEmbeddingService implements EmbeddingService {
     this.embedderId = `${this.model}:${version}`
     this.dimensions = config.dimensions ?? DEFAULT_DIMENSIONS
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.breaker = new CircuitBreaker({
+      failureThreshold: config.circuitThreshold ?? readCircuitThresholdFromEnv(),
+      cooldownMs: config.circuitCooldownMs ?? readCircuitCooldownMsFromEnv(),
+      clock: config.clock,
+      name: `embed:${this.embedderId}`,
+    })
+  }
+
+  /** Current circuit breaker state — exposed for health/analytics reporting. */
+  getCircuitBreakerState(): CircuitState {
+    return this.breaker.getState()
   }
 
   async isAvailable(): Promise<boolean> {
+    // Fast-fail: the breaker being open is stronger evidence than a stale
+    // success cached from before the outage started. Checked BEFORE the
+    // availability cache and with no network call either way.
+    if (this.breaker.isBlocking()) return false
+
     const now = Date.now()
     if (this.availableCache && this.availableCache.expiresAt > now) {
       return this.availableCache.value
@@ -189,10 +254,20 @@ export class OllamaEmbeddingService implements EmbeddingService {
       throw new TypeError('OllamaEmbeddingService.embed: text must be a non-empty string')
     }
 
+    // Fast-fail: skip straight past the network entirely when the breaker is
+    // open, or — once the cooldown has elapsed — admit exactly this call as
+    // the single half-open probe. `canProceed()` MUST be paired with exactly
+    // one onSuccess()/onFailure() below, however this resolves.
+    if (!this.breaker.canProceed()) {
+      throw new EmbedderCircuitOpenError(this.embedderId)
+    }
+
     let lastError: unknown = null
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        return await this._embedOnce(text)
+        const vec = await this._embedOnce(text)
+        this.breaker.onSuccess()
+        return vec
       } catch (err) {
         lastError = err
         // Only retry on timeout / network errors. Not on dimension mismatch
@@ -203,6 +278,19 @@ export class OllamaEmbeddingService implements EmbeddingService {
         }
       }
     }
+
+    // The breaker tracks outage signal (timeout/transport/5xx), not every
+    // failure mode. A dim-mismatch or malformed body means Ollama answered —
+    // that's evidence of reachability, so it resolves the breaker call as a
+    // success (and, in particular, releases a half-open probe) rather than
+    // leaving it stuck waiting for a report that will never distinguish it
+    // from an outage.
+    if (isCircuitBreakerFailure(lastError)) {
+      this.breaker.onFailure()
+    } else {
+      this.breaker.onSuccess()
+    }
+
     throw lastError instanceof Error
       ? lastError
       : new Error(`OllamaEmbeddingService.embed failed: ${String(lastError)}`)
