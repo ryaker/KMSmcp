@@ -45,6 +45,7 @@ import type { DecisionEngine, NoulDecisionQuestion } from '../decision/types.js'
 export const MIN_CONTENT_CHARS = 40
 export const MAX_USER_CHARS = 600
 export const MAX_ASSISTANT_CHARS = 200
+export const MAX_PREVIOUS_ASSISTANT_CHARS = 600
 export const DEFAULT_MAX_KEEP = 5
 export const DEFAULT_KEEP_THRESHOLD = 0.6
 export const SOPHIA_NOUL_THRESHOLD = 0.3
@@ -104,6 +105,8 @@ export interface TurnUnit {
   userMessage: string
   /** Last assistant text block (no tool output) before the next user turn, or null. */
   assistantExcerpt: string | null
+  /** Last assistant text before this user turn — what a correction would be correcting. */
+  previousAssistantExcerpt: string | null
   /** ISO timestamp of the user turn, if the transcript line had one. */
   timestamp: string | null
   uuid: string | null
@@ -138,6 +141,7 @@ function assistantTextBlocks(message: any): string[] {
 
 interface OpenTurn {
   userMessage: string
+  previousAssistantText: string | null
   timestamp: string | null
   uuid: string | null
   line: number
@@ -154,6 +158,7 @@ export function extractTurnUnits(absTranscriptPath: string): TurnUnit[] {
   const lines = readFileSync(absTranscriptPath, 'utf8').split('\n')
   const units: TurnUnit[] = []
   let current: OpenTurn | null = null
+  let lastAssistantText: string | null = null
 
   const flush = () => {
     if (!current) return
@@ -165,6 +170,7 @@ export function extractTurnUnits(absTranscriptPath: string): TurnUnit[] {
           current.assistantTexts.length > 0
             ? current.assistantTexts[current.assistantTexts.length - 1]
             : null,
+        previousAssistantExcerpt: current.previousAssistantText,
         timestamp: current.timestamp,
         uuid: current.uuid,
         line: current.line
@@ -184,7 +190,10 @@ export function extractTurnUnits(absTranscriptPath: string): TurnUnit[] {
 
     if (d.type === 'assistant' && !d.isSidechain) {
       const texts = assistantTextBlocks(d.message)
-      if (texts.length && current) current.assistantTexts.push(...texts)
+      if (texts.length) {
+        lastAssistantText = texts[texts.length - 1]
+        if (current) current.assistantTexts.push(...texts)
+      }
       return
     }
     if (d.type !== 'user' || d.isSidechain) return
@@ -195,6 +204,7 @@ export function extractTurnUnits(absTranscriptPath: string): TurnUnit[] {
     flush()
     current = {
       userMessage: text,
+      previousAssistantText: lastAssistantText,
       timestamp: typeof d.timestamp === 'string' ? d.timestamp : null,
       uuid: typeof d.uuid === 'string' ? d.uuid : null,
       line: i + 1,
@@ -234,42 +244,49 @@ export const SESSION_QUESTIONS: Record<SessionNoul, NoulDecisionQuestion> = {
   states_standing_rule: {
     type: 'noul',
     instructions:
-      'Does the user state a rule, preference, or default that should apply to future work, not only to this one request?'
+      'Does `user_message` state a rule, preference, or default that should apply to future work, not only to this one request?',
+    criteria: {
+      true: 'A lasting rule or preference: "always…", "never…", "X should run on Y", "from now on…", or a stated default',
+      false: 'Only a request, question, or instruction for the task at hand'
+    }
   },
   corrects_assistant: {
     type: 'noul',
     instructions:
-      'Does the user push back on, disagree with, or correct something the assistant said, assumed, or did?'
+      'Does `user_message` push back on, disagree with, or correct something said, assumed, or done in `previous_assistant_message`?',
+    criteria: {
+      true: 'Disagrees with, rejects, or corrects a claim, assumption, or action of the assistant',
+      false: 'Agrees, asks something new, or gives an instruction without disputing the assistant'
+    }
   },
   decision_with_reason: {
     type: 'noul',
     instructions:
-      'Does the user make or confirm a concrete decision (an approach, architecture, or plan) together with the reason for it?'
+      'Does `user_message` make or confirm a concrete decision (an approach, architecture, or plan) together with the reason for it?'
   },
   verified_fact_or_fix: {
     type: 'noul',
     instructions:
-      'Does the exchange record a concrete, checked technical fact or a fix that was verified to work — not a hypothesis, guess, or unconfirmed claim?'
+      'Do `user_message` and `assistant_reply` together record a concrete technical fact or fix that was checked and confirmed, not a hypothesis or guess?'
   },
   ephemeral: {
     type: 'noul',
-    instructions:
-      'Is this just status chatter, a routine one-off request, or back-and-forth with no lasting value (e.g. "run the tests", "looks good", "what is next")?'
+    instructions: 'Is `user_message` only about the task in progress, with nothing worth remembering in a later session?',
+    criteria: {
+      true: 'Status check, go-ahead, routine one-off request, or chatter ("run the tests", "status?", "proceed")',
+      false: 'Contains a rule, preference, correction, decision, or fact that would still matter in a later session, however it is phrased'
+    }
   },
   mentions_sophia: {
     type: 'noul',
     instructions:
-      'Is this specifically about the "Sophia" AI coach persona / MyMoneyCoach.ai character (the unrelated name "Sofia" does not count)?'
+      'Is `user_message` or `assistant_reply` specifically about the "Sophia" AI coach persona or the MyMoneyCoach.ai character? The unrelated name "Sofia" does not count.'
   }
 }
 
-/**
- * Half-weight ephemeral penalty: a correction phrased in frustration ("why do you keep…
- * wtf?") reads as chatter to the ephemeral noul, and a full penalty buried it.
- */
 export function computeScore(nouls: Record<SessionNoul, number>): number {
   const durable = Math.max(...DURABLE_NOULS.map(k => nouls[k]))
-  return durable * (1 - 0.5 * nouls.ephemeral)
+  return durable * (1 - nouls.ephemeral)
 }
 
 export function topDurableKind(nouls: Record<SessionNoul, number>): TopKind {
@@ -295,6 +312,7 @@ export interface JevClassifyResult {
 
 export interface SessionJevClient {
   classify(state: {
+    previous_assistant_message: string | null
     user_message: string
     assistant_reply: string | null
   }): Promise<JevClassifyResult>
@@ -305,6 +323,7 @@ export class EngineSessionJevClient implements SessionJevClient {
   constructor(private readonly engine: DecisionEngine) {}
 
   async classify(state: {
+    previous_assistant_message: string | null
     user_message: string
     assistant_reply: string | null
   }): Promise<JevClassifyResult> {
@@ -356,6 +375,10 @@ export async function scoreUnits(units: TurnUnit[], jev: SessionJevClient): Prom
 
   for (const unit of units) {
     const state = {
+      // Tail of the prior reply: the part a correction usually reacts to. Kept short (R4).
+      previous_assistant_message: unit.previousAssistantExcerpt
+        ? unit.previousAssistantExcerpt.slice(-MAX_PREVIOUS_ASSISTANT_CHARS)
+        : null,
       user_message: unit.userMessage.slice(0, MAX_USER_CHARS),
       assistant_reply: unit.assistantExcerpt
         ? unit.assistantExcerpt.slice(0, MAX_ASSISTANT_CHARS)
