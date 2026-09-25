@@ -7,6 +7,7 @@ import { KnowledgeQuery } from '../types/index.js'
 import { FACTCache } from '../cache/FACTCache.js'
 import { MongoDBStorage, Mem0Storage } from '../storage/index.js'
 import { mem0ParentId } from '../storage/Mem0Storage.js'
+import { compoundSequencePattern } from '../search/compoundTokens.js'
 import type { GraphStorage } from '../types/index.js'
 import type { EvalCandidate } from '../eval/rankers.js'
 import { OllamaEmbeddingService, type EmbeddingService } from '../embedding/EmbeddingService.js'
@@ -1111,14 +1112,25 @@ export class UnifiedSearchTool {
     const queryLower = query.trim().toLowerCase()
     // Drop stopwords and 1-char fragments so common filler does not inflate coverage.
     const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'is', 'it'])
-    const terms = Array.from(new Set(
-      queryLower.split(/[^a-z0-9_.-]+/).filter(t => t.length > 1 && !STOP.has(t))
-    ))
+    // Deduplicated by lowercased form (as before), but each entry keeps its original
+    // RAW-case spelling too — camelCase/PascalCase boundaries ("mem0ParentId") only
+    // exist before lowercasing, and the compound-expansion fallback below needs them.
+    // Splitting the original (mixed-case) query on the same delimiter class the old
+    // code split the lowercased query on tokenizes identically; only the case of the
+    // output differs.
+    const seenTermLower = new Set<string>()
+    const terms: Array<{ lower: string; raw: string }> = []
+    for (const raw of query.trim().split(/[^a-zA-Z0-9_.-]+/)) {
+      const lower = raw.toLowerCase()
+      if (lower.length <= 1 || STOP.has(lower) || seenTermLower.has(lower)) continue
+      seenTermLower.add(lower)
+      terms.push({ lower, raw })
+    }
     if (terms.length === 0) return 0
 
     let matched = 0
     let density = 0
-    for (const term of terms) {
+    for (const { lower: term, raw: rawTerm } of terms) {
       const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       // Bounded on BOTH sides. A leading \b alone still prefix-matches, so "timeout"
       // would score against "timeoutvalue" — the substring defect this function exists
@@ -1129,7 +1141,13 @@ export class UnifiedSearchTool {
       // ending in "e" get that "e" made optional so "route" also reaches "routing"
       // (rout + ing). Anything beyond these suffixes must clear its own word boundary.
       const stem = escaped.endsWith('e') ? `${escaped.slice(0, -1)}e?` : escaped
-      const occurrences = (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length
+      let occurrences = (contentLower.match(new RegExp(`\\b${stem}(?:s|es|ed|ing)?\\b`, 'g')) || []).length
+      // A compound QUERY term ("mem0ParentId") against content that spells it out
+      // ("mem0 parent id"): match its parts in sequence, never any single part alone.
+      if (occurrences === 0) {
+        const pattern = compoundSequencePattern(rawTerm)
+        if (pattern) occurrences = (contentLower.match(new RegExp(`\\b${pattern}\\b`, 'g')) || []).length
+      }
       if (occurrences > 0) {
         matched++
         // Diminishing returns — a term repeated 20x is not 20x more relevant.

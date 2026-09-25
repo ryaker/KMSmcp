@@ -88,6 +88,7 @@ import type { OntologyMatch } from './OntologyIndex.js'
 import { isSparrowdbPackageNotInstalled } from './nativeLoaderGuard.js'
 import { StorageSystem, UnifiedKnowledge, KnowledgeQuery, KnownPeopleConfig, KnowledgeFlag } from '../types/index.js'
 import { resolveSparrowDBPath, DEFAULT_SPARROWDB_DIRNAME } from './sparrowDbPath.js'
+import { textIncludesTermOrParts } from '../search/compoundTokens.js'
 
 // Re-exported for backward compatibility — the canonical definitions now
 // live in sparrowDbPath.ts (see that file's header for why), which has no
@@ -1149,7 +1150,11 @@ export class SparrowDBStorage implements StorageSystem {
 
     try {
       const maxResults = Math.floor(query.options?.maxResults ?? 10)
-      const searchTerms = query.query.toLowerCase().trim().split(/\s+/).filter(Boolean)
+      // Original case preserved — `textIncludesTermOrParts` needs it to find
+      // camelCase/PascalCase boundaries ("mem0ParentId"); it lowercases internally for
+      // the plain-substring comparison, so this is not a behaviour change for callers
+      // that already relied on case-insensitive matching.
+      const searchTerms = query.query.trim().split(/\s+/).filter(Boolean)
 
       // Search is entirely in-process against the content sidecar.
       // The sidecar holds full-length strings; SparrowDB graph holds short
@@ -1194,11 +1199,14 @@ export class SparrowDBStorage implements StorageSystem {
         }
       }
 
-      // Score by term hits in content.
+      // Score by term hits in content. A term counts as a hit on a plain substring
+      // match OR via one of its compound split parts — "mem0ParentId" typed as a single
+      // search term still finds content written as "mem0 parent id". Non-compound
+      // terms (the common case) fall straight through to the original substring check.
       const scored = entries
         .map(e => {
           const lower = e.content.toLowerCase()
-          const hits = searchTerms.filter(t => lower.includes(t)).length
+          const hits = searchTerms.filter(t => textIncludesTermOrParts(lower, t)).length
           const score = searchTerms.length > 0 ? hits / searchTerms.length : 1
           return { entry: e, score }
         })
