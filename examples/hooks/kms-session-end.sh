@@ -30,9 +30,9 @@ try:
 except Exception:
     data = {}
 safe = lambda s: re.sub(r"[^a-zA-Z0-9_/.\-~ ]", "", str(s))
-print(f"TRANSCRIPT_PATH=\"{safe(data.get(\"transcript_path\", \"\"))}\"")
-print(f"SESSION_CWD=\"{safe(data.get(\"cwd\", \"\"))}\"")
-print(f"SESSION_ID=\"{safe(data.get(\"session_id\", \"\"))}\"")
+# No backslashes inside f-string braces: /usr/bin/python3 (3.9) rejects them.
+for var, key in (("TRANSCRIPT_PATH", "transcript_path"), ("SESSION_CWD", "cwd"), ("SESSION_ID", "session_id")):
+    print(var + "=\"" + safe(data.get(key, "")) + "\"")
 ' 2>/dev/null)
 
 TRANSCRIPT_PATH="${TRANSCRIPT_PATH/#\~/$HOME}"
