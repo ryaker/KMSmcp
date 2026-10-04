@@ -9,6 +9,7 @@
 #   - it is clean (no modified or untracked files),
 #   - it is on a branch whose HEAD is covered by the head of a MERGED PR for that branch
 #     (the repo squash-merges, so ancestry alone would call merged work unmerged).
+# Ignored files other than node_modules/dist/coverage also block removal (they can be notes or data).
 # Anything else is kept and the reason printed. Entries whose directory is gone (moved or
 # deleted by hand) are pruned from git's registry. The main checkout is never touched.
 #
@@ -33,7 +34,12 @@ git -C "$main_wt" fetch -q origin || echo "warning: fetch failed; merge state ma
 removed=0; kept=0
 decide() {  # $1=path $2=branch $3=head ; echoes "REMOVE <why>" or "KEEP <why>"
   local path=$1 branch=$2 head=$3 oid
-  [ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ] || { echo "KEEP uncommitted changes"; return; }
+  # Fail closed: if git cannot read the worktree (e.g. its .git pointer references a moved repo),
+  # an empty status is an error, not "clean". Fix with `git worktree repair <path>`.
+  local st
+  st=$(git -C "$path" status --porcelain --ignored 2>&1) || { echo "KEEP git cannot read it (try: git worktree repair $path)"; return; }
+  [ -z "$(printf '%s\n' "$st" | grep -v -E '^!! ((node_modules|dist|coverage)/?|.*\.tsbuildinfo)$')" ] \
+    || { echo "KEEP uncommitted or ignored files (git status --ignored)"; return; }
   [ -n "$branch" ] || { echo "KEEP detached HEAD (cannot tell finished from fresh)"; return; }
   while read -r oid; do
     [ -n "$oid" ] && git -C "$main_wt" merge-base --is-ancestor "$head" "$oid" 2>/dev/null \
@@ -60,8 +66,12 @@ while IFS='|' read -r path branch head prunable; do
     REMOVE*)
       echo "REMOVE $name  (${verdict#REMOVE })"; removed=$((removed+1))
       if [ $apply = 1 ]; then
-        git -C "$main_wt" worktree remove "$path"        # refuses if dirty; never --force
-        [ $del_branches = 1 ] && [ -n "$branch" ] && git -C "$main_wt" branch -D "$branch" >/dev/null
+        # one failure must not abort the rest; git itself also refuses dirty trees (never --force)
+        if git -C "$main_wt" worktree remove "$path"; then
+          [ $del_branches = 1 ] && [ -n "$branch" ] && git -C "$main_wt" branch -D "$branch" >/dev/null
+        else
+          echo "FAILED to remove $name; left in place" >&2
+        fi
       fi ;;
     *) echo "keep   $name  (${verdict#KEEP })"; kept=$((kept+1)) ;;
   esac
