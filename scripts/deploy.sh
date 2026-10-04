@@ -104,6 +104,8 @@ if ! health; then
   exit 1
 fi
 trap - EXIT
-ls -1 "$DEPLOY_ROOT/releases" | sort | head -n -$KEEP | while read -r old; do rm -rf "${DEPLOY_ROOT:?}/releases/${old:?}"; done
+# all but the newest $KEEP (portable: BSD head has no negative counts)
+ls -1 "$DEPLOY_ROOT/releases" | sort | awk -v k="$KEEP" '{a[NR]=$0} END{for(i=1;i<=NR-k;i++)print a[i]}' \
+  | while read -r old; do rm -rf "${DEPLOY_ROOT:?}/releases/${old:?}"; done
 echo "live: $rel   (rollback: scripts/deploy.sh rollback)"
 echo "next: confirm with a real unified_store; the router should report JevStorageRouter(jev, …)"
