@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ollama.keep-model</string>
+	<key>UserName</key>
+	<string>ryaker</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/ryaker/.local/bin/ollama-keep-model.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/ryaker</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/ryaker/Library/Logs/ollama-keep-model.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ryaker/Library/Logs/ollama-keep-model-error.log</string>
+</dict>
+</plist>
