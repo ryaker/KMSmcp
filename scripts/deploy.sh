@@ -4,6 +4,7 @@
 #   scripts/deploy.sh            build, install prod deps, swap `current`, restart both agents
 #   scripts/deploy.sh rollback   point `current` at the previous release and restart
 #   scripts/deploy.sh status     show the live release and agent health
+#   scripts/deploy.sh install-report   install/refresh the daily health report (07:15, low priority)
 #   KMS_NO_RESTART=1 scripts/deploy.sh   stage and swap only, leave the agents alone (for testing)
 #
 # The live servers never read this checkout, so dev work, tests and worktrees (which live on the
@@ -57,6 +58,20 @@ health() {  # wait for /health on each agent's own port (HTTP_PORT comes from it
   return $bad
 }
 
+install_report() {  # the report scripts live in $DEPLOY_ROOT/bin (stable path, outside any release)
+  local plist="$HOME/Library/LaunchAgents/com.ryaker.kms-report.plist"
+  mkdir -p "$DEPLOY_ROOT/bin"
+  cp "$REPO/scripts/kms-health-report.sh" "$REPO/scripts/worktree-clean.sh" "$DEPLOY_ROOT/bin/"
+  chmod +x "$DEPLOY_ROOT/bin/"*.sh
+  sed -e "s#@DEPLOY_ROOT@#$DEPLOY_ROOT#g" -e "s#@HOME@#$HOME#g" \
+      "$REPO/scripts/launchd/kms-report.plist.tmpl" >"$plist.new"
+  plutil -lint "$plist.new" >/dev/null || die "rendered report plist is invalid"
+  mv "$plist.new" "$plist"
+  launchctl bootout "gui/$UID_/com.ryaker.kms-report" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_" "$plist"
+  echo "report agent installed: daily 07:15, output in $DEPLOY_ROOT/reports/latest.md"
+}
+
 live() { readlink "$DEPLOY_ROOT/current" 2>/dev/null | xargs -n1 basename 2>/dev/null || echo none; }
 
 swap_to() {  # atomic: build the new symlink beside `current`, then rename over it
@@ -65,6 +80,7 @@ swap_to() {  # atomic: build the new symlink beside `current`, then rename over 
 }
 
 case "${1:-deploy}" in
+  install-report) install_report; exit 0 ;;
   status) echo "live release: $(live)"; health; exit $? ;;
   rollback)
     prev=$(ls -1 "$DEPLOY_ROOT/releases" | sort | grep -B1 -x "$(live)" | head -1)
@@ -104,6 +120,7 @@ if ! health; then
   exit 1
 fi
 trap - EXIT
+install_report
 # all but the newest $KEEP (portable: BSD head has no negative counts)
 ls -1 "$DEPLOY_ROOT/releases" | sort | awk -v k="$KEEP" '{a[NR]=$0} END{for(i=1;i<=NR-k;i++)print a[i]}' \
   | while read -r old; do rm -rf "${DEPLOY_ROOT:?}/releases/${old:?}"; done
