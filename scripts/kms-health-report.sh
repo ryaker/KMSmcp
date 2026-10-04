@@ -66,14 +66,18 @@ fi
 # Recent window, not all-time: all-time numbers hide an outage that started this morning.
 log="$DECISION_LOGS/eng-recall-shadow.jsonl"
 if [ -f "$log" ]; then
-  recent=$(tail -n 50 "$log" | jq -s '{runs:length, eval:(map(.candidates_evaluated)|add // 0), failed:(map(.candidates_failed)|add // 0),
-            credits:([.[]|.. |strings|select(startswith("APIError: 402"))]|length)}' 2>/dev/null)
+  # Two views on purpose. The failure RATE uses the last 3 judged runs (smooths one-off timeouts). The credits alarm looks at
+  # the most recent run that judged anything: a 402 stays in any fixed window for hours after a
+  # top-up, and a stale alarm teaches people to ignore the report.
+  # rate over the last 3 judged runs: enough to ignore one transient timeout, short enough to clear within an hour of a fix
+  recent=$(tail -n 40 "$log" | jq -s 'map(select(.candidates_evaluated > 0)) | .[-3:] | {eval:(map(.candidates_evaluated)|add // 0), failed:(map(.candidates_failed)|add // 0)}' 2>/dev/null)
+  cr=$(tail -n 20 "$log" | jq -s 'map(select(.candidates_evaluated > 0)) | last // {} | [.. | strings | select(startswith("APIError: 402"))] | length' 2>/dev/null)
   if [ -n "$recent" ]; then
-    ev=$(jq -r .eval <<<"$recent"); fl=$(jq -r .failed <<<"$recent"); cr=$(jq -r .credits <<<"$recent")
+    ev=$(jq -r .eval <<<"$recent"); fl=$(jq -r .failed <<<"$recent")
     pct=$(( ev > 0 ? 100 * fl / ev : 0 ))
-    emit "- last 50 runs: $fl of $ev judgments failed (${pct}%), 402-credit errors: $cr; latest run $(tail -n 1 "$log" | jq -r .at)"
-    [ "$cr" -gt 0 ] && attn+=("TypeSafe/Jev credits exhausted (HTTP 402 in $cr recent judgments); Jev features are falling back to local models")
-    [ "$cr" -eq 0 ] && [ "$pct" -ge $JEV_FAIL_PCT ] && attn+=("Jev judgments failing: ${pct}% of the last 50 runs")
+    emit "- last 3 judged runs: $fl of $ev judgments failed (${pct}%); 402 in the latest judged run: ${cr:-0}; latest run $(tail -n 1 "$log" | jq -r .at)"
+    if [ "${cr:-0}" -gt 0 ]; then attn+=("TypeSafe/Jev credits exhausted (HTTP 402 in the latest judged run); Jev features are falling back to local models")
+    elif [ "$pct" -ge $JEV_FAIL_PCT ]; then attn+=("Jev judgments failing: ${pct}% of the last 3 judged runs (not credits; check the shadow log errors)"); fi
   fi
 fi
 emit "- flags: $(doppler run --project ry-local --config dev_eng -- env 2>/dev/null | grep -E '^KMS_JEV_' | grep -v -i -E 'KEY|TOKEN|SECRET|PASS' | tr '\n' ' ')"
