@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ollama.serve</string>
+	<key>UserName</key>
+	<string>ryaker</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/ollama</string>
+		<string>serve</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/ryaker</string>
+		<key>OLLAMA_HOST</key>
+		<string>0.0.0.0:11434</string>
+		<key>OLLAMA_KEEP_ALIVE</key>
+		<string>30m</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/ryaker/Library/Logs/ollama-serve.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/ryaker/Library/Logs/ollama-serve-error.log</string>
+</dict>
+</plist>
