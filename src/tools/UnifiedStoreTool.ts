@@ -20,6 +20,7 @@ import type { LLMJudgeService, LLMRelation } from '../embedding/LLMJudgeService.
 import { computeFingerprint } from '../dedup/Fingerprint.js'
 import { logger } from '../logger.js'
 import { scrubSecrets, scrubWrite } from '../security/secretScrub.js'
+import { resolveWriteUserId } from '../security/userIdPolicy.js'
 import {
   JEV_WRITE_DEDUP_ACT_FLAG,
   JEV_WRITE_DEDUP_FLAG,
@@ -210,6 +211,17 @@ export interface DedupCheckMetadata {
   reason?: string
 }
 
+/**
+ * Returned when the write's `userId` is not on the server's allowlist (or none
+ * was given and KMS_DEFAULT_USER_ID is unset). Nothing was stored. See
+ * src/security/userIdPolicy.ts.
+ */
+export interface InvalidUserResponse {
+  status: 'invalid_user'
+  success: false
+  error: string
+}
+
 export type UnifiedStoreResult =
   | {
       success: true
@@ -236,6 +248,7 @@ export type UnifiedStoreResult =
   | SupersedeActionResult
   | UpdateActionResult
   | InvalidActionResponse
+  | InvalidUserResponse
 
 export class UnifiedStoreTool {
   private router: IntelligentStorageRouter
@@ -471,6 +484,13 @@ export class UnifiedStoreTool {
     const startTime = Date.now()
     args = this._scrubArgs(args, 'content', 'unified_store')
 
+    // Every distinct userId becomes its own Mem0 entity / Mongo partition. Validate
+    // before anything is routed or written; supersede/update inherit the old entry's.
+    const userDecision = resolveWriteUserId(args.userId)
+    if (!userDecision.ok) {
+      return { status: 'invalid_user', success: false, error: userDecision.error }
+    }
+
     debug(`\n🚀 UNIFIED STORE Starting...`)
     debug(`📝 Content: "${args.content.slice(0, 100)}${args.content.length > 100 ? '...' : ''}"`)
 
@@ -544,8 +564,7 @@ export class UnifiedStoreTool {
     debug(`👤 User: ${enrichedArgs.userId || 'auto'}, Context: ${inference.detectedProject || 'general'}`)
     debug(`🏷️  Tags: ${enhancedMetadata.tags?.join(', ') || 'none'}`)
 
-    const defaultUserId = process.env.KMS_DEFAULT_USER_ID || 'personal'
-    const resolvedUserId = enrichedArgs.userId || defaultUserId
+    const resolvedUserId = userDecision.userId
 
     // Narrative timestamp (see the args doc): ISO string or epoch seconds.
     // Number is epoch SECONDS (not ms) — the caller's contract is mem0's
