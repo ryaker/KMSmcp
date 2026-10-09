@@ -42,6 +42,12 @@ Prefer supersede over delete: the mistake is data.
   (`list` / `approve` / `reject`) acts on it. The importers (Granola, Slack, markdown
   claims) default to it; `--no-review` writes live. Deliberate stores don't use it.
   `kms_review` refuses anything that isn't a `CANDIDATE`.
+- **`userId` is allowlisted on writes.** Every distinct `userId` becomes its own Mem0 entity and
+  Mongo partition, so `unified_store` refuses (`status: "invalid_user"`, nothing stored) any id that
+  is not `KMS_DEFAULT_USER_ID`, a `dolphin/*` benchmark namespace, or listed in
+  `KMS_ALLOWED_USER_IDS` (comma-separated, trailing `*` = prefix, lone `*` = off). With no default
+  configured it refuses rather than inventing `personal`. Omit `userId` to use the default.
+  `src/security/userIdPolicy.ts`.
 - **Secrets are masked on every write** (`unified_store`, `kms_update`, `kms_supersede`)
   before any backend, since Mem0 is hosted. Values become `[REDACTED:<type>]`; only
   `metadata.redactions` (`{type, count}`) is recorded. `src/security/secretScrub.ts`.
