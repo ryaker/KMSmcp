@@ -3,14 +3,18 @@
  */
 
 // Set test environment variables
-process.env.NODE_ENV = 'test'
-process.env.MEM0_API_KEY = 'test-mem0-key'
-process.env.MONGODB_URI = 'mongodb://localhost:27017'
-process.env.MONGODB_DATABASE = 'test_unified_kms'
-process.env.REDIS_URI = 'redis://localhost:6379'
+process.env.NODE_ENV = "test";
+process.env.MEM0_API_KEY = "test-mem0-key";
+process.env.MONGODB_URI = "mongodb://localhost:27017";
+process.env.MONGODB_DATABASE = "test_unified_kms";
+process.env.REDIS_URI = "redis://localhost:6379";
+// Writes refuse to invent or accept unknown userIds (src/security/userIdPolicy.ts).
+// Tests use arbitrary ids, so open the allowlist; userIdPolicy tests pass env explicitly.
+process.env.KMS_DEFAULT_USER_ID = "personal";
+process.env.KMS_ALLOWED_USER_IDS = "*";
 
 // Increase timeout for integration tests
-jest.setTimeout(10000)
+jest.setTimeout(10000);
 
 // Mock console methods to reduce noise in tests
 global.console = {
@@ -18,69 +22,69 @@ global.console = {
   log: jest.fn(),
   info: jest.fn(),
   warn: jest.fn(),
-  error: jest.fn()
-}
+  error: jest.fn(),
+};
 
 // Global test utilities
 global.testUtils = {
   createMockAuthContext: (overrides = {}) => ({
     isAuthenticated: true,
     user: {
-      id: 'test-user',
-      email: 'test@example.com',
-      name: 'Test User',
-      roles: ['user']
+      id: "test-user",
+      email: "test@example.com",
+      name: "Test User",
+      roles: ["user"],
     },
     token: {
-      type: 'Bearer' as const,
-      value: 'test-token',
-      scope: 'mcp:read mcp:write'
+      type: "Bearer" as const,
+      value: "test-token",
+      scope: "mcp:read mcp:write",
     },
-    ...overrides
+    ...overrides,
   }),
 
   createMockOAuthConfig: (overrides = {}) => ({
     enabled: true,
-    issuer: 'https://auth.example.com',
-    audience: 'https://mcp.example.com',
-    clientId: 'test-client-id',
-    clientSecret: 'test-client-secret',
-    jwksUri: 'https://auth.example.com/.well-known/jwks.json',
-    ...overrides
+    issuer: "https://auth.example.com",
+    audience: "https://mcp.example.com",
+    clientId: "test-client-id",
+    clientSecret: "test-client-secret",
+    jwksUri: "https://auth.example.com/.well-known/jwks.json",
+    ...overrides,
   }),
 
   createMockKMSConfig: (overrides = {}) => ({
     mongodb: {
       uri: process.env.MONGODB_URI!,
-      database: process.env.MONGODB_DATABASE!
+      database: process.env.MONGODB_DATABASE!,
     },
     mem0: {
       apiKey: process.env.MEM0_API_KEY!,
-      orgId: 'test-org'
+      orgId: "test-org",
     },
     redis: {
-      uri: process.env.REDIS_URI!
+      uri: process.env.REDIS_URI!,
     },
     fact: {
       l1CacheSize: 10485760, // 10MB
-      l2CacheTTL: 300000,    // 5 minutes
-      l3CacheTTL: 600000     // 10 minutes
+      l2CacheTTL: 300000, // 5 minutes
+      l3CacheTTL: 600000, // 10 minutes
     },
     transport: {
-      mode: 'stdio' as const
+      mode: "stdio" as const,
     },
-    ...overrides
-  })
-}
+    ...overrides,
+  }),
+};
 
 // Type declarations for global test utilities
 declare global {
   // eslint-disable-next-line no-var -- `declare global` requires `var`; let/const are invalid here.
   var testUtils: {
-    createMockAuthContext: (overrides?: any) => any
-    createMockOAuthConfig: (overrides?: any) => any
-    createMockKMSConfig: (overrides?: any) => any
-  }
+    createMockAuthContext: (overrides?: any) => any;
+    createMockOAuthConfig: (overrides?: any) => any;
+    createMockKMSConfig: (overrides?: any) => any;
+  };
 }
 
-export {}
+export {};
